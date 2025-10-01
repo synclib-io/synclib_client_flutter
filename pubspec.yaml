@@ -1,0 +1,25 @@
+name: synclib_sync
+description: "High-level sync package for synclib - WebSocket-based bidirectional sync with Elixir/Phoenix backend."
+version: 0.0.1
+homepage:
+
+environment:
+  sdk: ^3.9.2
+  flutter: ">=1.17.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  synclib_flutter:
+    path: ../synclib_flutter
+  web_socket_channel: ^3.0.0
+  msgpack_dart: ^1.0.1
+  logging: ^1.2.0
+  phoenix_socket: ^0.8.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  mockito: ^5.4.0
+  build_runner: ^2.4.0
