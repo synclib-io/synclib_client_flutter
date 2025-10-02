@@ -23,6 +23,9 @@ class SyncClientConfig {
   /// Unique client identifier
   final String clientId;
 
+  /// User ID for user-specific channel subscription
+  final String userId;
+
   /// Codec for message encoding
   final SyncCodecType codec;
 
@@ -45,6 +48,7 @@ class SyncClientConfig {
     required this.dbPath,
     required this.serverUrl,
     required this.clientId,
+    required this.userId,
     this.codec = SyncCodecType.messagepack,
     this.pushInterval = const Duration(seconds: 5),
     this.pushBatchSize = 100,
@@ -109,9 +113,10 @@ class SyncClient {
     await _ws.connect();
 
     // WebSocketManager.connect() ensures socket is connected
-    // Now join the channel
-    _logger.info('Attempting to join channel sync:lobby');
-    await _ws.joinChannel('sync:lobby', {
+    // Now join the user-specific channel
+    final channelTopic = 'sync:user:${config.userId}';
+    _logger.info('Attempting to join channel $channelTopic');
+    await _ws.joinChannel(channelTopic, {
       'client_id': config.clientId,
     });
     _logger.info('Channel joined successfully');
@@ -181,13 +186,17 @@ class SyncClient {
 
   /// Send hello message to server
   Future<void> _sendHello() async {
+    // Get current schema version from database
+    final schemaVersion = await _db!.getSchemaVersion();
+
     final hello = HelloMessage(
       clientId: config.clientId,
       lastSeqnum: _lastSyncedSeqnum,
+      schemaVersion: schemaVersion,
       metadata: config.metadata,
     );
     await _ws.send(hello);
-    _logger.info('Sent hello message');
+    _logger.info('Sent hello message with schema version $schemaVersion');
   }
 
   /// Handle incoming message from server
@@ -199,6 +208,8 @@ class SyncClient {
         await _applyRemoteChanges(message.changes);
       } else if (message is AckMessage) {
         _handleAck(message);
+      } else if (message is PhoenixReplyMessage) {
+        await _handlePhoenixReply(message);
       } else if (message is ErrorMessage) {
         _handleError(message);
       } else {
@@ -315,6 +326,63 @@ class SyncClient {
   void _handleError(ErrorMessage error) {
     _logger.severe('Server error: ${error.code} - ${error.message}');
     // TODO: Implement error recovery strategies
+  }
+
+  /// Handle Phoenix reply messages (especially hello response with migrations)
+  Future<void> _handlePhoenixReply(PhoenixReplyMessage reply) async {
+    final response = reply.response;
+
+    // Check if this is a hello response with migrations
+    if (response['status'] == 'upgrade_needed') {
+      _logger.info('Schema upgrade needed');
+      await _applyMigrations(response);
+    } else if (response['status'] == 'up_to_date') {
+      _logger.info('Schema is up to date');
+    } else if (response['status'] == 'ok') {
+      _logger.fine('Received OK response');
+    }
+  }
+
+  /// Apply schema migrations from server
+  Future<void> _applyMigrations(Map<String, dynamic> response) async {
+    final currentVersion = response['current_version'] as int;
+    final migrations = response['migrations'] as List?;
+
+    if (migrations == null || migrations.isEmpty) {
+      _logger.warning('No migrations provided');
+      return;
+    }
+
+    _logger.info('Applying ${migrations.length} migration(s) to reach version $currentVersion');
+
+    for (final migration in migrations) {
+      final migrationMap = migration as Map<String, dynamic>;
+      final version = migrationMap['version'] as int;
+      final description = migrationMap['description'] as String;
+      final sqlStatements = migrationMap['sql'] as List;
+
+      _logger.info('Applying migration v$version: $description');
+
+      try {
+        // Execute each SQL statement
+        for (final sql in sqlStatements) {
+          _logger.fine('Executing: $sql');
+          await _db!.exec(sql as String);
+        }
+
+        // Update schema version
+        await _db!.setSchemaVersion(version);
+        _logger.info('Successfully applied migration v$version');
+      } catch (e, stack) {
+        _logger.severe('Failed to apply migration v$version: $e', e, stack);
+        rethrow;
+      }
+    }
+
+    // Confirm migration to server
+    final confirm = SchemaConfirmMessage(version: currentVersion);
+    await _ws.send(confirm);
+    _logger.info('Confirmed schema migration to server');
   }
 
   /// Handle connection state changes

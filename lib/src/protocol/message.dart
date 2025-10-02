@@ -22,6 +22,11 @@ abstract class SyncMessage {
         return ChangesBatchMessage.fromMap(map);
       case 'hello':
         return HelloMessage.fromMap(map);
+      case 'phx_reply':
+        // Handle Phoenix reply messages (for hello response)
+        return PhoenixReplyMessage.fromMap(map);
+      case 'schema_migrated':
+        return SchemaConfirmMessage.fromMap(map);
       case 'error':
         return ErrorMessage.fromMap(map);
       default:
@@ -256,4 +261,51 @@ class ErrorMessage extends SyncMessage {
     message: map['message'] as String,
     details: map['details'] as Map<String, dynamic>?,
   );
+}
+
+/// Phoenix channel reply message (for hello response)
+class PhoenixReplyMessage extends SyncMessage {
+  final String status;
+  final Map<String, dynamic> response;
+
+  const PhoenixReplyMessage({
+    required this.status,
+    required this.response,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'phx_reply',
+    'status': status,
+    'response': response,
+  };
+
+  factory PhoenixReplyMessage.fromMap(Map<String, dynamic> map) {
+    // Phoenix replies are already unwrapped by the WebSocketManager
+    // Just return the response payload
+    return PhoenixReplyMessage(
+      status: map['status'] as String? ?? 'ok',
+      response: map,
+    );
+  }
+}
+
+/// Schema migration confirmation message
+class SchemaConfirmMessage extends SyncMessage {
+  final int version;
+
+  const SchemaConfirmMessage({
+    required this.version,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'schema_migrated',
+    'version': version,
+  };
+
+  factory SchemaConfirmMessage.fromMap(Map<String, dynamic> map) =>
+    SchemaConfirmMessage(
+      version: map['version'] as int,
+    );
 }

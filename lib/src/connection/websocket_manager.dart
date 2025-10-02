@@ -168,9 +168,15 @@ class WebSocketManager {
 
       _logger.info('Received Phoenix message: event=$eventType, payload=${message.payload}');
 
-      // Skip Phoenix system events
-      if (eventType.startsWith('phx_')) {
+      // Skip Phoenix system events (but not channel replies)
+      if (eventType.startsWith('phx_') && eventType != 'phx_reply') {
         _logger.fine('Skipping Phoenix system event: $eventType');
+        return;
+      }
+
+      // Handle channel reply messages (chan_reply_N)
+      if (eventType.startsWith('chan_reply_')) {
+        _handleChannelReply(message);
         return;
       }
 
@@ -185,6 +191,28 @@ class WebSocketManager {
       _logger.info('Successfully decoded $eventType message and added to stream');
     } catch (e, stack) {
       _logger.severe('Failed to process message: $e', e, stack);
+    }
+  }
+
+  /// Handle channel reply messages
+  void _handleChannelReply(Message message) {
+    try {
+      final payload = message.payload as Map<String, dynamic>? ?? {};
+
+      // Extract the response from the Phoenix reply structure
+      final response = payload['response'] as Map<String, dynamic>? ?? {};
+
+      _logger.fine('Channel reply response: $response');
+
+      // Create a PhoenixReplyMessage with the response
+      final replyPayload = Map<String, dynamic>.from(response);
+      replyPayload['type'] = 'phx_reply';
+
+      final syncMessage = SyncMessage.fromMap(replyPayload);
+      _messageController!.add(syncMessage);
+      _logger.info('Successfully processed channel reply');
+    } catch (e, stack) {
+      _logger.severe('Failed to process channel reply: $e', e, stack);
     }
   }
 

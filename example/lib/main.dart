@@ -46,10 +46,16 @@ class _MyAppState extends State<MyApp> {
       setState(() => _status = 'Initializing sync client...');
 
       // Create sync client configuration
+      // In a real app, you'd get the userId after authentication
+      // For demo purposes, using a deterministic UUID for user-123
+      // You can generate one with: uuidgen or use a real user ID from your DB
+      final userId = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'; // This would come from your auth system
+
       final config = sync.SyncClientConfig(
         dbPath: dbPath,
         serverUrl: 'ws://localhost:4000/socket/websocket', // Your Elixir server
         clientId: 'flutter-client-123',
+        userId: userId, // User-specific channel for scalability
         codec: sync.SyncCodecType.messagepack, // Or sync.SyncCodecType.json
         pushInterval: const Duration(seconds: 5),
         pullInterval: null, // Reactive mode - server pushes changes
@@ -106,7 +112,11 @@ class _MyAppState extends State<MyApp> {
     try {
       setState(() => _status = 'Connecting...');
       await _syncClient!.connect();
-      setState(() => _status = 'Connected!');
+      setState(() => _status = 'Connected! Checking schema...');
+
+      // The hello message already includes schema version
+      // Server will respond with upgrade_needed if client is behind
+      await _refreshAll();
     } catch (e) {
       setState(() => _status = 'Connection error: $e');
     }
