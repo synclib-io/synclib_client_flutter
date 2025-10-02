@@ -70,6 +70,9 @@ class SyncClient {
   int? _lastSyncedSeqnum;
   final Set<int> _pendingAcks = {};
 
+  // Stream controller for remote change notifications
+  final StreamController<ChangeMessage> _remoteChangeController = StreamController<ChangeMessage>.broadcast();
+
   SyncClient(this.config) {
     _ws = WebSocketManager(
       url: config.serverUrl,
@@ -209,23 +212,28 @@ class SyncClient {
   /// Apply a single remote change to local database
   Future<void> _applyRemoteChange(ChangeMessage change) async {
     try {
-      // Check for conflicts
+      // Check for conflicts with pending local changes
       if (config.onConflict != null) {
         final localChanges = await _db!.getPendingChanges();
-        final conflict = localChanges.firstWhere(
-          (c) => c.tableName == change.table && c.rowId == change.rowId,
-          orElse: () => throw StateError('No conflict'),
-        );
+        try {
+          final conflict = localChanges.firstWhere(
+            (c) => c.tableName == change.table && c.rowId == change.rowId,
+          );
 
-        // Conflict found - resolve it
-        final localChange = ChangeMessage.fromChange(conflict);
-        final resolved = await config.onConflict!(localChange, change);
-        if (resolved == null) {
-          _logger.info('Conflict skipped for ${change.table}:${change.rowId}');
-          return;
+          // Conflict found - resolve it
+          _logger.info('Conflict detected for ${change.table}:${change.rowId}');
+          final localChange = ChangeMessage.fromChange(conflict);
+          final resolved = await config.onConflict!(localChange, change);
+          if (resolved == null) {
+            _logger.info('Conflict skipped for ${change.table}:${change.rowId}');
+            return;
+          }
+          // Use resolved change
+          change = resolved;
+        } catch (e) {
+          // No conflict found - proceed normally
+          _logger.fine('No conflict for ${change.table}:${change.rowId}');
         }
-        // Use resolved change
-        change = resolved;
       }
 
       // Generate SQL for the operation
@@ -241,6 +249,9 @@ class SyncClient {
       );
 
       _logger.fine('Applied remote change: ${change.operation} on ${change.table}');
+
+      // Notify listeners that a remote change was applied
+      _remoteChangeController.add(change);
 
       // Send acknowledgment
       if (change.seqnum != null) {
@@ -346,28 +357,52 @@ class SyncClient {
 
   /// Generate SQL statement from change message
   String _generateSql(ChangeMessage change) {
-    // This is a simplified version - you'll need to expand this
-    // based on your actual table schemas
+    // Filter out server-only fields and map field names
+    Map<String, dynamic> filteredData = {};
+
+    if (change.data != null) {
+      for (final entry in change.data!.entries) {
+        final key = entry.key;
+        final value = entry.value;
+
+        // Skip server-only timestamp fields
+        if (key == 'inserted_at') continue;
+
+        // Map server field names to client field names
+        String clientKey = key;
+        if (change.table == 'users' && key == 'username') {
+          clientKey = 'name';
+        }
+
+        filteredData[clientKey] = value;
+      }
+    }
+
     switch (change.operation) {
       case 'insert':
-        final columns = change.data!.keys.join(', ');
-        final values = change.data!.values
-          .map((v) => v is String ? "'$v'" : v.toString())
+        final columns = filteredData.keys.join(', ');
+        final values = filteredData.values
+          .map((v) => v is String ? "'${_escapeSql(v)}'" : v.toString())
           .join(', ');
-        return 'INSERT INTO ${change.table} ($columns) VALUES ($values)';
+        return 'INSERT OR REPLACE INTO ${change.table} ($columns) VALUES ($values)';
 
       case 'update':
-        final sets = change.data!.entries
-          .map((e) => '${e.key} = ${e.value is String ? "'${e.value}'" : e.value}')
+        final sets = filteredData.entries
+          .map((e) => '${e.key} = ${e.value is String ? "'${_escapeSql(e.value)}'" : e.value}')
           .join(', ');
-        return 'UPDATE ${change.table} SET $sets WHERE id = \'${change.rowId}\'';
+        return 'UPDATE ${change.table} SET $sets WHERE id = \'${_escapeSql(change.rowId)}\'';
 
       case 'delete':
-        return 'DELETE FROM ${change.table} WHERE id = \'${change.rowId}\'';
+        return 'DELETE FROM ${change.table} WHERE id = \'${_escapeSql(change.rowId)}\'';
 
       default:
         throw ArgumentError('Unknown operation: ${change.operation}');
     }
+  }
+
+  /// Escape single quotes in SQL strings
+  String _escapeSql(String value) {
+    return value.replaceAll("'", "''");
   }
 
   /// Get current connection state
@@ -376,11 +411,15 @@ class SyncClient {
   /// Stream of connection state changes
   Stream<ConnectionState> get stateChanges => _ws.stateChanges;
 
+  /// Stream of remote changes as they are applied
+  Stream<ChangeMessage> get remoteChanges => _remoteChangeController.stream;
+
   /// Dispose resources
   Future<void> dispose() async {
     _stopPeriodicSync();
     await _messageSubscription?.cancel();
     await _stateSubscription?.cancel();
+    await _remoteChangeController.close();
     await _ws.dispose();
     await _db?.close();
     _isInitialized = false;

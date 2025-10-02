@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:synclib_sync/synclib_sync.dart' as sync;
 import 'package:synclib_flutter/synclib_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:logging/logging.dart';
+import 'package:sqlite3/sqlite3.dart' as sqlite;
 
 void main() {
   // Enable logging
@@ -26,6 +28,8 @@ class _MyAppState extends State<MyApp> {
   String _status = 'Not initialized';
   sync.ConnectionState _connectionState = sync.ConnectionState.disconnected;
   List<Change> _changes = [];
+  List<Map<String, dynamic>> _users = [];
+  StreamSubscription<sync.ChangeMessage>? _remoteChangeSubscription;
 
   @override
   void initState() {
@@ -79,6 +83,15 @@ class _MyAppState extends State<MyApp> {
           _connectionState = state;
           _status = 'Connection: ${state.name}';
         });
+      });
+
+      // Listen to remote changes and auto-refresh UI
+      _remoteChangeSubscription = _syncClient!.remoteChanges.listen((change) {
+        print('Remote change received: ${change.operation} on ${change.table}');
+        setState(() {
+          _status = 'Received server change: ${change.operation} on ${change.table}';
+        });
+        _refreshAll();
       });
 
       setState(() => _status = 'Initialized. Ready to connect.');
@@ -169,6 +182,34 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
+  Future<void> _loadUsers() async {
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final dbPath = '${directory.path}/sync_example.db';
+
+      // Use sqlite3 package to query
+      final db = sqlite.sqlite3.open(dbPath);
+      final result = db.select('SELECT id, name, email, updated_at FROM users ORDER BY updated_at DESC');
+      db.dispose();
+
+      setState(() {
+        _users = result.map((row) => {
+          'id': row['id'],
+          'name': row['name'],
+          'email': row['email'],
+          'updated_at': row['updated_at'],
+        }).toList();
+      });
+    } catch (e) {
+      setState(() => _status = 'Load users error: $e');
+    }
+  }
+
+  Future<void> _refreshAll() async {
+    await _loadChanges();
+    await _loadUsers();
+  }
+
   /// Example conflict resolution: last-write-wins based on timestamp
   Future<sync.ChangeMessage?> _resolveConflict(
     sync.ChangeMessage local,
@@ -191,6 +232,7 @@ class _MyAppState extends State<MyApp> {
 
   @override
   void dispose() {
+    _remoteChangeSubscription?.cancel();
     _syncClient?.dispose();
     super.dispose();
   }
@@ -256,35 +298,56 @@ class _MyAppState extends State<MyApp> {
               ),
               const SizedBox(height: 10),
               ElevatedButton(
-                onPressed: _loadChanges,
-                child: const Text('Refresh Pending Changes'),
+                onPressed: _refreshAll,
+                child: const Text('Refresh All Data'),
               ),
               const SizedBox(height: 20),
               Text(
-                'Pending Changes (${_changes.length}):',
+                'Users (${_users.length}):',
                 style: Theme.of(context).textTheme.titleMedium,
               ),
               const SizedBox(height: 10),
               Expanded(
-                child: _changes.isEmpty
-                  ? const Center(child: Text('No pending changes'))
+                child: _users.isEmpty
+                  ? const Center(child: Text('No users yet. Insert one or wait for server changes!'))
                   : ListView.builder(
-                      itemCount: _changes.length,
+                      itemCount: _users.length,
                       itemBuilder: (context, index) {
-                        final change = _changes[index];
+                        final user = _users[index];
+                        DateTime? timestamp;
+                        if (user['updated_at'] != null) {
+                          final ts = user['updated_at'];
+                          if (ts is int) {
+                            timestamp = DateTime.fromMillisecondsSinceEpoch(ts);
+                          } else if (ts is String) {
+                            try {
+                              timestamp = DateTime.parse(ts);
+                            } catch (e) {
+                              // Invalid timestamp format
+                            }
+                          }
+                        }
                         return Card(
                           child: ListTile(
-                            leading: Icon(_operationIcon(change.operation)),
-                            title: Text('${change.operation.name.toUpperCase()} - ${change.tableName}'),
+                            leading: const CircleAvatar(
+                              child: Icon(Icons.person),
+                            ),
+                            title: Text(user['name'] ?? 'Unknown'),
                             subtitle: Text(
-                              'Row ID: ${change.rowId}\n'
-                              'Seqnum: ${change.seqnum}',
+                              '${user['email'] ?? 'No email'}\n'
+                              'ID: ${user['id']}\n'
+                              'Updated: ${timestamp?.toString() ?? 'Unknown'}',
                             ),
                             isThreeLine: true,
                           ),
                         );
                       },
                     ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Pending Changes: ${_changes.length}',
+                style: Theme.of(context).textTheme.bodySmall,
               ),
             ],
           ),

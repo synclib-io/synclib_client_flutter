@@ -90,16 +90,27 @@ class ChangeMessage extends SyncMessage {
     if (timestamp != null) 'timestamp': timestamp!.toIso8601String(),
   };
 
-  factory ChangeMessage.fromMap(Map<String, dynamic> map) => ChangeMessage(
-    table: map['table'] as String,
-    operation: map['operation'] as String,
-    rowId: map['row_id'] as String,
-    data: map['data'] as Map<String, dynamic>?,
-    seqnum: map['seqnum'] as int?,
-    timestamp: map['timestamp'] != null
-      ? DateTime.parse(map['timestamp'] as String)
-      : null,
-  );
+  factory ChangeMessage.fromMap(Map<String, dynamic> map) {
+    DateTime? timestamp;
+    if (map['timestamp'] != null) {
+      final ts = map['timestamp'];
+      if (ts is String) {
+        timestamp = DateTime.parse(ts);
+      } else if (ts is num) {
+        // Unix timestamp in seconds (possibly with fractional seconds)
+        timestamp = DateTime.fromMillisecondsSinceEpoch((ts * 1000).toInt());
+      }
+    }
+
+    return ChangeMessage(
+      table: map['table'] as String,
+      operation: map['operation'] as String,
+      rowId: map['row_id'] as String,
+      data: map['data'] as Map<String, dynamic>?,
+      seqnum: map['seqnum'] as int?,
+      timestamp: timestamp,
+    );
+  }
 
   /// Create from synclib Change object
   factory ChangeMessage.fromChange(Change change) => ChangeMessage(

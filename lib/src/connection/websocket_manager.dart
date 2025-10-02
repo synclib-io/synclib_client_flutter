@@ -164,17 +164,25 @@ class WebSocketManager {
   /// Handle incoming message
   void _onMessage(Message message) {
     try {
-      _logger.fine('Received Phoenix message: event=${message.event}, payload=${message.payload}');
+      final eventType = message.event?.value ?? 'unknown';
+
+      _logger.info('Received Phoenix message: event=$eventType, payload=${message.payload}');
+
+      // Skip Phoenix system events
+      if (eventType.startsWith('phx_')) {
+        _logger.fine('Skipping Phoenix system event: $eventType');
+        return;
+      }
 
       // Convert Phoenix message to SyncMessage
-      final payload = message.payload as Map<String, dynamic>? ?? {};
-      final eventType = message.event?.value ?? 'unknown';
+      final payload = Map<String, dynamic>.from(message.payload as Map<String, dynamic>? ?? {});
 
       // Add type to payload for SyncMessage decoding
       payload['type'] = eventType;
 
       final syncMessage = SyncMessage.fromMap(payload);
       _messageController!.add(syncMessage);
+      _logger.info('Successfully decoded $eventType message and added to stream');
     } catch (e, stack) {
       _logger.severe('Failed to process message: $e', e, stack);
     }

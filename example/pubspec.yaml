@@ -36,6 +36,8 @@ dependencies:
     path: ../../synclib_flutter
   path_provider: ^2.1.0
   cupertino_icons: ^1.0.8
+  sqlite3: ^2.4.0
+  logging: ^1.2.0
 
 dev_dependencies:
   flutter_test:
