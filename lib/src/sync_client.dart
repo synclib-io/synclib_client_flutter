@@ -71,8 +71,15 @@ class SyncClient {
   StreamSubscription? _stateSubscription;
 
   bool _isInitialized = false;
+  bool _hasConnectedOnce = false;
   int? _lastSyncedSeqnum;
   final Set<int> _pendingAcks = {};
+
+  // Store channel subscription params for reconnection
+  bool _joinWorld = false;
+  List<String>? _zones;
+  List<String>? _guilds;
+  List<String>? _parties;
 
   // Stream controller for remote change notifications
   final StreamController<ChangeMessage> _remoteChangeController = StreamController<ChangeMessage>.broadcast();
@@ -105,24 +112,75 @@ class SyncClient {
   }
 
   /// Connect to sync server
-  Future<void> connect() async {
+  ///
+  /// Optionally provide additional channels to subscribe to:
+  /// - world: Global announcements
+  /// - zones: List of zone IDs to subscribe to
+  /// - guilds: List of guild IDs to subscribe to
+  /// - parties: List of party IDs to subscribe to
+  Future<void> connect({
+    bool joinWorld = false,
+    List<String>? zones,
+    List<String>? guilds,
+    List<String>? parties,
+  }) async {
     if (!_isInitialized) {
       throw StateError('Not initialized. Call initialize() first.');
     }
 
+    // Store channel subscription params for reconnection
+    _joinWorld = joinWorld;
+    _zones = zones;
+    _guilds = guilds;
+    _parties = parties;
+
     await _ws.connect();
+    await _joinChannels();
+  }
 
-    // WebSocketManager.connect() ensures socket is connected
-    // Now join the user-specific channel
-    final channelTopic = 'sync:user:${config.userId}';
-    _logger.info('Attempting to join channel $channelTopic');
-    await _ws.joinChannel(channelTopic, {
-      'client_id': config.clientId,
-    });
-    _logger.info('Channel joined successfully');
+  /// Join all configured channels
+  Future<void> _joinChannels() async {
+    // Join user-specific channel (always required)
+    final userTopic = 'sync:user:${config.userId}';
+    _logger.info('Joining channel: $userTopic');
+    await _ws.joinChannel(userTopic, {'client_id': config.clientId});
 
+    // Join world channel if requested
+    if (_joinWorld) {
+      _logger.info('Joining channel: sync:world');
+      await _ws.joinChannel('sync:world', {'client_id': config.clientId});
+    }
+
+    // Join zone channels
+    if (_zones != null) {
+      for (final zone in _zones!) {
+        final topic = 'sync:zone:$zone';
+        _logger.info('Joining channel: $topic');
+        await _ws.joinChannel(topic, {'client_id': config.clientId});
+      }
+    }
+
+    // Join guild channels
+    if (_guilds != null) {
+      for (final guild in _guilds!) {
+        final topic = 'sync:guild:$guild';
+        _logger.info('Joining channel: $topic');
+        await _ws.joinChannel(topic, {'client_id': config.clientId});
+      }
+    }
+
+    // Join party channels
+    if (_parties != null) {
+      for (final party in _parties!) {
+        final topic = 'sync:party:$party';
+        _logger.info('Joining channel: $topic');
+        await _ws.joinChannel(topic, {'client_id': config.clientId});
+      }
+    }
+
+    _logger.info('All channels joined successfully');
+    _hasConnectedOnce = true;
     _startPeriodicSync();
-
     await _sendHello();
   }
 
@@ -391,7 +449,13 @@ class SyncClient {
 
     switch (state) {
       case ConnectionState.connected:
-        // Note: _sendHello() and _startPeriodicSync() are called in connect() after joining channel
+        // When reconnected (not initial connection), rejoin channels
+        if (_hasConnectedOnce) {
+          _logger.info('Reconnected - rejoining channels');
+          _joinChannels().catchError((e) {
+            _logger.severe('Failed to rejoin channels after reconnect: $e');
+          });
+        }
         break;
       case ConnectionState.disconnected:
       case ConnectionState.failed:

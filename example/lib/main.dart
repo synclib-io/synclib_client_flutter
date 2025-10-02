@@ -111,7 +111,19 @@ class _MyAppState extends State<MyApp> {
 
     try {
       setState(() => _status = 'Connecting...');
-      await _syncClient!.connect();
+
+      // Connect with optional channel subscriptions
+      // For an MMORPG, you might subscribe to:
+      // - joinWorld: true (for global announcements)
+      // - zones: ['forest', 'city'] (for nearby player updates)
+      // - guilds: ['guild-123'] (for guild chat)
+      // - parties: ['party-456'] (for party updates)
+      await _syncClient!.connect(
+        joinWorld: false,  // Set to true to receive global broadcasts
+        // zones: ['zone-1'],  // Uncomment to join zone channels
+        // guilds: ['guild-1'],  // Uncomment to join guild channels
+      );
+
       setState(() => _status = 'Connected! Checking schema...');
 
       // The hello message already includes schema version

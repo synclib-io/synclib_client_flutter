@@ -22,7 +22,7 @@ class WebSocketManager {
   final Logger _logger = Logger('WebSocketManager');
 
   PhoenixSocket? _socket;
-  PhoenixChannel? _channel;
+  final Map<String, PhoenixChannel> _channels = {};
   ConnectionState _state = ConnectionState.disconnected;
   StreamController<SyncMessage>? _messageController;
   StreamController<ConnectionState>? _stateController;
@@ -106,17 +106,25 @@ class WebSocketManager {
     }
 
     try {
-      _channel = _socket!.addChannel(topic: topic, parameters: params);
+      // Leave existing channel with this topic if present
+      if (_channels.containsKey(topic)) {
+        _logger.info('Channel $topic already exists, leaving old one');
+        _channels[topic]?.leave();
+        _channels.remove(topic);
+      }
+
+      final channel = _socket!.addChannel(topic: topic, parameters: params);
 
       // Listen for messages
-      _channel!.messages.listen((message) {
+      channel.messages.listen((message) {
         _onMessage(message);
       });
 
       // Join the channel
-      final pushResponse = await _channel!.join().future;
+      final pushResponse = await channel.join().future;
 
       if (pushResponse.isOk) {
+        _channels[topic] = channel;
         _logger.info('Joined channel: $topic');
       } else {
         _logger.severe('Failed to join channel: ${pushResponse.response}');
@@ -131,16 +139,22 @@ class WebSocketManager {
   /// Disconnect from WebSocket server
   Future<void> disconnect() async {
     _logger.info('Disconnecting');
-    _channel?.leave();
-    _channel = null;
+
+    // Leave all channels
+    for (final channel in _channels.values) {
+      channel.leave();
+    }
+    _channels.clear();
+
     _socket?.dispose();
     _socket = null;
     _updateState(ConnectionState.disconnected);
   }
 
   /// Send a message to the server
+  /// Sends to the first channel (user channel) by default
   Future<void> send(SyncMessage message) async {
-    if (!isConnected || _channel == null) {
+    if (!isConnected || _channels.isEmpty) {
       throw StateError('Not connected to channel');
     }
 
@@ -151,7 +165,9 @@ class WebSocketManager {
 
       _logger.fine('Sending event: $event with payload: $map');
 
-      final push = _channel!.push(event, map);
+      // Send to the first channel (user channel)
+      final channel = _channels.values.first;
+      final push = channel.push(event, map);
       await push.future;
 
       _logger.fine('Sent message: $event');
