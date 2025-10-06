@@ -76,6 +76,7 @@ class SyncClient {
   final Set<int> _pendingAcks = {};
 
   // Store channel subscription params for reconnection
+  String? _token;
   bool _joinWorld = false;
   List<String>? _zones;
   List<String>? _guilds;
@@ -113,12 +114,15 @@ class SyncClient {
 
   /// Connect to sync server
   ///
+  /// [token] - Authentication token (JWT) required by the server
+  ///
   /// Optionally provide additional channels to subscribe to:
   /// - world: Global announcements
   /// - zones: List of zone IDs to subscribe to
   /// - guilds: List of guild IDs to subscribe to
   /// - parties: List of party IDs to subscribe to
   Future<void> connect({
+    required String token,
     bool joinWorld = false,
     List<String>? zones,
     List<String>? guilds,
@@ -128,13 +132,19 @@ class SyncClient {
       throw StateError('Not initialized. Call initialize() first.');
     }
 
-    // Store channel subscription params for reconnection
+    // Store connection params for reconnection
+    _token = token;
     _joinWorld = joinWorld;
     _zones = zones;
     _guilds = guilds;
     _parties = parties;
 
-    await _ws.connect();
+    await _ws.connect(
+      params: {
+        'token': token,
+        'client_id': config.clientId,
+      },
+    );
     await _joinChannels();
   }
 
@@ -500,6 +510,8 @@ class SyncClient {
         // Skip server-only timestamp fields
         if (key == 'inserted_at') continue;
 
+        // TODO, is this necessary? they should be the same.
+        // do we need use case specific code here?
         // Map server field names to client field names
         String clientKey = key;
         if (change.table == 'users' && key == 'username') {

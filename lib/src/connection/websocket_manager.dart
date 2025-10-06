@@ -27,6 +27,7 @@ class WebSocketManager {
   StreamController<SyncMessage>? _messageController;
   StreamController<ConnectionState>? _stateController;
   int _reconnectAttempts = 0;
+  Map<String, dynamic>? _connectionParams;
 
   WebSocketManager({
     required this.url,
@@ -51,10 +52,15 @@ class WebSocketManager {
   bool get isConnected => _state == ConnectionState.connected;
 
   /// Connect to WebSocket server
-  Future<void> connect() async {
+  Future<void> connect({Map<String, dynamic>? params}) async {
     if (_state == ConnectionState.connected || _state == ConnectionState.connecting) {
       _logger.info('Already connected or connecting');
       return;
+    }
+
+    // Store params for reconnection
+    if (params != null) {
+      _connectionParams = params;
     }
 
     _updateState(ConnectionState.connecting);
@@ -62,10 +68,16 @@ class WebSocketManager {
 
     try {
       // Create Phoenix socket
+      // Convert params to Map<String, String> as required by PhoenixSocketOptions
+      final stringParams = _connectionParams?.map(
+        (key, value) => MapEntry(key, value.toString()),
+      ) ?? <String, String>{};
+
       _socket = PhoenixSocket(
         url,
         socketOptions: PhoenixSocketOptions(
           timeout: const Duration(seconds: 10),
+          params: stringParams,
         ),
       );
 

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
 import 'package:flutter/material.dart';
 import 'package:synclib_sync/synclib_sync.dart' as sync;
 import 'package:synclib_flutter/synclib_flutter.dart';
@@ -54,7 +55,7 @@ class _MyAppState extends State<MyApp> {
       final config = sync.SyncClientConfig(
         dbPath: dbPath,
         serverUrl: 'ws://localhost:4000/socket/websocket', // Your Elixir server
-        clientId: 'flutter-client-123',
+        clientId: 'client1',
         userId: userId, // User-specific channel for scalability
         codec: sync.SyncCodecType.messagepack, // Or sync.SyncCodecType.json
         pushInterval: const Duration(seconds: 5),
@@ -118,7 +119,27 @@ class _MyAppState extends State<MyApp> {
       // - zones: ['forest', 'city'] (for nearby player updates)
       // - guilds: ['guild-123'] (for guild chat)
       // - parties: ['party-456'] (for party updates)
+
+      final private_key_for_jwt = """works""";
+
+      // Create JWT token
+      final jwt = JWT(
+        {
+          'user_id': 'test',
+          'client_id': 'client1',
+          'iat': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          'exp': DateTime.now().add(Duration(hours: 24)).millisecondsSinceEpoch ~/ 1000,
+        },
+      );
+
+      // Sign the JWT with RS256 algorithm
+      final token = jwt.sign(
+        RSAPrivateKey(private_key_for_jwt),
+        algorithm: JWTAlgorithm.RS256,
+      );
+      
       await _syncClient!.connect(
+        token: token,  // JWT token for authentication
         joinWorld: false,  // Set to true to receive global broadcasts
         // zones: ['zone-1'],  // Uncomment to join zone channels
         // guilds: ['guild-1'],  // Uncomment to join guild channels
