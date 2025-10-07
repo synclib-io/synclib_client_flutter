@@ -513,13 +513,13 @@ class SyncClient {
       case 'insert':
         final columns = filteredData.keys.join(', ');
         final values = filteredData.values
-          .map((v) => v is String ? "'${_escapeSql(v)}'" : v.toString())
+          .map((v) => _formatSqlValue(v))
           .join(', ');
         return 'INSERT OR REPLACE INTO ${change.table} ($columns) VALUES ($values)';
 
       case 'update':
         final sets = filteredData.entries
-          .map((e) => '${e.key} = ${e.value is String ? "'${_escapeSql(e.value)}'" : e.value}')
+          .map((e) => '${e.key} = ${_formatSqlValue(e.value)}')
           .join(', ');
         return 'UPDATE ${change.table} SET $sets WHERE id = \'${_escapeSql(change.rowId)}\'';
 
@@ -528,6 +528,19 @@ class SyncClient {
 
       default:
         throw ArgumentError('Unknown operation: ${change.operation}');
+    }
+  }
+
+  /// Format a value for SQL
+  String _formatSqlValue(dynamic value) {
+    if (value == null) {
+      return 'null';
+    } else if (value is String) {
+      return "'${_escapeSql(value)}'";
+    } else if (value is bool) {
+      return value ? '1' : '0';
+    } else {
+      return value.toString();
     }
   }
 
