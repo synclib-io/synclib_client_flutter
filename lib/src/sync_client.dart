@@ -331,22 +331,9 @@ class SyncClient {
 
       // Notify listeners that a remote change was applied
       _remoteChangeController.add(change);
-
-      // Send acknowledgment
-      if (change.seqnum != null) {
-        final ack = AckMessage(seqnum: change.seqnum!, success: true);
-        await _ws.send(ack);
-      }
     } catch (e, stack) {
       _logger.severe('Failed to apply remote change: $e', e, stack);
-      if (change.seqnum != null) {
-        final ack = AckMessage(
-          seqnum: change.seqnum!,
-          success: false,
-          error: e.toString(),
-        );
-        await _ws.send(ack);
-      }
+      // Note: We don't send acks for remote changes - only the server sends acks
     }
   }
 

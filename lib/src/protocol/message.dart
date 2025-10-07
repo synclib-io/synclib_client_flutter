@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:synclib_flutter/synclib_flutter.dart';
 
 /// Base class for all sync protocol messages
@@ -145,8 +146,7 @@ class ChangeMessage extends SyncMessage {
 
   static Map<String, dynamic>? _parseJson(String jsonString) {
     try {
-      final json = jsonString; // In real implementation, use json.decode
-      return {'raw': json}; // Placeholder - actual JSON parsing needed
+      return jsonDecode(jsonString) as Map<String, dynamic>;
     } catch (e) {
       return null;
     }
