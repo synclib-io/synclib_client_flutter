@@ -189,6 +189,37 @@ class WebSocketManager {
     }
   }
 
+  /// Send a raw message with custom event and payload, returns server response
+  Future<Map<String, dynamic>> sendRaw(
+    String event,
+    Map<String, dynamic> payload,
+  ) async {
+    if (!isConnected || _channels.isEmpty) {
+      throw StateError('Not connected to channel');
+    }
+
+    try {
+      _logger.fine('Sending raw event: $event with payload: $payload');
+
+      // Send to the first channel (user channel)
+      final channel = _channels.values.first;
+      final push = channel.push(event, payload);
+      final response = await push.future;
+
+      _logger.fine('Sent raw message: $event, received response');
+
+      // Phoenix response structure: {status: "ok", response: {...}}
+      if (response.isOk) {
+        return Map<String, dynamic>.from(response.response as Map);
+      } else {
+        throw Exception('Server error: ${response.response}');
+      }
+    } catch (e) {
+      _logger.severe('Failed to send raw message: $e');
+      rethrow;
+    }
+  }
+
   /// Handle incoming message
   void _onMessage(Message message) {
     try {

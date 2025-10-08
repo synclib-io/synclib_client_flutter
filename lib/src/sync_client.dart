@@ -549,6 +549,49 @@ class SyncClient {
     return value.replaceAll("'", "''");
   }
 
+  /// Fetch a full row from the server (including JSONB fields)
+  ///
+  /// Example:
+  /// ```dart
+  /// final user = await syncClient.fetchRow('users', 'user123');
+  /// print(user['document']); // Access JSONB field
+  /// ```
+  Future<Map<String, dynamic>> fetchRow(String table, String rowId) async {
+    final response = await sendMessage('fetch_row', {
+      'table': table,
+      'row_id': rowId,
+    });
+    return response['row'] as Map<String, dynamic>;
+  }
+
+  /// Send a custom message to the server and wait for reply
+  ///
+  /// Example:
+  /// ```dart
+  /// final response = await syncClient.sendMessage('fetch_row', {
+  ///   'table': 'users',
+  ///   'row_id': 'user123',
+  /// });
+  /// ```
+  Future<Map<String, dynamic>> sendMessage(
+    String event,
+    Map<String, dynamic> payload,
+  ) async {
+    if (!_ws.isConnected) {
+      throw Exception('Not connected to server');
+    }
+
+    try {
+      // Send the message and wait for response
+      // The Phoenix library handles request/response matching automatically
+      final response = await _ws.sendRaw(event, payload);
+      return response;
+    } catch (e) {
+      _logger.severe('Failed to send message: $e');
+      rethrow;
+    }
+  }
+
   /// Get current connection state
   ConnectionState get connectionState => _ws.state;
 
