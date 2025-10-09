@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:logging/logging.dart';
 import 'package:synclib_flutter/synclib_flutter.dart';
 import 'connection/websocket_manager.dart';
 import 'protocol/message.dart';
 import 'protocol/codec.dart';
+import 'package:sqlite3/sqlite3.dart';
 
 /// Callback for conflict resolution
 /// Returns the resolved change, or null to skip
@@ -315,17 +317,34 @@ class SyncClient {
         }
       }
 
-      // Generate SQL for the operation
-      final sql = _generateSql(change);
+      // Check if change contains JSONB data that needs parameterized query
+      final hasJsonbData = change.data != null &&
+        (change.data is Map || change.data is List ||
+         (change.data is Map<String, dynamic> &&
+          (change.data as Map<String, dynamic>).values.any((v) => v is Map || v is List)));
 
-      // Apply to local database
-      await _db!.applyRemote(
-        tableName: change.table,
-        rowId: change.rowId,
-        operation: change.toSynclibOperation(),
-        sql: sql,
-        data: change.data?.toString(),
-      );
+      if (hasJsonbData && (change.operation == 'update' || change.operation == 'insert' || change.operation == 'upsert')) {
+        // Use parameterized query for JSONB data
+        final result = _generateSqlWithParams(change);
+        await _db!.applyRemoteWithParams(
+          tableName: change.table,
+          rowId: change.rowId,
+          operation: change.toSynclibOperation(),
+          sql: result.sql,
+          params: result.params,
+          data: change.data?.toString(),
+        );
+      } else {
+        // Use simple SQL for non-JSONB operations
+        final sql = _generateSql(change);
+        await _db!.applyRemote(
+          tableName: change.table,
+          rowId: change.rowId,
+          operation: change.toSynclibOperation(),
+          sql: sql,
+          data: change.data?.toString(),
+        );
+      }
 
       _logger.fine('Applied remote change: ${change.operation} on ${change.table}');
 
@@ -511,12 +530,15 @@ class SyncClient {
 
     switch (change.operation) {
       case 'insert':
-        final columns = filteredData.keys.join(', ');
-        final values = filteredData.values
-          .map((v) => _formatSqlValue(v))
-          .join(', ');
+        // final columns = filteredData.keys.join(', ');
+        // final values = filteredData.values
+        //   .map((v) => _formatSqlValue(v))
+        //   .join(', ');
+        // return 'INSERT OR REPLACE INTO ${change.table} ($columns) VALUES ($values)';
+        // the problems is that there is no isSusbcribed table. it should be document: {isSubscribed: true}
+        final columns = ['id', ...filteredData.keys].join(', ');
+        final values = ['\'${_escapeSql(change.rowId)}\'', ...filteredData.values.map((v) => _formatSqlValue(v))].join(', ');
         return 'INSERT OR REPLACE INTO ${change.table} ($columns) VALUES ($values)';
-
       case 'update':
         final sets = filteredData.entries
           .map((e) => '${e.key} = ${_formatSqlValue(e.value)}')
@@ -531,6 +553,62 @@ class SyncClient {
     }
   }
 
+  /// Generate SQL with parameters for JSONB data
+  ({String sql, List<String?> params}) _generateSqlWithParams(ChangeMessage change) {
+    final data = change.data as Map<String, dynamic>;
+    final params = <String?>[];
+
+    // Filter out metadata fields
+    final filteredData = <String, dynamic>{};
+    for (final entry in data.entries) {
+      final key = entry.key;
+      final value = entry.value;
+
+      if (key == 'id' || key == 'updated_at' || key == 'inserted_at') continue;
+
+      filteredData[key] = value;
+    }
+
+    switch (change.operation) {
+      case 'insert':
+      case 'upsert':
+        final columns = ['id', ...filteredData.keys].join(', ');
+        final placeholders = ['?', ...List.generate(filteredData.length, (_) => '?')].join(', ');
+
+        // Build parameters array
+        params.add(change.rowId);
+        for (final value in filteredData.values) {
+          if (value is Map || value is List) {
+            params.add(jsonEncode(value));
+          } else {
+            params.add(value?.toString());
+          }
+        }
+
+        final insertSql = 'INSERT OR REPLACE INTO ${change.table} ($columns) VALUES ($placeholders)';
+        return (sql: insertSql, params: params);
+
+      case 'update':
+        final setClauses = <String>[];
+        for (final entry in filteredData.entries) {
+          if (entry.value is Map || entry.value is List) {
+            setClauses.add('${entry.key} = jsonb(?)');
+            params.add(jsonEncode(entry.value));
+          } else {
+            setClauses.add('${entry.key} = ?');
+            params.add(entry.value?.toString());
+          }
+        }
+
+        final updateSql = 'UPDATE ${change.table} SET ${setClauses.join(', ')} WHERE id = ?';
+        params.add(change.rowId);
+        return (sql: updateSql, params: params);
+
+      default:
+        throw ArgumentError('Unsupported operation for parameterized query: ${change.operation}');
+    }
+  }
+
   /// Format a value for SQL
   String _formatSqlValue(dynamic value) {
     if (value == null) {
@@ -539,6 +617,19 @@ class SyncClient {
       return "'${_escapeSql(value)}'";
     } else if (value is bool) {
       return value ? '1' : '0';
+    } else if (value is num) {
+      return value.toString();
+    } else if (value is Map || value is List) {
+      // For complex types (JSONB, arrays), encode as JSON string
+      // final jsonString = jsonb.encode(value); // jsonEncode(value);
+      // return "'${_escapeSql(jsonString)}'";
+
+      // could try like this...
+      // For complex types (JSONB, arrays), use SQLite's jsonb() function
+      // This creates proper JSONB binary format for efficient storage/querying
+      final jsonString = jsonEncode(value);
+      return "jsonb('${_escapeSql(jsonString)}')";
+
     } else {
       return value.toString();
     }
