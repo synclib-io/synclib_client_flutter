@@ -51,7 +51,7 @@ class SyncClientConfig {
     required this.serverUrl,
     required this.clientId,
     required this.userId,
-    this.codec = SyncCodecType.messagepack,
+    this.codec = SyncCodecType.json,
     this.pushInterval = const Duration(seconds: 5),
     this.pushBatchSize = 100,
     this.pullInterval,
@@ -67,6 +67,7 @@ class SyncClient {
 
   late final WebSocketManager _ws;
   SynclibDatabase? _db;
+  Database? _readDb; // Read-only sqlite3 connection for queries
   Timer? _pushTimer;
   Timer? _pullTimer;
   StreamSubscription? _messageSubscription;
@@ -105,6 +106,7 @@ class SyncClient {
 
     // Open database
     _db = await SynclibDatabase.open(config.dbPath);
+    _readDb = sqlite3.open(config.dbPath, mode: OpenMode.readOnly);
     _logger.info('Database opened: ${config.dbPath}');
 
     // Subscribe to WebSocket messages
@@ -282,6 +284,10 @@ class SyncClient {
         await _handlePhoenixReply(message);
       } else if (message is ErrorMessage) {
         _handleError(message);
+      } else if (message is SnapshotBatchMessage) {
+        await _handleSnapshotBatch(message);
+      } else if (message is SnapshotCompleteMessage) {
+        _handleSnapshotComplete(message);
       } else {
         _logger.warning('Unhandled message type: ${message.runtimeType}');
       }
@@ -400,6 +406,40 @@ class SyncClient {
   void _handleError(ErrorMessage error) {
     _logger.severe('Server error: ${error.code} - ${error.message}');
     // TODO: Implement error recovery strategies
+  }
+
+  /// Handle snapshot batch message
+  Future<void> _handleSnapshotBatch(SnapshotBatchMessage batch) async {
+    _logger.info('Received snapshot batch for ${batch.table}: ${batch.rows.length} rows');
+
+    // Apply each row to the database
+    await _db!.beginBulkRemote();
+    try {
+      for (final row in batch.rows) {
+        // Create a change message for each row
+        final change = ChangeMessage(
+          table: batch.table,
+          operation: 'insert',
+          rowId: row['id'] as String,
+          data: row,
+        );
+
+        final sql = _generateSql(change);
+        await _db!.execBulkRemote(sql);
+      }
+      await _db!.endBulkRemote();
+      _logger.info('Successfully applied snapshot batch for ${batch.table}');
+    } catch (e) {
+      _logger.severe('Failed to apply snapshot batch: $e');
+      await _db!.endBulkRemote(rollback: true);
+      rethrow;
+    }
+  }
+
+  /// Handle snapshot complete message
+  void _handleSnapshotComplete(SnapshotCompleteMessage message) {
+    _logger.info('Snapshot complete for stream ${message.streamId}');
+    // TODO: Notify listeners or update state
   }
 
   /// Handle Phoenix reply messages (especially hello response with migrations)
@@ -640,6 +680,85 @@ class SyncClient {
     return value.replaceAll("'", "''");
   }
 
+  /// Stream snapshot of tables from server
+  ///
+  /// Supports incremental sync by querying max seqnum from local tables.
+  ///
+  /// Example:
+  /// ```dart
+  /// // Full sync (all data)
+  /// await syncClient.streamSnapshot(['users', 'journal_entries']);
+  ///
+  /// // Incremental sync (only changes since last sync)
+  /// await syncClient.streamSnapshot(['users', 'journal_entries'], incremental: true);
+  /// ```
+  Future<void> streamSnapshot(
+    List<String> tables, {
+    bool incremental = false,
+  }) async {
+    if (!_ws.isConnected) {
+      throw Exception('Not connected to server');
+    }
+
+    int? sinceSeqnum;
+
+    if (incremental) {
+      // Query the minimum seqnum across all requested tables
+      // This ensures we get all changes since the oldest table was synced
+      sinceSeqnum = await _getMinServerSeqnum(tables);
+      _logger.info('Requesting incremental snapshot since seqnum: $sinceSeqnum');
+    } else {
+      _logger.info('Requesting full snapshot');
+    }
+
+    final payload = {
+      'tables': tables,
+      if (sinceSeqnum != null) 'since_seqnum': sinceSeqnum,
+    };
+
+    await _ws.sendRaw('stream_snapshot', payload);
+  }
+
+  /// Get the minimum seqnum across multiple tables
+  /// Returns null if any table has no data
+  Future<int?> _getMinServerSeqnum(List<String> tables) async {
+    int? minSeqnum;
+
+    for (final table in tables) {
+      final seqnum = await _getMaxSeqnumFromTable(table);
+      if (seqnum == null) {
+        // If any table has no data, do a full sync
+        return null;
+      }
+      if (minSeqnum == null || seqnum < minSeqnum) {
+        minSeqnum = seqnum;
+      }
+    }
+
+    return minSeqnum;
+  }
+
+  /// Query the max seqnum from a local SQLite table
+  Future<int?> _getMaxSeqnumFromTable(String table) async {
+    try {
+      final result = _readDb!.select('SELECT MAX(seqnum) as max_seqnum FROM $table');
+
+      if (result.isEmpty) {
+        return null;
+      }
+
+      final maxSeqnum = result.first['max_seqnum'];
+      if (maxSeqnum == null) {
+        return null;
+      }
+
+      return maxSeqnum is int ? maxSeqnum : int.parse(maxSeqnum.toString());
+    } catch (e) {
+      _logger.warning('Failed to get max seqnum for table $table: $e');
+      return null;
+    }
+  }
+
   /// Fetch a full row from the server (including JSONB fields)
   ///
   /// Example:
@@ -700,6 +819,7 @@ class SyncClient {
     await _remoteChangeController.close();
     await _ws.dispose();
     await _db?.close();
+    _readDb?.dispose();
     _isInitialized = false;
   }
 }

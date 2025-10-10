@@ -30,6 +30,10 @@ abstract class SyncMessage {
         return SchemaConfirmMessage.fromMap(map);
       case 'error':
         return ErrorMessage.fromMap(map);
+      case 'snapshot_batch':
+        return SnapshotBatchMessage.fromMap(map);
+      case 'snapshot_complete':
+        return SnapshotCompleteMessage.fromMap(map);
       default:
         throw UnsupportedError('Unknown message type: $type');
     }
@@ -307,5 +311,55 @@ class SchemaConfirmMessage extends SyncMessage {
   factory SchemaConfirmMessage.fromMap(Map<String, dynamic> map) =>
     SchemaConfirmMessage(
       version: map['version'] as int,
+    );
+}
+
+/// Snapshot batch message (streaming table data)
+class SnapshotBatchMessage extends SyncMessage {
+  final String streamId;
+  final String table;
+  final List<Map<String, dynamic>> rows;
+
+  const SnapshotBatchMessage({
+    required this.streamId,
+    required this.table,
+    required this.rows,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'snapshot_batch',
+    'stream_id': streamId,
+    'table': table,
+    'rows': rows,
+  };
+
+  factory SnapshotBatchMessage.fromMap(Map<String, dynamic> map) {
+    final rowsData = map['rows'] as List? ?? [];
+    return SnapshotBatchMessage(
+      streamId: map['stream_id'] as String,
+      table: map['table'] as String,
+      rows: rowsData.map((r) => Map<String, dynamic>.from(r as Map)).toList(),
+    );
+  }
+}
+
+/// Snapshot complete message (marks end of snapshot stream)
+class SnapshotCompleteMessage extends SyncMessage {
+  final String streamId;
+
+  const SnapshotCompleteMessage({
+    required this.streamId,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'snapshot_complete',
+    'stream_id': streamId,
+  };
+
+  factory SnapshotCompleteMessage.fromMap(Map<String, dynamic> map) =>
+    SnapshotCompleteMessage(
+      streamId: map['stream_id'] as String,
     );
 }
