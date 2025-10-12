@@ -17,9 +17,11 @@ typedef ConflictResolver = Future<ChangeMessage?> Function(
 class SyncClientChannel {
   final String channelName;
   final String channelId;
+  final Map<String, String>? params;
   const SyncClientChannel({
     required this.channelName,
     required this.channelId,
+    this.params
   });  
 }
 
@@ -167,7 +169,7 @@ class SyncClient {
     for (final channel in config.initialChannels) {
       final topic = 'sync:${channel.channelName}:${channel.channelId}';
       _logger.info('Joining channel: $topic');
-      await _ws.joinChannel(topic, {'client_id': config.clientId});            
+      await _ws.joinChannel(topic, {'client_id': config.clientId, ...?channel.params});
     }
 
     _logger.info('All channels joined successfully');
