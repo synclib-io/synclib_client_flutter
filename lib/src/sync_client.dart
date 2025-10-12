@@ -682,9 +682,7 @@ class SyncClient {
     int? sinceSeqnum;
 
     if (incremental) {
-      // Query the minimum seqnum across all requested tables
-      // This ensures we get all changes since the oldest table was synced
-      sinceSeqnum = await _getMinServerSeqnum(tables);
+      sinceSeqnum = await _getMaxServerSeqnum(tables); // seqnum is global across all tables. we have anything under the max
       _logger.info('Requesting incremental snapshot since seqnum: $sinceSeqnum');
     } else {
       _logger.info('Requesting full snapshot');
@@ -698,43 +696,39 @@ class SyncClient {
     await _ws.sendRaw('stream_snapshot', payload, channelTopic: channelTopic);
   }
 
-  /// Get the minimum seqnum across multiple tables
+  /// Get the max seqnum across multiple tables
   /// Returns null if any table has no data
-  Future<int?> _getMinServerSeqnum(List<String> tables) async {
-    int? minSeqnum;
+  Future<int?> _getMaxServerSeqnum(List<String> tables) async {
+    int? maxSeqnum;
 
     for (final table in tables) {
       final seqnum = await _getMaxSeqnumFromTable(table);
-      if (seqnum == null) {
-        // If any table has no data, do a full sync
-        return null;
-      }
-      if (minSeqnum == null || seqnum < minSeqnum) {
-        minSeqnum = seqnum;
+      if (maxSeqnum == null || seqnum > maxSeqnum) {
+        maxSeqnum = seqnum;
       }
     }
 
-    return minSeqnum;
+    return maxSeqnum;
   }
 
   /// Query the max seqnum from a local SQLite table
-  Future<int?> _getMaxSeqnumFromTable(String table) async {
+  Future<int> _getMaxSeqnumFromTable(String table) async {
     try {
       final result = _readDb!.select('SELECT MAX(seqnum) as max_seqnum FROM $table');
 
       if (result.isEmpty) {
-        return null;
+        return 0;
       }
 
       final maxSeqnum = result.first['max_seqnum'];
       if (maxSeqnum == null) {
-        return null;
+        return 0;
       }
 
       return maxSeqnum is int ? maxSeqnum : int.parse(maxSeqnum.toString());
     } catch (e) {
       _logger.warning('Failed to get max seqnum for table $table: $e');
-      return null;
+      return 0;
     }
   }
 
