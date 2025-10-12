@@ -14,6 +14,15 @@ typedef ConflictResolver = Future<ChangeMessage?> Function(
   ChangeMessage remote,
 );
 
+class SyncClientChannel {
+  final String channelName;
+  final String channelId;
+  const SyncClientChannel({
+    required this.channelName,
+    required this.channelId,
+  });  
+}
+
 /// Configuration for sync client
 class SyncClientConfig {
   /// Path to local SQLite database
@@ -25,8 +34,9 @@ class SyncClientConfig {
   /// Unique client identifier
   final String clientId;
 
-  /// User ID for user-specific channel subscription
-  final String userId;
+  /// channels to connect to initially
+  // todo allow connecting to any channel dynamically later
+  final List<SyncClientChannel> initialChannels;
 
   /// Codec for message encoding
   final SyncCodecType codec;
@@ -50,7 +60,7 @@ class SyncClientConfig {
     required this.dbPath,
     required this.serverUrl,
     required this.clientId,
-    required this.userId,
+    required this.initialChannels,
     this.codec = SyncCodecType.json,
     this.pushInterval = const Duration(seconds: 5),
     this.pushBatchSize = 100,
@@ -121,10 +131,7 @@ class SyncClient {
   /// [token] - Authentication token (JWT) required by the server
   ///
   /// Optionally provide additional channels to subscribe to:
-  /// - world: Global announcements
-  /// - zones: List of zone IDs to subscribe to
-  /// - guilds: List of guild IDs to subscribe to
-  /// - parties: List of party IDs to subscribe to
+  // should connect to what is passed in to config for possible channels
   Future<void> connect({
     required String token,
     bool joinWorld = false,
@@ -153,43 +160,14 @@ class SyncClient {
   }
 
   /// Join all configured channels
+  // todo use initial channels
   Future<void> _joinChannels() async {
     // Join user-specific channel (always required)
-    final userTopic = 'sync:user:${config.userId}';
-    _logger.info('Joining channel: $userTopic');
-    await _ws.joinChannel(userTopic, {'client_id': config.clientId});
 
-    // Join world channel if requested
-    if (_joinWorld) {
-      _logger.info('Joining channel: sync:world');
-      await _ws.joinChannel('sync:world', {'client_id': config.clientId});
-    }
-
-    // Join zone channels
-    if (_zones != null) {
-      for (final zone in _zones!) {
-        final topic = 'sync:zone:$zone';
-        _logger.info('Joining channel: $topic');
-        await _ws.joinChannel(topic, {'client_id': config.clientId});
-      }
-    }
-
-    // Join guild channels
-    if (_guilds != null) {
-      for (final guild in _guilds!) {
-        final topic = 'sync:guild:$guild';
-        _logger.info('Joining channel: $topic');
-        await _ws.joinChannel(topic, {'client_id': config.clientId});
-      }
-    }
-
-    // Join party channels
-    if (_parties != null) {
-      for (final party in _parties!) {
-        final topic = 'sync:party:$party';
-        _logger.info('Joining channel: $topic');
-        await _ws.joinChannel(topic, {'client_id': config.clientId});
-      }
+    for (final channel in config.initialChannels) {
+      final topic = 'sync:${channel.channelName}:${channel.channelId}';
+      _logger.info('Joining channel: $topic');
+      await _ws.joinChannel(topic, {'client_id': config.clientId});            
     }
 
     _logger.info('All channels joined successfully');
@@ -695,6 +673,7 @@ class SyncClient {
   Future<void> streamSnapshot(
     List<String> tables, {
     bool incremental = false,
+        String? channelTopic
   }) async {
     if (!_ws.isConnected) {
       throw Exception('Not connected to server');
@@ -716,7 +695,7 @@ class SyncClient {
       if (sinceSeqnum != null) 'since_seqnum': sinceSeqnum,
     };
 
-    await _ws.sendRaw('stream_snapshot', payload);
+    await _ws.sendRaw('stream_snapshot', payload, channelTopic: channelTopic);
   }
 
   /// Get the minimum seqnum across multiple tables
@@ -786,6 +765,7 @@ class SyncClient {
   Future<Map<String, dynamic>> sendMessage(
     String event,
     Map<String, dynamic> payload,
+    {String? channelTopic}
   ) async {
     if (!_ws.isConnected) {
       throw Exception('Not connected to server');
@@ -794,7 +774,7 @@ class SyncClient {
     try {
       // Send the message and wait for response
       // The Phoenix library handles request/response matching automatically
-      final response = await _ws.sendRaw(event, payload);
+      final response = await _ws.sendRaw(event, payload, channelTopic: channelTopic);
       return response;
     } catch (e) {
       _logger.severe('Failed to send message: $e');

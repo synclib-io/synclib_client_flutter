@@ -3,6 +3,7 @@ import 'package:phoenix_socket/phoenix_socket.dart';
 import 'package:logging/logging.dart';
 import '../protocol/message.dart';
 import '../protocol/codec.dart';
+import 'package:collection/collection.dart' show IterableExtension;
 
 /// Connection state
 enum ConnectionState {
@@ -165,7 +166,7 @@ class WebSocketManager {
 
   /// Send a message to the server
   /// Sends to the first channel (user channel) by default
-  Future<void> send(SyncMessage message) async {
+  Future<void> send(SyncMessage message, {String? channelTopic}) async {
     if (!isConnected || _channels.isEmpty) {
       throw StateError('Not connected to channel');
     }
@@ -177,9 +178,16 @@ class WebSocketManager {
 
       _logger.fine('Sending event: $event with payload: $map');
 
-      // Send to the first channel (user channel)
-      final channel = _channels.values.first;
-      final push = channel.push(event, map);
+      PhoenixChannel? channel = _channels.values.first;
+      if (channelTopic != null) {
+        final existingChannelKey = _channels.keys.firstWhereOrNull((k) =>
+            k.contains(channelTopic));
+        channel = existingChannelKey != null
+            ? _channels[existingChannelKey]
+            : _channels.values.first;
+      }
+
+      final push = channel!.push(event, map);
       await push.future;
 
       _logger.fine('Sent message: $event');
@@ -193,6 +201,7 @@ class WebSocketManager {
   Future<Map<String, dynamic>> sendRaw(
     String event,
     Map<String, dynamic> payload,
+    {String? channelTopic}
   ) async {
     if (!isConnected || _channels.isEmpty) {
       throw StateError('Not connected to channel');
@@ -201,12 +210,19 @@ class WebSocketManager {
     try {
       _logger.fine('Sending raw event: $event with payload: $payload');
 
-      // Send to the first channel (user channel)
-      final channel = _channels.values.first;
-      final push = channel.push(event, payload);
+      PhoenixChannel? channel = _channels.values.first;
+      if (channelTopic != null) {
+        final existingChannelKey = _channels.keys.firstWhereOrNull((k) =>
+            k.contains(channelTopic));
+        channel = existingChannelKey != null
+            ? _channels[existingChannelKey]
+            : _channels.values.first;
+      }
+
+      final push = channel!.push(event, payload);
       final response = await push.future;
 
-      _logger.fine('Sent raw message: $event, received response');
+      _logger.fine('Sent on channel ${channelTopic ?? 'default'} raw message: $event, received response');
 
       // Phoenix response structure: {status: "ok", response: {...}}
       if (response.isOk) {
