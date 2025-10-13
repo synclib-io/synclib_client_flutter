@@ -5,7 +5,6 @@ import 'package:synclib_sync/synclib_sync.dart' as sync;
 import 'package:synclib_flutter/synclib_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:logging/logging.dart';
-import 'package:sqlite3/sqlite3.dart' as sqlite;
 
 void main() {
   // Enable logging
@@ -230,18 +229,13 @@ class _MyAppState extends State<MyApp> {
       final directory = await getApplicationDocumentsDirectory();
       final dbPath = '${directory.path}/sync_example.db';
 
-      // Use sqlite3 package to query
-      final db = sqlite.sqlite3.open(dbPath);
-      final result = db.select('SELECT id, name, email, updated_at FROM users ORDER BY updated_at DESC');
-      db.dispose();
+      // Use SynclibDatabase to query
+      final db = await SynclibDatabase.open(dbPath);
+      final result = await db.read('SELECT id, name, email, updated_at FROM users ORDER BY updated_at DESC');
+      await db.close();
 
       setState(() {
-        _users = result.map((row) => {
-          'id': row['id'],
-          'name': row['name'],
-          'email': row['email'],
-          'updated_at': row['updated_at'],
-        }).toList();
+        _users = result;
       });
     } catch (e) {
       setState(() => _status = 'Load users error: $e');

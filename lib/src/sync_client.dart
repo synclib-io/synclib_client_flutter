@@ -5,7 +5,6 @@ import 'package:synclib_flutter/synclib_flutter.dart';
 import 'connection/websocket_manager.dart';
 import 'protocol/message.dart';
 import 'protocol/codec.dart';
-import 'package:sqlite3/sqlite3.dart';
 
 /// Callback for conflict resolution
 /// Returns the resolved change, or null to skip
@@ -79,7 +78,6 @@ class SyncClient {
 
   late final WebSocketManager _ws;
   SynclibDatabase? _db;
-  Database? _readDb; // Read-only sqlite3 connection for queries
   Timer? _pushTimer;
   Timer? _pullTimer;
   StreamSubscription? _messageSubscription;
@@ -118,7 +116,6 @@ class SyncClient {
 
     // Open database
     _db = await SynclibDatabase.open(config.dbPath);
-    _readDb = sqlite3.open(config.dbPath, mode: OpenMode.readOnly);
     _logger.info('Database opened: ${config.dbPath}');
 
     // Subscribe to WebSocket messages
@@ -779,7 +776,7 @@ class SyncClient {
   /// Query the max seqnum from a local SQLite table
   Future<int> _getMaxSeqnumFromTable(String table) async {
     try {
-      final result = _readDb!.select('SELECT MAX(seqnum) as max_seqnum FROM $table');
+      final result = await _db!.read('SELECT MAX(seqnum) as max_seqnum FROM $table');
 
       if (result.isEmpty) {
         return 0;
@@ -858,7 +855,6 @@ class SyncClient {
     await _remoteChangeController.close();
     await _ws.dispose();
     await _db?.close();
-    _readDb?.dispose();
     _isInitialized = false;
   }
 }
