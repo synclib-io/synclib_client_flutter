@@ -178,6 +178,69 @@ class SyncClient {
     await _sendHello();
   }
 
+  /// Join an additional channel after initial connection
+  ///
+  /// Example:
+  /// ```dart
+  /// await syncClient.joinChannel(
+  ///   SyncClientChannel(
+  ///     channelName: 'user',
+  ///     channelId: userId,
+  ///   ),
+  /// );
+  /// ```
+  Future<void> joinChannel(SyncClientChannel channel) async {
+    if (!_ws.isConnected) {
+      throw StateError('Not connected. Call connect() first.');
+    }
+
+    final topic = 'sync:${channel.channelName}:${channel.channelId}';
+    _logger.info('Joining additional channel: $topic');
+
+    await _ws.joinChannel(topic, {
+      'client_id': config.clientId,
+      ...?channel.params,
+    });
+
+    _logger.info('Successfully joined channel: $topic');
+  }
+
+  /// Check if a channel is currently joined
+  ///
+  /// Example:
+  /// ```dart
+  /// if (syncClient.isChannelJoined(
+  ///   SyncClientChannel(channelName: 'user', channelId: userId),
+  /// )) {
+  ///   print('Already joined');
+  /// }
+  /// ```
+  bool isChannelJoined(SyncClientChannel channel) {
+    final topic = 'sync:${channel.channelName}:${channel.channelId}';
+    return _ws.isChannelJoined(topic);
+  }
+
+  /// Get all currently joined channel topics
+  List<String> get joinedChannels => _ws.joinedChannels;
+
+  /// Leave a channel
+  ///
+  /// Example:
+  /// ```dart
+  /// await syncClient.leaveChannel(
+  ///   SyncClientChannel(
+  ///     channelName: 'user',
+  ///     channelId: 'anon',
+  ///   ),
+  /// );
+  /// ```
+  Future<void> leaveChannel(SyncClientChannel channel) async {
+    final topic = 'sync:${channel.channelName}:${channel.channelId}';
+    _logger.info('Leaving channel: $topic');
+    await _ws.leaveChannel(topic);
+    _logger.info('Left channel: $topic');
+  }
+
   /// Disconnect from sync server
   Future<void> disconnect() async {
     _stopPeriodicSync();

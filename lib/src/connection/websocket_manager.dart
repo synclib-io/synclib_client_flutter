@@ -149,6 +149,28 @@ class WebSocketManager {
     }
   }
 
+  /// Check if a channel is currently joined
+  bool isChannelJoined(String topic) {
+    return _channels.containsKey(topic);
+  }
+
+  /// Get all currently joined channel topics
+  List<String> get joinedChannels => _channels.keys.toList();
+
+  /// Leave a specific channel by topic
+  Future<void> leaveChannel(String topic) async {
+    final channel = _channels[topic];
+    if (channel == null) {
+      _logger.warning('Channel $topic not found');
+      return;
+    }
+
+    _logger.info('Leaving channel: $topic');
+    await channel.leave().future;
+    _channels.remove(topic);
+    _logger.info('Left channel: $topic');
+  }
+
   /// Disconnect from WebSocket server
   Future<void> disconnect() async {
     _logger.info('Disconnecting');
