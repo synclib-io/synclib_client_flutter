@@ -98,6 +98,9 @@ class SyncClient {
   // Stream controller for remote change notifications
   final StreamController<ChangeMessage> _remoteChangeController = StreamController<ChangeMessage>.broadcast();
 
+  // Stream controller for snapshot complete events
+  final StreamController<String> _snapshotCompleteController = StreamController<String>.broadcast();
+
   SyncClient(this.config) {
     _ws = WebSocketManager(
       url: config.serverUrl,
@@ -479,7 +482,7 @@ class SyncClient {
   /// Handle snapshot complete message
   void _handleSnapshotComplete(SnapshotCompleteMessage message) {
     _logger.info('Snapshot complete for stream ${message.streamId}');
-    // TODO: Notify listeners or update state
+    _snapshotCompleteController.add(message.streamId);
   }
 
   /// Handle Phoenix reply messages (especially hello response with migrations)
@@ -847,12 +850,16 @@ class SyncClient {
   /// Stream of remote changes as they are applied
   Stream<ChangeMessage> get remoteChanges => _remoteChangeController.stream;
 
+  /// Stream of snapshot complete events (emits stream_id when snapshot finishes)
+  Stream<String> get snapshotComplete => _snapshotCompleteController.stream;
+
   /// Dispose resources
   Future<void> dispose() async {
     _stopPeriodicSync();
     await _messageSubscription?.cancel();
     await _stateSubscription?.cancel();
     await _remoteChangeController.close();
+    await _snapshotCompleteController.close();
     await _ws.dispose();
     await _db?.close();
     _isInitialized = false;
