@@ -663,6 +663,8 @@ class SyncClient {
         for (final value in filteredData.values) {
           if (value is Map || value is List) {
             params.add(jsonEncode(value));
+          } else if (value is bool) {
+            params.add(value ? '1' : '0');
           } else {
             params.add(value?.toString());
           }
@@ -677,6 +679,9 @@ class SyncClient {
           if (entry.value is Map || entry.value is List) {
             setClauses.add('${entry.key} = jsonb(?)');
             params.add(jsonEncode(entry.value));
+          } else if (entry.value is bool) {
+            setClauses.add('${entry.key} = ?');
+            params.add(entry.value ? '1' : '0');
           } else {
             setClauses.add('${entry.key} = ?');
             params.add(entry.value?.toString());
