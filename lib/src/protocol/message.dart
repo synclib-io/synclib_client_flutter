@@ -34,6 +34,8 @@ abstract class SyncMessage {
         return SnapshotBatchMessage.fromMap(map);
       case 'snapshot_complete':
         return SnapshotCompleteMessage.fromMap(map);
+      case 'job_update':
+        return JobUpdateMessage.fromMap(map);
       default:
         throw UnsupportedError('Unknown message type: $type');
     }
@@ -361,5 +363,49 @@ class SnapshotCompleteMessage extends SyncMessage {
   factory SnapshotCompleteMessage.fromMap(Map<String, dynamic> map) =>
     SnapshotCompleteMessage(
       streamId: map['stream_id'] as String,
+    );
+}
+
+/// Job update message (from ECS tasks via webhook)
+class JobUpdateMessage extends SyncMessage {
+  final int currentStep;
+  final int totalSteps;
+  final String stepType;
+  final String jobId;
+  final String userId;
+  final String phoenixChannelId;
+  final String? filename;
+
+  const JobUpdateMessage({
+    required this.currentStep,
+    required this.totalSteps,
+    required this.stepType,
+    required this.jobId,
+    required this.userId,
+    required this.phoenixChannelId,
+    this.filename,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'job_update',
+    'current_step': currentStep,
+    'total_steps': totalSteps,
+    'step_type': stepType,
+    'job_id': jobId,
+    'user_id': userId,
+    'phoenix_channel_id': phoenixChannelId,
+    if (filename != null) 'filename': filename,
+  };
+
+  factory JobUpdateMessage.fromMap(Map<String, dynamic> map) =>
+    JobUpdateMessage(
+      currentStep: map['current_step'] as int,
+      totalSteps: map['total_steps'] as int,
+      stepType: map['step_type'] as String,
+      jobId: map['job_id'] as String,
+      userId: map['user_id'] as String,
+      phoenixChannelId: map['phoenix_channel_id'] as String,
+      filename: map['filename'] as String?,
     );
 }

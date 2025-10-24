@@ -101,6 +101,9 @@ class SyncClient {
   // Stream controller for snapshot complete events
   final StreamController<String> _snapshotCompleteController = StreamController<String>.broadcast();
 
+  // Stream controller for job update events
+  final StreamController<JobUpdateMessage> _jobUpdateController = StreamController<JobUpdateMessage>.broadcast();
+
   SyncClient(this.config) {
     _ws = WebSocketManager(
       url: config.serverUrl,
@@ -331,6 +334,8 @@ class SyncClient {
         await _handleSnapshotBatch(message);
       } else if (message is SnapshotCompleteMessage) {
         _handleSnapshotComplete(message);
+      } else if (message is JobUpdateMessage) {
+        _handleJobUpdate(message);
       } else {
         _logger.warning('Unhandled message type: ${message.runtimeType}');
       }
@@ -483,6 +488,12 @@ class SyncClient {
   void _handleSnapshotComplete(SnapshotCompleteMessage message) {
     _logger.info('Snapshot complete for stream ${message.streamId}');
     _snapshotCompleteController.add(message.streamId);
+  }
+
+  /// Handle job update message
+  void _handleJobUpdate(JobUpdateMessage message) {
+    _logger.info('Job update: ${message.stepType} - step ${message.currentStep}/${message.totalSteps} for job ${message.jobId}');
+    _jobUpdateController.add(message);
   }
 
   /// Handle Phoenix reply messages (especially hello response with migrations)
@@ -858,6 +869,9 @@ class SyncClient {
   /// Stream of snapshot complete events (emits stream_id when snapshot finishes)
   Stream<String> get snapshotComplete => _snapshotCompleteController.stream;
 
+  /// Stream of job update events (from ECS tasks via webhook)
+  Stream<JobUpdateMessage> get jobUpdates => _jobUpdateController.stream;
+
   /// Dispose resources
   Future<void> dispose() async {
     _stopPeriodicSync();
@@ -865,6 +879,7 @@ class SyncClient {
     await _stateSubscription?.cancel();
     await _remoteChangeController.close();
     await _snapshotCompleteController.close();
+    await _jobUpdateController.close();
     await _ws.dispose();
     await _db?.close();
     _isInitialized = false;
