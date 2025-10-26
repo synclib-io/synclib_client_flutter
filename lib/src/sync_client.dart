@@ -7,6 +7,16 @@ import 'connection/websocket_manager.dart';
 import 'protocol/message.dart';
 import 'protocol/codec.dart';
 
+/// Sync readiness state
+enum SyncReadyState {
+  /// Waiting for initial hello reply from server
+  waitingForHello,
+  /// Applying schema migrations
+  applyingMigrations,
+  /// Ready to stream snapshots and sync data
+  ready,
+}
+
 /// Callback for conflict resolution
 /// Returns the resolved change, or null to skip
 typedef ConflictResolver = Future<ChangeMessage?> Function(
@@ -105,14 +115,14 @@ class SyncClient {
   // Stream controller for job update events
   final StreamController<JobUpdateMessage> _jobUpdateController = StreamController<JobUpdateMessage>.broadcast();
 
-  // Stream controller for schema sync state changes
-  final StreamController<bool> _schemaSyncStateController = StreamController<bool>.broadcast();
+  // Stream controller for sync ready state changes
+  final StreamController<SyncReadyState> _syncReadyStateController = StreamController<SyncReadyState>.broadcast();
 
   // Lock to ensure only one batch operation happens at a time
   final Lock _batchLock = Lock();
   final List<SnapshotBatchMessage> _batchQueue = [];
 
-  bool _syncingSchemas = false;
+  SyncReadyState _readyState = SyncReadyState.waitingForHello;
 
   SyncClient(this.config) {
     _ws = WebSocketManager(
@@ -563,7 +573,9 @@ class SyncClient {
       // If migrations are included, apply them directly
       if (message.migrations != null && message.migrations!.isNotEmpty) {
         _logger.info('Applying ${message.migrations!.length} migrations from schema_update notification');
-        await _applyMigrations({'migrations': message.migrations});
+        _updateReadyState(SyncReadyState.applyingMigrations);
+        await _applyMigrations({'migrations': message.migrations, 'current_version': message.newVersion});
+        _updateReadyState(SyncReadyState.ready);
       } else {
         // Otherwise, log and let app handle (could trigger reconnect)
         _logger.warning('Schema update detected but no migrations provided - may need to reconnect');
@@ -580,11 +592,27 @@ class SyncClient {
     // Check if this is a hello response with migrations
     if (response['status'] == 'upgrade_needed') {
       _logger.info('Schema upgrade needed');
+      _updateReadyState(SyncReadyState.applyingMigrations);
       await _applyMigrations(response);
+      _updateReadyState(SyncReadyState.ready);
     } else if (response['status'] == 'up_to_date') {
       _logger.info('Schema is up to date');
+      _updateReadyState(SyncReadyState.ready);
     } else if (response['status'] == 'ok') {
       _logger.fine('Received OK response');
+      // If we were waiting for hello, mark as ready
+      if (_readyState == SyncReadyState.waitingForHello) {
+        _updateReadyState(SyncReadyState.ready);
+      }
+    }
+  }
+
+  /// Update sync ready state and broadcast change
+  void _updateReadyState(SyncReadyState newState) {
+    if (_readyState != newState) {
+      _readyState = newState;
+      _syncReadyStateController.add(newState);
+      _logger.info('Sync ready state changed to: $newState');
     }
   }
 
@@ -597,9 +625,6 @@ class SyncClient {
       _logger.warning('No migrations provided');
       return;
     }
-
-    _syncingSchemas = true;
-    _schemaSyncStateController.add(true);
 
     _logger.info('Applying ${migrations.length} migration(s) to reach version $currentVersion');
 
@@ -627,13 +652,10 @@ class SyncClient {
       }
     }
 
-    _syncingSchemas = false;
-    _schemaSyncStateController.add(false);
-
     // Confirm migration to server
     final confirm = SchemaConfirmMessage(version: currentVersion);
     await _ws.send(confirm);
-    
+
     _logger.info('Confirmed schema migration to server');
   }
 
@@ -958,13 +980,17 @@ class SyncClient {
   /// Stream of job update events (from ECS tasks via webhook)
   Stream<JobUpdateMessage> get jobUpdates => _jobUpdateController.stream;
 
-  /// Stream of schema sync state changes (true = syncing, false = done)
-  /// Listen to this to know when migrations are being applied
-  Stream<bool> get schemaSyncState => _schemaSyncStateController.stream;
+  /// Stream of sync ready state changes
+  /// Listen to this to know when the client is ready to stream snapshots
+  /// States: waitingForHello -> applyingMigrations -> ready
+  Stream<SyncReadyState> get syncReadyState => _syncReadyStateController.stream;
 
-  /// Check if currently syncing schemas (applying migrations)
-  /// Useful to wait before calling streamSnapshot
-  bool get isSyncingSchemas => _syncingSchemas;
+  /// Get current sync ready state
+  SyncReadyState get readyState => _readyState;
+
+  /// Check if client is ready to stream snapshots
+  /// Returns true only when state is SyncReadyState.ready
+  bool get isReady => _readyState == SyncReadyState.ready;
 
   /// Dispose resources
   Future<void> dispose() async {
@@ -974,7 +1000,7 @@ class SyncClient {
     await _remoteChangeController.close();
     await _snapshotCompleteController.close();
     await _jobUpdateController.close();
-    await _schemaSyncStateController.close();
+    await _syncReadyStateController.close();
     await _ws.dispose();
     await _db?.close();
     _isInitialized = false;
