@@ -104,6 +104,15 @@ class SyncClient {
   // Stream controller for job update events
   final StreamController<JobUpdateMessage> _jobUpdateController = StreamController<JobUpdateMessage>.broadcast();
 
+  // Stream controller for schema sync state changes
+  final StreamController<bool> _schemaSyncStateController = StreamController<bool>.broadcast();
+
+  // Mutex to ensure only one snapshot batch is processed at a time
+  bool _isProcessingBatch = false;
+  final List<SnapshotBatchMessage> _batchQueue = [];
+
+  bool _syncingSchemas = false;
+
   SyncClient(this.config) {
     _ws = WebSocketManager(
       url: config.serverUrl,
@@ -215,7 +224,7 @@ class SyncClient {
   /// if (syncClient.isChannelJoined(
   ///   SyncClientChannel(channelName: 'user', channelId: userId),
   /// )) {
-  ///   print('Already joined');
+  ///   _logger.info('Already joined');
   /// }
   /// ```
   bool isChannelJoined(SyncClientChannel channel) {
@@ -331,11 +340,13 @@ class SyncClient {
       } else if (message is ErrorMessage) {
         _handleError(message);
       } else if (message is SnapshotBatchMessage) {
-        await _handleSnapshotBatch(message);
+        await _queueSnapshotBatch(message);
       } else if (message is SnapshotCompleteMessage) {
         _handleSnapshotComplete(message);
       } else if (message is JobUpdateMessage) {
         _handleJobUpdate(message);
+      } else if (message is SchemaUpdateMessage) {
+        await _handleSchemaUpdate(message);
       } else {
         _logger.warning('Unhandled message type: ${message.runtimeType}');
       }
@@ -414,23 +425,35 @@ class SyncClient {
   Future<void> _applyRemoteChanges(List<ChangeMessage> changes) async {
     _logger.info('Applying ${changes.length} remote changes');
 
-    // Use bulk mode for efficiency
-    await _db!.beginBulkRemote();
-    try {
-      for (final change in changes) {
-        final sql = _generateSql(change);
-        await _db!.execBulkRemote(sql);
-      }
-      await _db!.endBulkRemote();
-      _logger.info('Successfully applied ${changes.length} changes');
+    // Wait for any ongoing batch processing to complete
+    while (_isProcessingBatch) {
+      _logger.info('Waiting for snapshot batch processing to complete before applying remote changes...');
+      await Future.delayed(Duration(milliseconds: 100));
+    }
 
-      // Update last synced seqnum
-      if (changes.isNotEmpty && changes.last.seqnum != null) {
-        _lastSyncedSeqnum = changes.last.seqnum;
+    // Mark as processing to prevent batch queue from starting
+    _isProcessingBatch = true;
+    try {
+      // Use bulk mode for efficiency
+      await _db!.beginBulkRemote();
+      try {
+        for (final change in changes) {
+          final sql = _generateSql(change);
+          await _db!.execBulkRemote(sql);
+        }
+        await _db!.endBulkRemote();
+        _logger.info('Successfully applied ${changes.length} changes');
+
+        // Update last synced seqnum
+        if (changes.isNotEmpty && changes.last.seqnum != null) {
+          _lastSyncedSeqnum = changes.last.seqnum;
+        }
+      } catch (e) {
+        _logger.severe('Failed to apply changes batch: $e');
+        await _db!.endBulkRemote(rollback: true);
       }
-    } catch (e) {
-      _logger.severe('Failed to apply changes batch: $e');
-      await _db!.endBulkRemote(rollback: true);
+    } finally {
+      _isProcessingBatch = false;
     }
   }
 
@@ -456,12 +479,57 @@ class SyncClient {
     // TODO: Implement error recovery strategies
   }
 
-  /// Handle snapshot batch message
+  /// Queue snapshot batch for processing (ensures batches are processed serially)
+  Future<void> _queueSnapshotBatch(SnapshotBatchMessage batch) async {
+    _batchQueue.add(batch);
+    _logger.info('Queued snapshot batch for ${batch.table}: ${batch.rows.length} rows (queue size: ${_batchQueue.length})');
+
+    // If not currently processing, start processing the queue
+    if (!_isProcessingBatch) {
+      await _processBatchQueue();
+    }
+  }
+
+  /// Process all batches in the queue serially
+  Future<void> _processBatchQueue() async {
+    if (_isProcessingBatch) {
+      _logger.warning('Already processing batches, skipping');
+      return;
+    }
+
+    _isProcessingBatch = true;
+    try {
+      while (_batchQueue.isNotEmpty) {
+        final batch = _batchQueue.removeAt(0);
+        _logger.info('Processing batch for ${batch.table} (${_batchQueue.length} remaining in queue)');
+        await _handleSnapshotBatch(batch);
+      }
+    } finally {
+      _isProcessingBatch = false;
+    }
+  }
+
+  /// Handle snapshot batch message (called serially from queue)
   Future<void> _handleSnapshotBatch(SnapshotBatchMessage batch) async {
+    final startTime = DateTime.now();
     _logger.info('Received snapshot batch for ${batch.table}: ${batch.rows.length} rows');
+
+    // Check if table exists before trying to insert
+    try {
+      final tableCheck = await _db!.read("SELECT name FROM sqlite_master WHERE type='table' AND name='${batch.table}'");
+      if (tableCheck.isEmpty) {
+        _logger.warning('Table ${batch.table} does not exist, skipping batch');
+        _logger.info('!!! SKIPPING batch for ${batch.table}: table does not exist');
+        return;
+      }
+    } catch (e) {
+      _logger.severe('Error checking if table ${batch.table} exists: $e');
+      return;
+    }
 
     // Apply each row to the database
     await _db!.beginBulkRemote();
+    int processedCount = 0;
     try {
       for (final row in batch.rows) {
         // Create a change message for each row
@@ -474,11 +542,15 @@ class SyncClient {
 
         final sql = _generateSql(change);
         await _db!.execBulkRemote(sql);
+        processedCount++;
       }
       await _db!.endBulkRemote();
-      _logger.info('Successfully applied snapshot batch for ${batch.table}');
-    } catch (e) {
-      _logger.severe('Failed to apply snapshot batch: $e');
+      final elapsed = DateTime.now().difference(startTime).inMilliseconds;
+      _logger.info('Successfully applied snapshot batch for ${batch.table}: processed $processedCount/${batch.rows.length} rows in ${elapsed}ms');
+    } catch (e, stackTrace) {
+      final elapsed = DateTime.now().difference(startTime).inMilliseconds;
+      _logger.info('!!! FAILED to apply snapshot batch for ${batch.table} after processing $processedCount/${batch.rows.length} rows (${elapsed}ms): $e');
+      _logger.info('Stack trace: $stackTrace');
       await _db!.endBulkRemote(rollback: true);
       rethrow;
     }
@@ -494,6 +566,29 @@ class SyncClient {
   void _handleJobUpdate(JobUpdateMessage message) {
     _logger.info('Job update: ${message.stepType} - step ${message.currentStep}/${message.totalSteps} for job ${message.jobId}');
     _jobUpdateController.add(message);
+  }
+
+  /// Handle schema update notification
+  Future<void> _handleSchemaUpdate(SchemaUpdateMessage message) async {
+    _logger.warning('Schema update notification: server has new version ${message.newVersion}');
+
+    // Get current client schema version
+    final currentVersion = await _db!.getSchemaVersion();
+
+    if (message.newVersion > currentVersion) {
+      _logger.info('Client schema v$currentVersion is behind server v${message.newVersion}');
+
+      // If migrations are included, apply them directly
+      if (message.migrations != null && message.migrations!.isNotEmpty) {
+        _logger.info('Applying ${message.migrations!.length} migrations from schema_update notification');
+        await _applyMigrations({'migrations': message.migrations});
+      } else {
+        // Otherwise, log and let app handle (could trigger reconnect)
+        _logger.warning('Schema update detected but no migrations provided - may need to reconnect');
+      }
+    } else {
+      _logger.info('Client schema is already up to date (v$currentVersion)');
+    }
   }
 
   /// Handle Phoenix reply messages (especially hello response with migrations)
@@ -521,6 +616,9 @@ class SyncClient {
       return;
     }
 
+    _syncingSchemas = true;
+    _schemaSyncStateController.add(true);
+
     _logger.info('Applying ${migrations.length} migration(s) to reach version $currentVersion');
 
     for (final migration in migrations) {
@@ -534,7 +632,7 @@ class SyncClient {
       try {
         // Execute each SQL statement
         for (final sql in sqlStatements) {
-          _logger.fine('Executing: $sql');
+          _logger.info('Executing: $sql');
           await _db!.exec(sql as String);
         }
 
@@ -547,9 +645,13 @@ class SyncClient {
       }
     }
 
+    _syncingSchemas = false;
+    _schemaSyncStateController.add(false);
+
     // Confirm migration to server
     final confirm = SchemaConfirmMessage(version: currentVersion);
     await _ws.send(confirm);
+    
     _logger.info('Confirmed schema migration to server');
   }
 
@@ -607,18 +709,20 @@ class SyncClient {
         final key = entry.key;
         final value = entry.value;
 
-        // Skip server-only timestamp fields
-        if (key == 'inserted_at') continue;
+        // Skip server-only timestamp fields and id (we add id separately)
+        if (key == 'inserted_at' || key == 'id') continue;
 
-        // TODO, is this necessary? they should be the same.
-        // do we need use case specific code here?
-        // Map server field names to client field names
-        String clientKey = key;
-        if (change.table == 'users' && key == 'username') {
-          clientKey = 'name';
+        // Normalize field names to lowercase to match PostgreSQL column names
+        // PostgreSQL identifiers are lowercase by default, so our schema has userid, createdat, etc.
+        // But the document JSON has camelCase like userId, createdAt
+        String normalizedKey = key.toLowerCase();
+
+        // Handle special case mappings
+        if (change.table == 'users' && normalizedKey == 'username') {
+          normalizedKey = 'name';
         }
 
-        filteredData[clientKey] = value;
+        filteredData[normalizedKey] = value;
       }
     }
 
@@ -818,7 +922,7 @@ class SyncClient {
   /// Example:
   /// ```dart
   /// final user = await syncClient.fetchRow('users', 'user123');
-  /// print(user['document']); // Access JSONB field
+  /// _logger.info(user['document']); // Access JSONB field
   /// ```
   Future<Map<String, dynamic>> fetchRow(String table, String rowId) async {
     final response = await sendMessage('fetch_row', {
@@ -872,6 +976,14 @@ class SyncClient {
   /// Stream of job update events (from ECS tasks via webhook)
   Stream<JobUpdateMessage> get jobUpdates => _jobUpdateController.stream;
 
+  /// Stream of schema sync state changes (true = syncing, false = done)
+  /// Listen to this to know when migrations are being applied
+  Stream<bool> get schemaSyncState => _schemaSyncStateController.stream;
+
+  /// Check if currently syncing schemas (applying migrations)
+  /// Useful to wait before calling streamSnapshot
+  bool get isSyncingSchemas => _syncingSchemas;
+
   /// Dispose resources
   Future<void> dispose() async {
     _stopPeriodicSync();
@@ -880,6 +992,7 @@ class SyncClient {
     await _remoteChangeController.close();
     await _snapshotCompleteController.close();
     await _jobUpdateController.close();
+    await _schemaSyncStateController.close();
     await _ws.dispose();
     await _db?.close();
     _isInitialized = false;

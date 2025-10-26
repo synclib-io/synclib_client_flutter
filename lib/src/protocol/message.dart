@@ -36,6 +36,8 @@ abstract class SyncMessage {
         return SnapshotCompleteMessage.fromMap(map);
       case 'job_update':
         return JobUpdateMessage.fromMap(map);
+      case 'schema_update':
+        return SchemaUpdateMessage.fromMap(map);
       default:
         throw UnsupportedError('Unknown message type: $type');
     }
@@ -407,5 +409,36 @@ class JobUpdateMessage extends SyncMessage {
       userId: map['user_id'] as String,
       phoenixChannelId: map['phoenix_channel_id'] as String,
       filename: map['filename'] as String?,
+    );
+}
+
+/// Schema update notification message
+/// Notifies clients that a new schema version is available
+class SchemaUpdateMessage extends SyncMessage {
+  final int newVersion;
+  final List<Map<String, dynamic>>? migrations;
+  final int timestamp;
+
+  const SchemaUpdateMessage({
+    required this.newVersion,
+    this.migrations,
+    required this.timestamp,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'schema_update',
+    'new_version': newVersion,
+    if (migrations != null) 'migrations': migrations,
+    'timestamp': timestamp,
+  };
+
+  factory SchemaUpdateMessage.fromMap(Map<String, dynamic> map) =>
+    SchemaUpdateMessage(
+      newVersion: map['new_version'] as int,
+      migrations: map['migrations'] != null
+        ? List<Map<String, dynamic>>.from(map['migrations'] as List)
+        : null,
+      timestamp: map['timestamp'] as int,
     );
 }

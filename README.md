@@ -174,3 +174,64 @@ end
 ## Example
 
 See [example/main.dart](example/main.dart) for a complete working example.
+
+
+
+## LOGGING
+The _logger in sync_client.dart uses Dart's logging package. To see the logs in your app, you need to configure a logger listener. Let me show you how: In your Flutter app (e.g., main.dart):
+import 'package:logging/logging.dart';
+
+void main() {
+  // Configure logging - do this BEFORE initializing SyncClient
+  Logger.root.level = Level.ALL; // Set minimum log level
+  
+  Logger.root.onRecord.listen((record) {
+    print('${record.level.name}: ${record.time}: ${record.loggerName}: ${record.message}');
+    
+    // Or use developer.log for better formatting in Flutter
+    // developer.log(
+    //   record.message,
+    //   time: record.time,
+    //   level: record.level.value,
+    //   name: record.loggerName,
+    // );
+  });
+  
+  runApp(MyApp());
+}
+Available log levels:
+Logger.root.level = Level.ALL;      // See everything (FINEST to SHOUT)
+Logger.root.level = Level.FINE;     // Debug and above
+Logger.root.level = Level.INFO;     // Info and above (recommended)
+Logger.root.level = Level.WARNING;  // Warnings and errors only
+Logger.root.level = Level.SEVERE;   // Errors only
+For better formatting in Flutter DevTools:
+import 'dart:developer' as developer;
+import 'package:logging/logging.dart';
+
+void setupLogging() {
+  Logger.root.level = Level.INFO;
+  
+  Logger.root.onRecord.listen((record) {
+    developer.log(
+      record.message,
+      time: record.time,
+      level: record.level.value,
+      name: record.loggerName,
+      error: record.error,
+      stackTrace: record.stackTrace,
+    );
+  });
+}
+Filter by specific logger:
+// Only show SyncClient logs
+Logger.root.onRecord.listen((record) {
+  if (record.loggerName == 'SyncClient' || record.loggerName.startsWith('Sync')) {
+    print('[${record.level.name}] ${record.loggerName}: ${record.message}');
+  }
+});
+Make sure you have the logging package:
+# pubspec.yaml
+dependencies:
+  logging: ^1.2.0  # Add this if not already there
+Once configured, you'll see all the _logger.info(), _logger.warning(), etc. messages from SyncClient in your console
