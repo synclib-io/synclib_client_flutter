@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:logging/logging.dart';
 import 'package:synclib_flutter/synclib_flutter.dart';
+import 'package:synchronized/synchronized.dart';
 import 'connection/websocket_manager.dart';
 import 'protocol/message.dart';
 import 'protocol/codec.dart';
@@ -107,8 +108,8 @@ class SyncClient {
   // Stream controller for schema sync state changes
   final StreamController<bool> _schemaSyncStateController = StreamController<bool>.broadcast();
 
-  // Mutex to ensure only one snapshot batch is processed at a time
-  bool _isProcessingBatch = false;
+  // Lock to ensure only one batch operation happens at a time
+  final Lock _batchLock = Lock();
   final List<SnapshotBatchMessage> _batchQueue = [];
 
   bool _syncingSchemas = false;
@@ -425,15 +426,8 @@ class SyncClient {
   Future<void> _applyRemoteChanges(List<ChangeMessage> changes) async {
     _logger.info('Applying ${changes.length} remote changes');
 
-    // Wait for any ongoing batch processing to complete
-    while (_isProcessingBatch) {
-      _logger.info('Waiting for snapshot batch processing to complete before applying remote changes...');
-      await Future.delayed(Duration(milliseconds: 100));
-    }
-
-    // Mark as processing to prevent batch queue from starting
-    _isProcessingBatch = true;
-    try {
+    // Use lock to ensure serial processing with snapshot batches
+    await _batchLock.synchronized(() async {
       // Use bulk mode for efficiency
       await _db!.beginBulkRemote();
       try {
@@ -452,9 +446,7 @@ class SyncClient {
         _logger.severe('Failed to apply changes batch: $e');
         await _db!.endBulkRemote(rollback: true);
       }
-    } finally {
-      _isProcessingBatch = false;
-    }
+    });
   }
 
   /// Handle acknowledgment from server
@@ -484,29 +476,19 @@ class SyncClient {
     _batchQueue.add(batch);
     _logger.info('Queued snapshot batch for ${batch.table}: ${batch.rows.length} rows (queue size: ${_batchQueue.length})');
 
-    // If not currently processing, start processing the queue
-    if (!_isProcessingBatch) {
-      await _processBatchQueue();
-    }
+    // Process the queue - lock ensures only one process runs at a time
+    await _processBatchQueue();
   }
 
-  /// Process all batches in the queue serially
+  /// Process all batches in the queue serially (protected by lock)
   Future<void> _processBatchQueue() async {
-    if (_isProcessingBatch) {
-      _logger.warning('Already processing batches, skipping');
-      return;
-    }
-
-    _isProcessingBatch = true;
-    try {
+    await _batchLock.synchronized(() async {
       while (_batchQueue.isNotEmpty) {
         final batch = _batchQueue.removeAt(0);
         _logger.info('Processing batch for ${batch.table} (${_batchQueue.length} remaining in queue)');
         await _handleSnapshotBatch(batch);
       }
-    } finally {
-      _isProcessingBatch = false;
-    }
+    });
   }
 
   /// Handle snapshot batch message (called serially from queue)
