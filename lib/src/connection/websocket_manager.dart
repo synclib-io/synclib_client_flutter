@@ -294,10 +294,15 @@ class WebSocketManager {
   /// Handle channel reply messages
   void _handleChannelReply(Message message) {
     try {
-      final payload = message.payload as Map<String, dynamic>? ?? {};
+      final payload = message.payload != null
+          ? Map<String, dynamic>.from(message.payload as Map)
+          : <String, dynamic>{};
 
       // Extract the response from the Phoenix reply structure
-      final response = payload['response'] as Map<String, dynamic>? ?? {};
+      final responseData = payload['response'];
+      final response = responseData != null
+          ? Map<String, dynamic>.from(responseData as Map)
+          : <String, dynamic>{};
 
       _logger.fine('Channel reply response: $response');
 
