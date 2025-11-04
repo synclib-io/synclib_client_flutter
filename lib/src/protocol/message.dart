@@ -38,6 +38,9 @@ abstract class SyncMessage {
         return JobUpdateMessage.fromMap(map);
       case 'schema_update':
         return SchemaUpdateMessage.fromMap(map);
+      case 'livestream:started':
+      case 'livestream:stopped':
+        return LivestreamMessage.fromMap(map);
       default:
         throw UnsupportedError('Unknown message type: $type');
     }
@@ -441,4 +444,51 @@ class SchemaUpdateMessage extends SyncMessage {
         : null,
       timestamp: map['timestamp'] as int,
     );
+}
+
+/// Livestream event message
+/// Notifies tribe members when a livestream starts or stops
+class LivestreamMessage extends SyncMessage {
+  final String event; // 'livestream:started' or 'livestream:stopped'
+  final String? streamId;
+  final String? tribeId;
+  final String? userId; // User who started/stopped the stream
+  final String? hlsUrl; // HLS URL for playing the stream
+  final int timestamp;
+
+  const LivestreamMessage({
+    required this.event,
+    this.streamId,
+    this.tribeId,
+    this.userId,
+    this.hlsUrl,
+    required this.timestamp,
+  });
+
+  bool get isStarted => event == 'livestream:started';
+  bool get isStopped => event == 'livestream:stopped';
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': event,
+    if (streamId != null) 'stream_id': streamId,
+    if (tribeId != null) 'tribe_id': tribeId,
+    if (userId != null) 'user_id': userId,
+    if (hlsUrl != null) 'hls_url': hlsUrl,
+    'timestamp': timestamp,
+  };
+
+  factory LivestreamMessage.fromMap(Map<String, dynamic> map) {
+    // The event type comes from the Phoenix channel event name
+    final event = map['type'] as String? ?? map['event'] as String?;
+
+    return LivestreamMessage(
+      event: event ?? 'livestream:started',
+      streamId: map['stream_id'] as String?,
+      tribeId: map['tribe_id'] as String?,
+      userId: map['user_id'] as String?,
+      hlsUrl: map['hls_url'] as String?,
+      timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+  }
 }

@@ -115,6 +115,9 @@ class SyncClient {
   // Stream controller for job update events
   final StreamController<JobUpdateMessage> _jobUpdateController = StreamController<JobUpdateMessage>.broadcast();
 
+  // Stream controller for livestream events
+  final StreamController<LivestreamMessage> _livestreamController = StreamController<LivestreamMessage>.broadcast();
+
   // Stream controller for sync ready state changes
   final StreamController<SyncReadyState> _syncReadyStateController = StreamController<SyncReadyState>.broadcast();
 
@@ -356,6 +359,8 @@ class SyncClient {
         _handleSnapshotComplete(message);
       } else if (message is JobUpdateMessage) {
         _handleJobUpdate(message);
+      } else if (message is LivestreamMessage) {
+        _handleLivestream(message);
       } else if (message is SchemaUpdateMessage) {
         await _handleSchemaUpdate(message);
       } else {
@@ -558,6 +563,12 @@ class SyncClient {
   void _handleJobUpdate(JobUpdateMessage message) {
     _logger.info('Job update: ${message.stepType} - step ${message.currentStep}/${message.totalSteps} for job ${message.jobId}');
     _jobUpdateController.add(message);
+  }
+
+  /// Handle livestream message
+  void _handleLivestream(LivestreamMessage message) {
+    _logger.info('Livestream event: ${message.event} - stream ${message.streamId} by user ${message.userId}');
+    _livestreamController.add(message);
   }
 
   /// Handle schema update notification
@@ -979,6 +990,9 @@ class SyncClient {
 
   /// Stream of job update events (from ECS tasks via webhook)
   Stream<JobUpdateMessage> get jobUpdates => _jobUpdateController.stream;
+
+  /// Stream of livestream events (started/stopped notifications)
+  Stream<LivestreamMessage> get livestreamEvents => _livestreamController.stream;
 
   /// Stream of sync ready state changes
   /// Listen to this to know when the client is ready to stream snapshots
