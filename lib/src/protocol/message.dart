@@ -41,6 +41,11 @@ abstract class SyncMessage {
       case 'livestream:started':
       case 'livestream:stopped':
         return LivestreamMessage.fromMap(map);
+      case 'conversation:user_joined':
+      case 'conversation:user_left':
+      case 'conversation:message_sent':
+      case 'conversation:online_count':
+        return ConversationMessage.fromMap(map);
       default:
         throw UnsupportedError('Unknown message type: $type');
     }
@@ -227,23 +232,27 @@ class AckMessage extends SyncMessage {
 class RequestChangesMessage extends SyncMessage {
   final int? sinceSeqnum;
   final int? limit;
+  final String? table;
 
   const RequestChangesMessage({
     this.sinceSeqnum,
     this.limit,
+    this.table,
   });
 
   @override
   Map<String, dynamic> toMap() => {
     'type': 'request_changes',
-    if (sinceSeqnum != null) 'since_seqnum': sinceSeqnum,
+    'since_seqnum': sinceSeqnum ?? 0,
     if (limit != null) 'limit': limit,
+    if (table != null) 'table': table
   };
 
   factory RequestChangesMessage.fromMap(Map<String, dynamic> map) =>
     RequestChangesMessage(
       sinceSeqnum: map['since_seqnum'] as int?,
       limit: map['limit'] as int?,
+      table: map['table'] as String?
     );
 }
 
@@ -488,6 +497,59 @@ class LivestreamMessage extends SyncMessage {
       tribeId: map['tribe_id'] as String?,
       userId: map['user_id'] as String?,
       hlsUrl: map['hls_url'] as String?,
+      timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+  }
+}
+
+/// Conversation event message
+/// Notifies conversation participants of real-time events like user presence and new messages
+class ConversationMessage extends SyncMessage {
+  final String event; // 'conversation:user_joined', 'conversation:user_left', 'conversation:message_sent', 'conversation:online_count'
+  final String? conversationId; // Generic ID (maps to tribeId for tribe chats, but allows for DMs)
+  final String? userId; // User who triggered the event
+  final String? messageId; // For message_sent events (notification only, not content)
+  final int? onlineCount; // Number of users currently online
+  final Map<String, dynamic>? metadata; // For extensibility
+  final int timestamp;
+
+  const ConversationMessage({
+    required this.event,
+    this.conversationId,
+    this.userId,
+    this.messageId,
+    this.onlineCount,
+    this.metadata,
+    required this.timestamp,
+  });
+
+  bool get isUserJoined => event == 'conversation:user_joined';
+  bool get isUserLeft => event == 'conversation:user_left';
+  bool get isMessageSent => event == 'conversation:message_sent';
+  bool get isOnlineCount => event == 'conversation:online_count';
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': event,
+    if (conversationId != null) 'conversation_id': conversationId,
+    if (userId != null) 'user_id': userId,
+    if (messageId != null) 'message_id': messageId,
+    if (onlineCount != null) 'online_count': onlineCount,
+    if (metadata != null) 'metadata': metadata,
+    'timestamp': timestamp,
+  };
+
+  factory ConversationMessage.fromMap(Map<String, dynamic> map) {
+    // The event type comes from the Phoenix channel event name
+    final event = map['type'] as String? ?? map['event'] as String?;
+
+    return ConversationMessage(
+      event: event ?? 'conversation:message_sent',
+      conversationId: map['conversation_id'] as String?,
+      userId: map['user_id'] as String?,
+      messageId: map['message_id'] as String?,
+      onlineCount: map['online_count'] as int?,
+      metadata: map['metadata'] as Map<String, dynamic>?,
       timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );
   }

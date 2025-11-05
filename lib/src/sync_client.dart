@@ -96,7 +96,7 @@ class SyncClient {
 
   bool _isInitialized = false;
   bool _hasConnectedOnce = false;
-  int? _lastSyncedSeqnum;
+  int _lastSyncedSeqnum = 0;
   final Set<int> _pendingAcks = {};
 
   // Store channel subscription params for reconnection
@@ -117,6 +117,9 @@ class SyncClient {
 
   // Stream controller for livestream events
   final StreamController<LivestreamMessage> _livestreamController = StreamController<LivestreamMessage>.broadcast();
+
+  // Stream controller for conversation events
+  final StreamController<ConversationMessage> _conversationController = StreamController<ConversationMessage>.broadcast();
 
   // Stream controller for sync ready state changes
   final StreamController<SyncReadyState> _syncReadyStateController = StreamController<SyncReadyState>.broadcast();
@@ -273,6 +276,11 @@ class SyncClient {
     await _ws.disconnect();
   }
 
+  Future<void> syncOverTable(String table) async {
+    await _pushLocalChanges();
+    await _pullRemoteChangesForTable(table);
+  }
+
   /// Manually trigger a sync cycle
   Future<void> sync() async {
     await _pushLocalChanges();
@@ -311,12 +319,32 @@ class SyncClient {
   }
 
   /// Request remote changes from server
+  Future<void> _pullRemoteChangesForTable(String table) async {
+    if (!_ws.isConnected) return;
+
+    if (_lastSyncedSeqnum == 0) {
+      _lastSyncedSeqnum = await _getMaxSeqnumFromTable(table) ?? 0; // seqnum is global across all tables. we have anything under the max
+    }
+
+    try {
+      final request = RequestChangesMessage(
+        sinceSeqnum: _lastSyncedSeqnum,
+        table: table
+      );
+      await _ws.send(request);
+      _logger.fine('Requested remote changes since $_lastSyncedSeqnum');
+    } catch (e) {
+      _logger.severe('Failed to request changes: $e');
+    }
+  }
+
+  /// Request remote changes from server
   Future<void> _pullRemoteChanges() async {
     if (!_ws.isConnected) return;
 
     try {
       final request = RequestChangesMessage(
-        sinceSeqnum: _lastSyncedSeqnum,
+        sinceSeqnum: _lastSyncedSeqnum ?? 0,
       );
       await _ws.send(request);
       _logger.fine('Requested remote changes since $_lastSyncedSeqnum');
@@ -361,6 +389,8 @@ class SyncClient {
         _handleJobUpdate(message);
       } else if (message is LivestreamMessage) {
         _handleLivestream(message);
+      } else if (message is ConversationMessage) {
+        _handleConversation(message);
       } else if (message is SchemaUpdateMessage) {
         await _handleSchemaUpdate(message);
       } else {
@@ -455,7 +485,7 @@ class SyncClient {
 
         // Update last synced seqnum
         if (changes.isNotEmpty && changes.last.seqnum != null) {
-          _lastSyncedSeqnum = changes.last.seqnum;
+          _lastSyncedSeqnum = changes.last.seqnum ?? 0;
         }
       } catch (e) {
         _logger.severe('Failed to apply changes batch: $e');
@@ -569,6 +599,12 @@ class SyncClient {
   void _handleLivestream(LivestreamMessage message) {
     _logger.info('Livestream event: ${message.event} - stream ${message.streamId} by user ${message.userId}');
     _livestreamController.add(message);
+  }
+
+  /// Handle conversation message
+  void _handleConversation(ConversationMessage message) {
+    _logger.info('Conversation event: ${message.event} - conversation ${message.conversationId} by user ${message.userId}');
+    _conversationController.add(message);
   }
 
   /// Handle schema update notification
@@ -976,6 +1012,42 @@ class SyncClient {
     }
   }
 
+  /// Send a conversation presence event (user_joined or user_left)
+  ///
+  /// Example:
+  /// ```dart
+  /// // Notify that user joined a conversation
+  /// await syncClient.sendConversationPresence(
+  ///   conversationId: 'tribe_123',
+  ///   userId: 'user_456',
+  ///   event: 'conversation:user_joined',
+  /// );
+  /// ```
+  Future<void> sendConversationPresence({
+    required String conversationId,
+    required String userId,
+    required String event, // 'conversation:user_joined' or 'conversation:user_left'
+    String? channelTopic,
+  }) async {
+    if (!_ws.isConnected) {
+      throw Exception('Not connected to server');
+    }
+
+    try {
+      final payload = {
+        'conversation_id': conversationId,
+        'user_id': userId,
+        'timestamp': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      };
+
+      await _ws.sendRaw(event, payload, channelTopic: channelTopic);
+      _logger.info('Sent conversation presence event: $event for conversation $conversationId');
+    } catch (e) {
+      _logger.severe('Failed to send conversation presence: $e');
+      rethrow;
+    }
+  }
+
   /// Get current connection state
   ConnectionState get connectionState => _ws.state;
 
@@ -993,6 +1065,9 @@ class SyncClient {
 
   /// Stream of livestream events (started/stopped notifications)
   Stream<LivestreamMessage> get livestreamEvents => _livestreamController.stream;
+
+  /// Stream of conversation events (user presence, message notifications, online count)
+  Stream<ConversationMessage> get conversationEvents => _conversationController.stream;
 
   /// Stream of sync ready state changes
   /// Listen to this to know when the client is ready to stream snapshots
@@ -1014,6 +1089,8 @@ class SyncClient {
     await _remoteChangeController.close();
     await _snapshotCompleteController.close();
     await _jobUpdateController.close();
+    await _livestreamController.close();
+    await _conversationController.close();
     await _syncReadyStateController.close();
     await _ws.dispose();
     await _db?.close();
