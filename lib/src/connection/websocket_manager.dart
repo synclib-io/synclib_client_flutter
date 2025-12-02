@@ -12,6 +12,7 @@ enum ConnectionState {
   connected,
   reconnecting,
   failed,
+  authFailed,
 }
 
 /// WebSocket connection manager using Phoenix Channels
@@ -29,6 +30,7 @@ class WebSocketManager {
   StreamController<ConnectionState>? _stateController;
   int _reconnectAttempts = 0;
   Map<String, dynamic>? _connectionParams;
+  DateTime? _connectStartTime;
 
   WebSocketManager({
     required this.url,
@@ -65,6 +67,7 @@ class WebSocketManager {
     }
 
     _updateState(ConnectionState.connecting);
+    _connectStartTime = DateTime.now();
     _logger.info('Connecting to $url');
 
     try {
@@ -321,12 +324,30 @@ class WebSocketManager {
   /// Handle WebSocket error
   void _onError(error) {
     _logger.severe('WebSocket error: $error');
-    _updateState(ConnectionState.failed);
+
+    // If error occurs very quickly after connection attempt (< 2 seconds),
+    // it's likely an auth failure (token expired/invalid)
+    final timeSinceConnect = _connectStartTime != null
+        ? DateTime.now().difference(_connectStartTime!).inMilliseconds
+        : 999999;
+    if (timeSinceConnect < 2000 && _state == ConnectionState.connecting) {
+      _logger.warning('Connection rejected quickly - likely auth failure (token expired?)');
+      _updateState(ConnectionState.authFailed);
+    } else {
+      _updateState(ConnectionState.failed);
+    }
   }
 
   /// Handle WebSocket close
   void _onDone() {
     _logger.warning('WebSocket connection closed');
+
+    // Don't auto-reconnect on auth failures - client needs to refresh token first
+    if (_state == ConnectionState.authFailed) {
+      _logger.warning('Not reconnecting due to auth failure - token refresh required');
+      return;
+    }
+
     _updateState(ConnectionState.disconnected);
     _scheduleReconnect();
   }
