@@ -270,6 +270,18 @@ class SyncClient {
     _logger.info('Left channel: $topic');
   }
 
+  /// Leave a channel by its topic ID (e.g., "sync:user:123")
+  ///
+  /// Example:
+  /// ```dart
+  /// await syncClient.leaveChannelById('sync:user:123');
+  /// ```
+  Future<void> leaveChannelById(String channelId) async {
+    _logger.info('Leaving channel: $channelId');
+    await _ws.leaveChannel(channelId);
+    _logger.info('Left channel: $channelId');
+  }
+
   /// Disconnect from sync server
   Future<void> disconnect() async {
     _stopPeriodicSync();
