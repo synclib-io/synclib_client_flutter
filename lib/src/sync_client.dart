@@ -68,6 +68,10 @@ class SyncClientConfig {
   /// Optional metadata to send in hello message
   final Map<String, dynamic>? metadata;
 
+  /// Channel to use for broadcasting messages (e.g., "sync:user:123")
+  /// If not specified, uses the first channel
+  final String? broadcastChannel;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -79,6 +83,7 @@ class SyncClientConfig {
     this.pullInterval,
     this.onConflict,
     this.metadata,
+    this.broadcastChannel,
   });
 }
 
@@ -319,7 +324,7 @@ class SyncClient {
         toSeqnum: changes.last.seqnum,
       );
 
-      await _ws.send(batch);
+      await _ws.send(batch, channelTopic: config.broadcastChannel);
 
       // Track pending acks
       for (final change in changes) {
@@ -343,7 +348,7 @@ class SyncClient {
         sinceSeqnum: _lastSyncedSeqnum,
         table: table
       );
-      await _ws.send(request);
+      await _ws.send(request, channelTopic: config.broadcastChannel);
       _logger.fine('Requested remote changes since $_lastSyncedSeqnum');
     } catch (e) {
       _logger.severe('Failed to request changes: $e');
@@ -358,7 +363,7 @@ class SyncClient {
       final request = RequestChangesMessage(
         sinceSeqnum: _lastSyncedSeqnum ?? 0,
       );
-      await _ws.send(request);
+      await _ws.send(request, channelTopic: config.broadcastChannel);
       _logger.fine('Requested remote changes since $_lastSyncedSeqnum');
     } catch (e) {
       _logger.severe('Failed to request changes: $e');
@@ -376,7 +381,7 @@ class SyncClient {
       schemaVersion: schemaVersion,
       metadata: config.metadata,
     );
-    await _ws.send(hello);
+    await _ws.send(hello, channelTopic: config.broadcastChannel);
     _logger.info('Sent hello message with schema version $schemaVersion');
   }
 
@@ -713,7 +718,7 @@ class SyncClient {
 
     // Confirm migration to server
     final confirm = SchemaConfirmMessage(version: currentVersion);
-    await _ws.send(confirm);
+    await _ws.send(confirm, channelTopic: config.broadcastChannel);
 
     _logger.info('Confirmed schema migration to server');
   }

@@ -31,6 +31,7 @@ class WebSocketManager {
   int _reconnectAttempts = 0;
   Map<String, dynamic>? _connectionParams;
   DateTime? _connectStartTime;
+  bool _intentionalDisconnect = false;
 
   WebSocketManager({
     required this.url,
@@ -60,6 +61,9 @@ class WebSocketManager {
       _logger.info('Already connected or connecting');
       return;
     }
+
+    // Reset intentional disconnect flag when connecting
+    _intentionalDisconnect = false;
 
     // Store params for reconnection
     if (params != null) {
@@ -177,6 +181,9 @@ class WebSocketManager {
   /// Disconnect from WebSocket server
   Future<void> disconnect() async {
     _logger.info('Disconnecting');
+
+    // Mark as intentional to prevent auto-reconnect
+    _intentionalDisconnect = true;
 
     // Leave all channels
     for (final channel in _channels.values) {
@@ -354,6 +361,12 @@ class WebSocketManager {
 
   /// Schedule automatic reconnection
   void _scheduleReconnect() {
+    // Don't reconnect if disconnect was intentional
+    if (_intentionalDisconnect) {
+      _logger.info('Skipping reconnect - disconnect was intentional');
+      return;
+    }
+
     if (_reconnectAttempts >= maxReconnectAttempts) {
       _logger.severe('Max reconnect attempts reached');
       _updateState(ConnectionState.failed);
