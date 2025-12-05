@@ -363,20 +363,24 @@ class SnapshotBatchMessage extends SyncMessage {
 /// Snapshot complete message (marks end of snapshot stream)
 class SnapshotCompleteMessage extends SyncMessage {
   final String streamId;
+  final String channelId;
 
   const SnapshotCompleteMessage({
     required this.streamId,
+    required this.channelId,
   });
 
   @override
   Map<String, dynamic> toMap() => {
     'type': 'snapshot_complete',
     'stream_id': streamId,
+    'channel_id': channelId,
   };
 
   factory SnapshotCompleteMessage.fromMap(Map<String, dynamic> map) =>
     SnapshotCompleteMessage(
       streamId: map['stream_id'] as String,
+      channelId: map['channel_id'] as String,
     );
 }
 

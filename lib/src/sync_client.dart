@@ -24,6 +24,17 @@ typedef ConflictResolver = Future<ChangeMessage?> Function(
   ChangeMessage remote,
 );
 
+/// Event emitted when a snapshot stream completes
+class SnapshotCompleteEvent {
+  final String streamId;
+  final String channelId;
+
+  const SnapshotCompleteEvent({
+    required this.streamId,
+    required this.channelId,
+  });
+}
+
 class SyncClientChannel {
   final String channelName;
   final String channelId;
@@ -115,7 +126,7 @@ class SyncClient {
   final StreamController<ChangeMessage> _remoteChangeController = StreamController<ChangeMessage>.broadcast();
 
   // Stream controller for snapshot complete events
-  final StreamController<String> _snapshotCompleteController = StreamController<String>.broadcast();
+  final StreamController<SnapshotCompleteEvent> _snapshotCompleteController = StreamController<SnapshotCompleteEvent>.broadcast();
 
   // Stream controller for job update events
   final StreamController<JobUpdateMessage> _jobUpdateController = StreamController<JobUpdateMessage>.broadcast();
@@ -602,8 +613,11 @@ class SyncClient {
 
   /// Handle snapshot complete message
   void _handleSnapshotComplete(SnapshotCompleteMessage message) {
-    _logger.info('Snapshot complete for stream ${message.streamId}');
-    _snapshotCompleteController.add(message.streamId);
+    _logger.info('Snapshot complete for stream ${message.streamId} on channel ${message.channelId}');
+    _snapshotCompleteController.add(SnapshotCompleteEvent(
+      streamId: message.streamId,
+      channelId: message.channelId,
+    ));
   }
 
   /// Handle job update message
@@ -1074,8 +1088,8 @@ class SyncClient {
   /// Stream of remote changes as they are applied
   Stream<ChangeMessage> get remoteChanges => _remoteChangeController.stream;
 
-  /// Stream of snapshot complete events (emits stream_id when snapshot finishes)
-  Stream<String> get snapshotComplete => _snapshotCompleteController.stream;
+  /// Stream of snapshot complete events (emits streamId and channelId when snapshot finishes)
+  Stream<SnapshotCompleteEvent> get snapshotComplete => _snapshotCompleteController.stream;
 
   /// Stream of job update events (from ECS tasks via webhook)
   Stream<JobUpdateMessage> get jobUpdates => _jobUpdateController.stream;
