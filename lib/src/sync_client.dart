@@ -83,6 +83,10 @@ class SyncClientConfig {
   /// If not specified, uses the first channel
   final String? broadcastChannel;
 
+  /// Whether to pull remote changes periodically.
+  /// If false, only pushes local changes. Defaults to true.
+  final bool pullRemote;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -95,6 +99,7 @@ class SyncClientConfig {
     this.onConflict,
     this.metadata,
     this.broadcastChannel,
+    this.pullRemote = true,
   });
 }
 
@@ -122,6 +127,9 @@ class SyncClient {
   List<String>? _guilds;
   List<String>? _parties;
 
+  // Control whether periodic sync pulls from remote (initialized from config)
+  late bool _pullRemoteEnabled;
+
   // Stream controller for remote change notifications
   final StreamController<ChangeMessage> _remoteChangeController = StreamController<ChangeMessage>.broadcast();
 
@@ -147,6 +155,7 @@ class SyncClient {
   SyncReadyState _readyState = SyncReadyState.waitingForHello;
 
   SyncClient(this.config) {
+    _pullRemoteEnabled = config.pullRemote;
     _ws = WebSocketManager(
       url: config.serverUrl,
       codec: SyncCodecFactory.create(config.codec),
@@ -219,7 +228,7 @@ class SyncClient {
 
     _logger.info('All channels joined successfully');
     _hasConnectedOnce = true;
-    _startPeriodicSync();
+    startPeriodicSync(pullRemote: _pullRemoteEnabled);
     await _sendHello();
   }
 
@@ -761,17 +770,43 @@ class SyncClient {
   }
 
   /// Start periodic sync timers
-  void _startPeriodicSync() {
+  ///
+  /// [pullRemote] - If false, only pushes local changes periodically (no pull).
+  /// Defaults to true.
+  void startPeriodicSync({bool pullRemote = true}) {
+    _pullRemoteEnabled = pullRemote;
+
     if (config.pushInterval != null) {
       _pushTimer?.cancel();
       _pushTimer = Timer.periodic(config.pushInterval!, (_) => _pushLocalChanges());
     }
 
-    if (config.pullInterval != null) {
+    if (config.pullInterval != null && _pullRemoteEnabled) {
       _pullTimer?.cancel();
       _pullTimer = Timer.periodic(config.pullInterval!, (_) => _pullRemoteChanges());
+    } else if (!_pullRemoteEnabled) {
+      _pullTimer?.cancel();
+      _pullTimer = null;
     }
   }
+
+  /// Update whether periodic sync should pull from remote
+  ///
+  /// Can be called at any time to enable/disable remote pulling.
+  set pullRemoteEnabled(bool enabled) {
+    if (_pullRemoteEnabled == enabled) return;
+    _pullRemoteEnabled = enabled;
+
+    if (enabled && config.pullInterval != null) {
+      _pullTimer?.cancel();
+      _pullTimer = Timer.periodic(config.pullInterval!, (_) => _pullRemoteChanges());
+    } else if (!enabled) {
+      _pullTimer?.cancel();
+      _pullTimer = null;
+    }
+  }
+
+  bool get pullRemoteEnabled => _pullRemoteEnabled;
 
   /// Stop periodic sync timers
   void _stopPeriodicSync() {
