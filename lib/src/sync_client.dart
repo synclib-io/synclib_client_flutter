@@ -87,6 +87,11 @@ class SyncClientConfig {
   /// If false, only pushes local changes. Defaults to true.
   final bool pullRemote;
 
+  /// Whether to enable periodic sync at all.
+  /// If false, no timers are started - sync is fully reactive (WebSocket events only).
+  /// Defaults to true.
+  final bool enablePeriodicSync;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -100,6 +105,7 @@ class SyncClientConfig {
     this.metadata,
     this.broadcastChannel,
     this.pullRemote = true,
+    this.enablePeriodicSync = true,
   });
 }
 
@@ -228,7 +234,9 @@ class SyncClient {
 
     _logger.info('All channels joined successfully');
     _hasConnectedOnce = true;
-    startPeriodicSync(pullRemote: _pullRemoteEnabled);
+    if (config.enablePeriodicSync) {
+      startPeriodicSync(pullRemote: _pullRemoteEnabled);
+    }
     await _sendHello();
   }
 
