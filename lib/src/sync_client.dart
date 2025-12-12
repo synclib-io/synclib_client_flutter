@@ -92,6 +92,17 @@ class SyncClientConfig {
   /// Defaults to true.
   final bool enablePeriodicSync;
 
+  /// Whether to automatically push changes immediately when writes occur.
+  /// If true, subscribes to database localChanges stream and pushes on each write.
+  /// Uses debouncing to batch rapid writes (default 100ms debounce).
+  /// Defaults to false for backward compatibility.
+  final bool syncOnWrite;
+
+  /// Debounce duration for syncOnWrite. Batches rapid writes together.
+  /// Only used when syncOnWrite is true.
+  /// Defaults to 100ms.
+  final Duration syncOnWriteDebounce;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -106,6 +117,8 @@ class SyncClientConfig {
     this.broadcastChannel,
     this.pullRemote = true,
     this.enablePeriodicSync = true,
+    this.syncOnWrite = false,
+    this.syncOnWriteDebounce = const Duration(milliseconds: 100),
   });
 }
 
@@ -158,6 +171,10 @@ class SyncClient {
   final Lock _batchLock = Lock();
   final List<SnapshotBatchMessage> _batchQueue = [];
 
+  // syncOnWrite: subscription to local changes and debounce timer
+  StreamSubscription? _localChangeSubscription;
+  Timer? _syncOnWriteDebounceTimer;
+
   SyncReadyState _readyState = SyncReadyState.waitingForHello;
 
   SyncClient(this.config) {
@@ -185,7 +202,30 @@ class SyncClient {
     _messageSubscription = _ws.messages.listen(_handleMessage);
     _stateSubscription = _ws.stateChanges.listen(_handleStateChange);
 
+    // Subscribe to local changes for syncOnWrite
+    if (config.syncOnWrite) {
+      _logger.info('syncOnWrite enabled - subscribing to local changes');
+      _localChangeSubscription = _db!.localChanges.listen((_) {
+        _onLocalChange();
+      });
+    }
+
     _isInitialized = true;
+  }
+
+  /// Called when a local change occurs (for syncOnWrite).
+  /// Uses debouncing to batch rapid writes together.
+  void _onLocalChange() {
+    if (!_ws.isConnected) return;
+
+    // Cancel any existing debounce timer
+    _syncOnWriteDebounceTimer?.cancel();
+
+    // Start a new debounce timer
+    _syncOnWriteDebounceTimer = Timer(config.syncOnWriteDebounce, () {
+      _logger.fine('syncOnWrite: pushing changes after debounce');
+      _pushLocalChanges();
+    });
   }
 
   /// Connect to sync server
@@ -1158,6 +1198,8 @@ class SyncClient {
   /// Dispose resources
   Future<void> dispose() async {
     _stopPeriodicSync();
+    _syncOnWriteDebounceTimer?.cancel();
+    await _localChangeSubscription?.cancel();
     await _messageSubscription?.cancel();
     await _stateSubscription?.cancel();
     await _remoteChangeController.close();
