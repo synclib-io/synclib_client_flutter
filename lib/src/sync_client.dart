@@ -103,6 +103,12 @@ class SyncClientConfig {
   /// Defaults to 100ms.
   final Duration syncOnWriteDebounce;
 
+  /// Optional pre-opened database instance.
+  /// If provided, SyncClient will use this instead of opening a new connection.
+  /// This is useful when you want to share a database connection with other
+  /// parts of your app (e.g., a UI layer that also reads from the database).
+  final SynclibDatabase? database;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -119,6 +125,7 @@ class SyncClientConfig {
     this.enablePeriodicSync = true,
     this.syncOnWrite = false,
     this.syncOnWriteDebounce = const Duration(milliseconds: 100),
+    this.database,
   });
 }
 
@@ -194,9 +201,14 @@ class SyncClient {
 
     _logger.info('Initializing sync client');
 
-    // Open database
-    _db = await SynclibDatabase.open(config.dbPath);
-    _logger.info('Database opened: ${config.dbPath}');
+    // Use provided database or open a new one
+    if (config.database != null) {
+      _db = config.database;
+      _logger.info('Using provided database instance');
+    } else {
+      _db = await SynclibDatabase.open(config.dbPath);
+      _logger.info('Database opened: ${config.dbPath}');
+    }
 
     // Subscribe to WebSocket messages
     _messageSubscription = _ws.messages.listen(_handleMessage);
@@ -631,7 +643,6 @@ class SyncClient {
       final tableCheck = await _db!.read("SELECT name FROM sqlite_master WHERE type='table' AND name='${batch.table}'");
       if (tableCheck.isEmpty) {
         _logger.warning('Table ${batch.table} does not exist, skipping batch');
-        _logger.info('!!! SKIPPING batch for ${batch.table}: table does not exist');
         return;
       }
     } catch (e) {
@@ -657,12 +668,13 @@ class SyncClient {
         processedCount++;
       }
       await _db!.endBulkRemote();
+
       final elapsed = DateTime.now().difference(startTime).inMilliseconds;
-      _logger.info('Successfully applied snapshot batch for ${batch.table}: processed $processedCount/${batch.rows.length} rows in ${elapsed}ms');
+      _logger.info('Applied snapshot batch for ${batch.table}: $processedCount/${batch.rows.length} rows in ${elapsed}ms');
     } catch (e, stackTrace) {
       final elapsed = DateTime.now().difference(startTime).inMilliseconds;
-      _logger.info('!!! FAILED to apply snapshot batch for ${batch.table} after processing $processedCount/${batch.rows.length} rows (${elapsed}ms): $e');
-      _logger.info('Stack trace: $stackTrace');
+      _logger.severe('Failed to apply snapshot batch for ${batch.table} after $processedCount/${batch.rows.length} rows (${elapsed}ms): $e');
+      _logger.fine('Stack trace: $stackTrace');
       await _db!.endBulkRemote(rollback: true);
       rethrow;
     }
