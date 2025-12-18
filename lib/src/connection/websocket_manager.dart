@@ -32,6 +32,8 @@ class WebSocketManager {
   Map<String, dynamic>? _connectionParams;
   DateTime? _connectStartTime;
   bool _intentionalDisconnect = false;
+  int _quickFailureCount = 0; // Track consecutive quick failures for auth detection
+  static const int _quickFailureThreshold = 1; // Trigger authFailed after 1 quick failure to refresh token faster
 
   WebSocketManager({
     required this.url,
@@ -104,6 +106,7 @@ class WebSocketManager {
         _logger.info('Socket opened');
         _updateState(ConnectionState.connected);
         _reconnectAttempts = 0;
+        _quickFailureCount = 0; // Reset quick failure counter on successful connection
       });
 
       // Connect socket
@@ -353,6 +356,26 @@ class WebSocketManager {
     if (_state == ConnectionState.authFailed) {
       _logger.warning('Not reconnecting due to auth failure - token refresh required');
       return;
+    }
+
+    // Track quick failures - if connection closes quickly after connect attempt,
+    // it's likely an auth rejection (expired token)
+    final timeSinceConnect = _connectStartTime != null
+        ? DateTime.now().difference(_connectStartTime!).inMilliseconds
+        : 999999;
+
+    if (timeSinceConnect < 2000) {
+      _quickFailureCount++;
+      _logger.warning('Quick connection failure detected ($_quickFailureCount/$_quickFailureThreshold)');
+
+      if (_quickFailureCount >= _quickFailureThreshold) {
+        _logger.warning('Multiple quick failures - likely auth failure (token expired?)');
+        _updateState(ConnectionState.authFailed);
+        return;
+      }
+    } else {
+      // Reset counter on successful connection that lasted > 2s
+      _quickFailureCount = 0;
     }
 
     _updateState(ConnectionState.disconnected);
