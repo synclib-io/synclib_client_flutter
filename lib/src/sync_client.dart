@@ -87,6 +87,10 @@ class SyncClientConfig {
   /// If false, only pushes local changes. Defaults to true.
   final bool pullRemote;
 
+  /// Whether to push local changes periodically.
+  /// If false, only pulls remote changes. Defaults to true.
+  final bool pushLocal;
+
   /// Whether to enable periodic sync at all.
   /// If false, no timers are started - sync is fully reactive (WebSocket events only).
   /// Defaults to true.
@@ -122,6 +126,7 @@ class SyncClientConfig {
     this.metadata,
     this.broadcastChannel,
     this.pullRemote = true,
+    this.pushLocal = true,
     this.enablePeriodicSync = true,
     this.syncOnWrite = false,
     this.syncOnWriteDebounce = const Duration(milliseconds: 100),
@@ -155,6 +160,8 @@ class SyncClient {
 
   // Control whether periodic sync pulls from remote (initialized from config)
   late bool _pullRemoteEnabled;
+  // Control whether periodic sync pushes local changes (initialized from config)
+  late bool _pushLocalEnabled;
 
   // Stream controller for remote change notifications
   final StreamController<ChangeMessage> _remoteChangeController = StreamController<ChangeMessage>.broadcast();
@@ -186,6 +193,7 @@ class SyncClient {
 
   SyncClient(this.config) {
     _pullRemoteEnabled = config.pullRemote;
+    _pushLocalEnabled = config.pushLocal;
     _ws = WebSocketManager(
       url: config.serverUrl,
       codec: SyncCodecFactory.create(config.codec),
@@ -287,7 +295,7 @@ class SyncClient {
     _logger.info('All channels joined successfully');
     _hasConnectedOnce = true;
     if (config.enablePeriodicSync) {
-      startPeriodicSync(pullRemote: _pullRemoteEnabled);
+      startPeriodicSync(pullRemote: _pullRemoteEnabled, pushLocal: _pushLocalEnabled);
     }
     await _sendHello();
   }
@@ -833,12 +841,18 @@ class SyncClient {
   ///
   /// [pullRemote] - If false, only pushes local changes periodically (no pull).
   /// Defaults to true.
-  void startPeriodicSync({bool pullRemote = true}) {
+  /// [pushLocal] - If false, only pulls remote changes periodically (no push).
+  /// Defaults to true.
+  void startPeriodicSync({bool pullRemote = true, bool pushLocal = true}) {
     _pullRemoteEnabled = pullRemote;
+    _pushLocalEnabled = pushLocal;
 
-    if (config.pushInterval != null) {
+    if (config.pushInterval != null && _pushLocalEnabled) {
       _pushTimer?.cancel();
       _pushTimer = Timer.periodic(config.pushInterval!, (_) => _pushLocalChanges());
+    } else if (!_pushLocalEnabled) {
+      _pushTimer?.cancel();
+      _pushTimer = null;
     }
 
     if (config.pullInterval != null && _pullRemoteEnabled) {
@@ -867,6 +881,24 @@ class SyncClient {
   }
 
   bool get pullRemoteEnabled => _pullRemoteEnabled;
+
+  /// Update whether periodic sync should push local changes
+  ///
+  /// Can be called at any time to enable/disable local pushing.
+  set pushLocalEnabled(bool enabled) {
+    if (_pushLocalEnabled == enabled) return;
+    _pushLocalEnabled = enabled;
+
+    if (enabled && config.pushInterval != null) {
+      _pushTimer?.cancel();
+      _pushTimer = Timer.periodic(config.pushInterval!, (_) => _pushLocalChanges());
+    } else if (!enabled) {
+      _pushTimer?.cancel();
+      _pushTimer = null;
+    }
+  }
+
+  bool get pushLocalEnabled => _pushLocalEnabled;
 
   /// Stop periodic sync timers
   void _stopPeriodicSync() {
