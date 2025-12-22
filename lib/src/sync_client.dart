@@ -438,6 +438,12 @@ class SyncClient {
   Future<void> _pullRemoteChangesForTable(String table) async {
     if (!_ws.isConnected) return;
 
+    // Don't pull until client is ready (hello received, migrations applied)
+    if (!isReady) {
+      _logger.fine('Skipping pull for $table - client not ready yet (state: $_readyState)');
+      return;
+    }
+
     if (_lastSyncedSeqnum == 0) {
       _lastSyncedSeqnum = await _getMaxSeqnumFromTable(table) ?? 0; // seqnum is global across all tables. we have anything under the max
     }
@@ -459,6 +465,12 @@ class SyncClient {
   /// Request remote changes from server
   Future<void> _pullRemoteChanges() async {
     if (!_ws.isConnected) return;
+
+    // Don't pull until client is ready (hello received, migrations applied)
+    if (!isReady) {
+      _logger.fine('Skipping pull - client not ready yet (state: $_readyState)');
+      return;
+    }
 
     try {
       final request = RequestChangesMessage(
