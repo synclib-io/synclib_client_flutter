@@ -206,11 +206,15 @@ class AckMessage extends SyncMessage {
   final int seqnum;
   final bool success;
   final String? error;
+  /// Server-assigned seqnum for the row (set by Postgres trigger).
+  /// Client should update the local row's seqnum column with this value.
+  final int? serverSeqnum;
 
   const AckMessage({
     required this.seqnum,
     required this.success,
     this.error,
+    this.serverSeqnum,
   });
 
   @override
@@ -219,12 +223,14 @@ class AckMessage extends SyncMessage {
     'seqnum': seqnum,
     'success': success,
     if (error != null) 'error': error,
+    if (serverSeqnum != null) 'server_seqnum': serverSeqnum,
   };
 
   factory AckMessage.fromMap(Map<String, dynamic> map) => AckMessage(
     seqnum: map['seqnum'] as int,
     success: map['success'] as bool,
     error: map['error'] as String?,
+    serverSeqnum: map['server_seqnum'] as int?,
   );
 }
 

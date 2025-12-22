@@ -150,6 +150,9 @@ class SyncClient {
   bool _hasConnectedOnce = false;
   int _lastSyncedSeqnum = 0;
   final Set<int> _pendingAcks = {};
+  /// Track pending changes by local seqnum so we can update server seqnum on ack.
+  /// Key is local seqnum from _synclib_changes, value is (table, rowId).
+  final Map<int, ({String table, String rowId})> _pendingChangeInfo = {};
 
   // Store channel subscription params for reconnection
   String? _token;
@@ -414,9 +417,10 @@ class SyncClient {
 
       await _ws.send(batch, channelTopic: config.broadcastChannel);
 
-      // Track pending acks
+      // Track pending acks and change info for server seqnum updates
       for (final change in changes) {
         _pendingAcks.add(change.seqnum);
+        _pendingChangeInfo[change.seqnum] = (table: change.tableName, rowId: change.rowId);
       }
     } catch (e, stack) {
       _logger.severe('Failed to push changes: $e', e, stack);
@@ -601,17 +605,41 @@ class SyncClient {
 
   /// Handle acknowledgment from server
   void _handleAck(AckMessage ack) {
-    _logger.fine('Received ack for seqnum ${ack.seqnum}: ${ack.success}');
+    _logger.fine('Received ack for seqnum ${ack.seqnum}: ${ack.success}, server_seqnum: ${ack.serverSeqnum}');
 
     if (ack.success) {
       _pendingAcks.remove(ack.seqnum);
+
+      // Get the change info for this local seqnum
+      final changeInfo = _pendingChangeInfo.remove(ack.seqnum);
+
       // Mark as synced in local database
       _db!.markSynced(ack.seqnum).catchError((e) {
         _logger.severe('Failed to mark synced: $e');
       });
+
+      // Update the local row's seqnum column with the server-assigned seqnum
+      if (ack.serverSeqnum != null && changeInfo != null) {
+        _updateLocalSeqnum(changeInfo.table, changeInfo.rowId, ack.serverSeqnum!).catchError((e) {
+          _logger.warning('Failed to update local seqnum for ${changeInfo.table}:${changeInfo.rowId}: $e');
+        });
+      }
     } else {
       _logger.warning('Change ${ack.seqnum} failed: ${ack.error}');
+      _pendingChangeInfo.remove(ack.seqnum);
       // TODO: Implement retry logic
+    }
+  }
+
+  /// Update the seqnum column on a local row after server assigns it
+  Future<void> _updateLocalSeqnum(String table, String rowId, int serverSeqnum) async {
+    try {
+      final sql = "UPDATE $table SET seqnum = $serverSeqnum WHERE id = '${rowId.replaceAll("'", "''")}'";
+      await _db!.exec(sql);
+      _logger.fine('Updated local seqnum for $table:$rowId to $serverSeqnum');
+    } catch (e) {
+      // Table might not have seqnum column - this is fine for some tables
+      _logger.fine('Could not update seqnum for $table:$rowId (table may not have seqnum column): $e');
     }
   }
 
