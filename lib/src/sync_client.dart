@@ -79,9 +79,15 @@ class SyncClientConfig {
   /// Optional metadata to send in hello message
   final Map<String, dynamic>? metadata;
 
-  /// Channel to use for broadcasting messages (e.g., "sync:user:123")
+  /// Channel to use for broadcasting/pushing messages (e.g., "sync:user:123")
   /// If not specified, uses the first channel
   final String? broadcastChannel;
+
+  /// Channel to use for pulling remote changes (e.g., "sync:tribe:trainer123")
+  /// If not specified, uses broadcastChannel (or first channel if that's also null).
+  /// This allows pulling from a different channel than you push to.
+  /// Example: Members pull from tribe channel (trainer content) but push to user channel.
+  final String? pullChannel;
 
   /// Whether to pull remote changes periodically.
   /// If false, only pushes local changes. Defaults to true.
@@ -125,6 +131,7 @@ class SyncClientConfig {
     this.onConflict,
     this.metadata,
     this.broadcastChannel,
+    this.pullChannel,
     this.pullRemote = true,
     this.pushLocal = true,
     this.enablePeriodicSync = true,
@@ -440,8 +447,10 @@ class SyncClient {
         sinceSeqnum: _lastSyncedSeqnum,
         table: table
       );
-      await _ws.send(request, channelTopic: config.broadcastChannel);
-      _logger.fine('Requested remote changes since $_lastSyncedSeqnum');
+      // Use pullChannel if specified, otherwise fall back to broadcastChannel
+      final channelTopic = config.pullChannel ?? config.broadcastChannel;
+      await _ws.send(request, channelTopic: channelTopic);
+      _logger.fine('Requested remote changes since $_lastSyncedSeqnum on channel $channelTopic');
     } catch (e) {
       _logger.severe('Failed to request changes: $e');
     }
@@ -455,8 +464,10 @@ class SyncClient {
       final request = RequestChangesMessage(
         sinceSeqnum: _lastSyncedSeqnum ?? 0,
       );
-      await _ws.send(request, channelTopic: config.broadcastChannel);
-      _logger.fine('Requested remote changes since $_lastSyncedSeqnum');
+      // Use pullChannel if specified, otherwise fall back to broadcastChannel
+      final channelTopic = config.pullChannel ?? config.broadcastChannel;
+      await _ws.send(request, channelTopic: channelTopic);
+      _logger.fine('Requested remote changes since $_lastSyncedSeqnum on channel $channelTopic');
     } catch (e) {
       _logger.severe('Failed to request changes: $e');
     }
