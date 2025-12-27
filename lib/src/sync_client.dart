@@ -427,8 +427,40 @@ class SyncClient {
   }
 
   /// Manually trigger a sync cycle
+  ///
+  /// This is the safe version that waits for push acks before pulling,
+  /// preventing race conditions with stale data.
   Future<void> sync() async {
+    await syncSafe();
+  }
+
+  /// Push local changes to server (public API)
+  ///
+  /// Use this when you want to ensure local changes are sent to the server
+  /// without pulling remote changes that might overwrite pending edits.
+  Future<void> push() async {
     await _pushLocalChanges();
+  }
+
+  /// Safely sync by waiting for push acks before pulling
+  ///
+  /// This prevents race conditions where you might pull stale data
+  /// before your local changes have been processed by the server.
+  Future<void> syncSafe({Duration timeout = const Duration(seconds: 10)}) async {
+    await _pushLocalChanges();
+
+    // Wait for all pending acks before pulling
+    if (_pendingAcks.isNotEmpty) {
+      final startTime = DateTime.now();
+      while (_pendingAcks.isNotEmpty) {
+        if (DateTime.now().difference(startTime) > timeout) {
+          _logger.warning('syncSafe: Timeout waiting for acks, ${_pendingAcks.length} still pending');
+          break;
+        }
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
+    }
+
     await _pullRemoteChanges();
   }
 
