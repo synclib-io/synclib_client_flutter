@@ -48,6 +48,17 @@ class SnapshotBatchEvent {
   });
 }
 
+/// Event emitted when starting to request a snapshot for tables
+class SnapshotRequestEvent {
+  final List<String> tables;
+  final bool incremental;
+
+  const SnapshotRequestEvent({
+    required this.tables,
+    required this.incremental,
+  });
+}
+
 class SyncClientChannel {
   final String channelName;
   final String channelId;
@@ -194,6 +205,9 @@ class SyncClient {
 
   // Stream controller for snapshot batch events (per-table progress)
   final StreamController<SnapshotBatchEvent> _snapshotBatchController = StreamController<SnapshotBatchEvent>.broadcast();
+
+  // Stream controller for snapshot request events (when tables are requested)
+  final StreamController<SnapshotRequestEvent> _snapshotRequestController = StreamController<SnapshotRequestEvent>.broadcast();
 
   // Stream controller for job update events
   final StreamController<JobUpdateMessage> _jobUpdateController = StreamController<JobUpdateMessage>.broadcast();
@@ -1147,6 +1161,12 @@ class SyncClient {
       throw Exception('Not connected to server');
     }
 
+    // Emit request event so UI can show which tables are being requested
+    _snapshotRequestController.add(SnapshotRequestEvent(
+      tables: tables,
+      incremental: incremental,
+    ));
+
     int? sinceSeqnum;
 
     if (incremental) {
@@ -1296,6 +1316,10 @@ class SyncClient {
   /// Use this to show loading progress in the UI
   Stream<SnapshotBatchEvent> get snapshotBatches => _snapshotBatchController.stream;
 
+  /// Stream of snapshot request events (emits when snapshot is requested with list of tables)
+  /// Use this to show which tables will be loaded, even for incremental syncs with no batches
+  Stream<SnapshotRequestEvent> get snapshotRequests => _snapshotRequestController.stream;
+
   /// Stream of job update events (from ECS tasks via webhook)
   Stream<JobUpdateMessage> get jobUpdates => _jobUpdateController.stream;
 
@@ -1327,6 +1351,7 @@ class SyncClient {
     await _remoteChangeController.close();
     await _snapshotCompleteController.close();
     await _snapshotBatchController.close();
+    await _snapshotRequestController.close();
     await _jobUpdateController.close();
     await _livestreamController.close();
     await _conversationController.close();
