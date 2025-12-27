@@ -35,6 +35,19 @@ class SnapshotCompleteEvent {
   });
 }
 
+/// Event emitted when a snapshot batch is received and processed
+class SnapshotBatchEvent {
+  final String streamId;
+  final String table;
+  final int rowCount;
+
+  const SnapshotBatchEvent({
+    required this.streamId,
+    required this.table,
+    required this.rowCount,
+  });
+}
+
 class SyncClientChannel {
   final String channelName;
   final String channelId;
@@ -178,6 +191,9 @@ class SyncClient {
 
   // Stream controller for snapshot complete events
   final StreamController<SnapshotCompleteEvent> _snapshotCompleteController = StreamController<SnapshotCompleteEvent>.broadcast();
+
+  // Stream controller for snapshot batch events (per-table progress)
+  final StreamController<SnapshotBatchEvent> _snapshotBatchController = StreamController<SnapshotBatchEvent>.broadcast();
 
   // Stream controller for job update events
   final StreamController<JobUpdateMessage> _jobUpdateController = StreamController<JobUpdateMessage>.broadcast();
@@ -730,6 +746,13 @@ class SyncClient {
 
       final elapsed = DateTime.now().difference(startTime).inMilliseconds;
       _logger.info('Applied snapshot batch for ${batch.table}: $processedCount/${batch.rows.length} rows in ${elapsed}ms');
+
+      // Emit batch event for UI progress tracking
+      _snapshotBatchController.add(SnapshotBatchEvent(
+        streamId: batch.streamId,
+        table: batch.table,
+        rowCount: processedCount,
+      ));
     } catch (e, stackTrace) {
       final elapsed = DateTime.now().difference(startTime).inMilliseconds;
       _logger.severe('Failed to apply snapshot batch for ${batch.table} after $processedCount/${batch.rows.length} rows (${elapsed}ms): $e');
@@ -1269,6 +1292,10 @@ class SyncClient {
   /// Stream of snapshot complete events (emits streamId and channelId when snapshot finishes)
   Stream<SnapshotCompleteEvent> get snapshotComplete => _snapshotCompleteController.stream;
 
+  /// Stream of snapshot batch events (emits table name and row count as each batch is processed)
+  /// Use this to show loading progress in the UI
+  Stream<SnapshotBatchEvent> get snapshotBatches => _snapshotBatchController.stream;
+
   /// Stream of job update events (from ECS tasks via webhook)
   Stream<JobUpdateMessage> get jobUpdates => _jobUpdateController.stream;
 
@@ -1299,6 +1326,7 @@ class SyncClient {
     await _stateSubscription?.cancel();
     await _remoteChangeController.close();
     await _snapshotCompleteController.close();
+    await _snapshotBatchController.close();
     await _jobUpdateController.close();
     await _livestreamController.close();
     await _conversationController.close();
