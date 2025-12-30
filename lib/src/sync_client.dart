@@ -598,6 +598,21 @@ class SyncClient {
   /// Apply a single remote change to local database
   Future<void> _applyRemoteChange(ChangeMessage change) async {
     try {
+      // Check if this is a soft-deleted row - delete locally instead of inserting
+      if (change.data != null && change.data['deleted_at'] != null) {
+        final deleteSql = "DELETE FROM ${change.table} WHERE id = '${_escapeSql(change.rowId)}'";
+        await _db!.applyRemote(
+          tableName: change.table,
+          rowId: change.rowId,
+          operation: SynclibOperation.delete,
+          sql: deleteSql,
+          data: null,
+        );
+        _logger.fine('Soft-deleted row locally: ${change.table}:${change.rowId}');
+        _remoteChangeController.add(change);
+        return;
+      }
+
       // Check for conflicts with pending local changes
       if (config.onConflict != null) {
         final localChanges = await _db!.getPendingChanges();
@@ -669,12 +684,23 @@ class SyncClient {
     await _batchLock.synchronized(() async {
       // Use bulk mode for efficiency
       await _db!.beginBulkRemote();
+      int deletedCount = 0;
       try {
         for (final change in changes) {
-          final sql = _generateSql(change);
-          await _db!.execBulkRemote(sql);
+          // Check if this is a soft-deleted row - delete locally instead of inserting
+          if (change.data != null && change.data['deleted_at'] != null) {
+            final deleteSql = "DELETE FROM ${change.table} WHERE id = '${_escapeSql(change.rowId)}'";
+            await _db!.execBulkRemote(deleteSql);
+            deletedCount++;
+          } else {
+            final sql = _generateSql(change);
+            await _db!.execBulkRemote(sql);
+          }
         }
         await _db!.endBulkRemote();
+        if (deletedCount > 0) {
+          _logger.info('Soft-deleted $deletedCount rows locally');
+        }
         _logger.info('Successfully applied ${changes.length} changes');
 
         // Update last synced seqnum
@@ -774,21 +800,36 @@ class SyncClient {
     // Apply each row to the database
     await _db!.beginBulkRemote();
     int processedCount = 0;
+    int deletedCount = 0;
     try {
       for (final row in batch.rows) {
-        // Create a change message for each row
-        final change = ChangeMessage(
-          table: batch.table,
-          operation: 'insert',
-          rowId: row['id'] as String,
-          data: row,
-        );
+        final deletedAt = row['deleted_at'];
 
-        final sql = _generateSql(change);
-        await _db!.execBulkRemote(sql);
+        if (deletedAt != null) {
+          // Soft-deleted row - delete locally
+          final rowId = row['id'] as String;
+          final deleteSql = "DELETE FROM ${batch.table} WHERE id = '${_escapeSql(rowId)}'";
+          await _db!.execBulkRemote(deleteSql);
+          deletedCount++;
+        } else {
+          // Normal row - insert/replace as usual
+          final change = ChangeMessage(
+            table: batch.table,
+            operation: 'insert',
+            rowId: row['id'] as String,
+            data: row,
+          );
+
+          final sql = _generateSql(change);
+          await _db!.execBulkRemote(sql);
+        }
         processedCount++;
       }
       await _db!.endBulkRemote();
+
+      if (deletedCount > 0) {
+        _logger.info('Soft-deleted $deletedCount rows from ${batch.table}');
+      }
 
       final elapsed = DateTime.now().difference(startTime).inMilliseconds;
       _logger.info('Applied snapshot batch for ${batch.table}: $processedCount/${batch.rows.length} rows in ${elapsed}ms');
