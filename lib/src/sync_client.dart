@@ -599,7 +599,7 @@ class SyncClient {
   Future<void> _applyRemoteChange(ChangeMessage change) async {
     try {
       // Check if this is a soft-deleted row - delete locally instead of inserting
-      if (change.data != null && change.data['deleted_at'] != null) {
+      if (change.data?['deleted_at'] != null) {
         final deleteSql = "DELETE FROM ${change.table} WHERE id = '${_escapeSql(change.rowId)}'";
         await _db!.applyRemote(
           tableName: change.table,
@@ -688,7 +688,7 @@ class SyncClient {
       try {
         for (final change in changes) {
           // Check if this is a soft-deleted row - delete locally instead of inserting
-          if (change.data != null && change.data['deleted_at'] != null) {
+          if (change.data?['deleted_at'] != null) {
             final deleteSql = "DELETE FROM ${change.table} WHERE id = '${_escapeSql(change.rowId)}'";
             await _db!.execBulkRemote(deleteSql);
             deletedCount++;
