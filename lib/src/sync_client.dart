@@ -421,6 +421,52 @@ class SyncClient {
     await _ws.disconnect();
   }
 
+  /// Wait for connection to be established, triggering reconnect if needed.
+  ///
+  /// This is useful when you want to ensure the client is connected before
+  /// sending messages, rather than immediately failing with "Not connected".
+  ///
+  /// Throws an exception if reconnection fails or times out.
+  Future<void> _waitForConnection({Duration timeout = const Duration(seconds: 30)}) async {
+    if (_ws.isConnected) return;
+
+    // Trigger reconnect if not already reconnecting
+    if (_ws.state == ConnectionState.disconnected || _ws.state == ConnectionState.failed) {
+      _logger.info('Not connected, triggering reconnect...');
+      // Don't await connect() - it may return before actually connected
+      _ws.connect();
+    }
+
+    // If already reconnecting, just wait
+    if (_ws.state == ConnectionState.reconnecting || _ws.state == ConnectionState.connecting) {
+      _logger.info('Reconnection in progress, waiting...');
+    }
+
+    // Wait for connected state
+    final completer = Completer<void>();
+    StreamSubscription<ConnectionState>? sub;
+
+    sub = _ws.stateChanges.listen((state) {
+      if (state == ConnectionState.connected) {
+        sub?.cancel();
+        if (!completer.isCompleted) completer.complete();
+      } else if (state == ConnectionState.failed || state == ConnectionState.authFailed) {
+        sub?.cancel();
+        if (!completer.isCompleted) {
+          completer.completeError(Exception('Reconnection failed: $state'));
+        }
+      }
+    });
+
+    try {
+      await completer.future.timeout(timeout, onTimeout: () {
+        throw TimeoutException('Timed out waiting for reconnection', timeout);
+      });
+    } finally {
+      await sub?.cancel();
+    }
+  }
+
   Future<void> syncOverTable(String table) async {
     await _pushLocalChanges();
     await _pullRemoteChangesForTable(table);
@@ -1228,10 +1274,16 @@ class SyncClient {
   Future<void> streamSnapshot(
     List<String> tables, {
     bool incremental = false,
-        String? channelTopic
+    String? channelTopic,
+    bool waitForReconnect = true,
   }) async {
     if (!_ws.isConnected) {
-      throw Exception('Not connected to server');
+      if (waitForReconnect) {
+        _logger.info('streamSnapshot: Not connected, waiting for reconnection...');
+        await _waitForConnection();
+      } else {
+        throw Exception('Not connected to server');
+      }
     }
 
     // Emit request event so UI can show which tables are being requested
@@ -1320,10 +1372,15 @@ class SyncClient {
   Future<Map<String, dynamic>> sendMessage(
     String event,
     Map<String, dynamic> payload,
-    {String? channelTopic}
+    {String? channelTopic, bool waitForReconnect = true}
   ) async {
     if (!_ws.isConnected) {
-      throw Exception('Not connected to server');
+      if (waitForReconnect) {
+        _logger.info('sendMessage: Not connected, waiting for reconnection...');
+        await _waitForConnection();
+      } else {
+        throw Exception('Not connected to server');
+      }
     }
 
     try {
@@ -1353,9 +1410,15 @@ class SyncClient {
     required String userId,
     required String event, // 'conversation:user_joined' or 'conversation:user_left'
     String? channelTopic,
+    bool waitForReconnect = true,
   }) async {
     if (!_ws.isConnected) {
-      throw Exception('Not connected to server');
+      if (waitForReconnect) {
+        _logger.info('sendConversationPresence: Not connected, waiting for reconnection...');
+        await _waitForConnection();
+      } else {
+        throw Exception('Not connected to server');
+      }
     }
 
     try {
