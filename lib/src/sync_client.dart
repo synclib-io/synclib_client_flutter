@@ -1133,11 +1133,6 @@ class SyncClient {
         // But the document JSON has camelCase like userId, createdAt
         String normalizedKey = key.toLowerCase();
 
-        // Handle special case mappings
-        if (change.table == 'users' && normalizedKey == 'username') {
-          normalizedKey = 'name';
-        }
-
         filteredData[normalizedKey] = value;
       }
     }
