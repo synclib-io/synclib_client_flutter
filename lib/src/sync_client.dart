@@ -218,6 +218,15 @@ class SyncClient {
   // Stream controller for conversation events
   final StreamController<ConversationMessage> _conversationController = StreamController<ConversationMessage>.broadcast();
 
+  // Stream controller for presence events (video/livestream viewers)
+  final StreamController<PresenceMessage> _presenceController = StreamController<PresenceMessage>.broadcast();
+
+  // Stream controller for feed status events (new videos, online count)
+  final StreamController<FeedStatusMessage> _feedStatusController = StreamController<FeedStatusMessage>.broadcast();
+
+  // Stream controller for interaction events (likes, comments, comment likes)
+  final StreamController<InteractionMessage> _interactionController = StreamController<InteractionMessage>.broadcast();
+
   // Stream controller for sync ready state changes
   final StreamController<SyncReadyState> _syncReadyStateController = StreamController<SyncReadyState>.broadcast();
 
@@ -631,6 +640,12 @@ class SyncClient {
         _handleLivestream(message);
       } else if (message is ConversationMessage) {
         _handleConversation(message);
+      } else if (message is PresenceMessage) {
+        _handlePresence(message);
+      } else if (message is FeedStatusMessage) {
+        _handleFeedStatus(message);
+      } else if (message is InteractionMessage) {
+        _handleInteraction(message);
       } else if (message is SchemaUpdateMessage) {
         await _handleSchemaUpdate(message);
       } else {
@@ -920,6 +935,24 @@ class SyncClient {
   void _handleConversation(ConversationMessage message) {
     _logger.info('Conversation event: ${message.event} - conversation ${message.conversationId} by user ${message.userId}');
     _conversationController.add(message);
+  }
+
+  /// Handle presence message (video/livestream viewers)
+  void _handlePresence(PresenceMessage message) {
+    _logger.info('Presence event: ${message.presenceType} - video ${message.videoId}, count ${message.viewerCount}');
+    _presenceController.add(message);
+  }
+
+  /// Handle feed status message (new videos, online count)
+  void _handleFeedStatus(FeedStatusMessage message) {
+    _logger.info('Feed status event: ${message.statusType} - video ${message.videoId}, online ${message.onlineCount}');
+    _feedStatusController.add(message);
+  }
+
+  /// Handle interaction message (likes, comments, comment likes)
+  void _handleInteraction(InteractionMessage message) {
+    _logger.info('Interaction event: ${message.interactionType} - video ${message.videoId}, comment ${message.commentId}');
+    _interactionController.add(message);
   }
 
   /// Handle schema update notification
@@ -1460,6 +1493,15 @@ class SyncClient {
   /// Stream of conversation events (user presence, message notifications, online count)
   Stream<ConversationMessage> get conversationEvents => _conversationController.stream;
 
+  /// Stream of presence events (video/livestream viewer updates)
+  Stream<PresenceMessage> get presenceEvents => _presenceController.stream;
+
+  /// Stream of feed status events (new videos, online count)
+  Stream<FeedStatusMessage> get feedStatusEvents => _feedStatusController.stream;
+
+  /// Stream of interaction events (likes, comments, comment likes)
+  Stream<InteractionMessage> get interactionEvents => _interactionController.stream;
+
   /// Stream of sync ready state changes
   /// Listen to this to know when the client is ready to stream snapshots
   /// States: waitingForHello -> applyingMigrations -> ready
@@ -1486,6 +1528,9 @@ class SyncClient {
     await _jobUpdateController.close();
     await _livestreamController.close();
     await _conversationController.close();
+    await _presenceController.close();
+    await _feedStatusController.close();
+    await _interactionController.close();
     await _syncReadyStateController.close();
     await _ws.dispose();
     await _db?.close();

@@ -46,6 +46,12 @@ abstract class SyncMessage {
       case 'conversation:message_sent':
       case 'conversation:online_count':
         return ConversationMessage.fromMap(map);
+      case 'presence':
+        return PresenceMessage.fromMap(map);
+      case 'feed_status':
+        return FeedStatusMessage.fromMap(map);
+      case 'interaction':
+        return InteractionMessage.fromMap(map);
       default:
         throw UnsupportedError('Unknown message type: $type');
     }
@@ -561,6 +567,167 @@ class ConversationMessage extends SyncMessage {
       onlineCount: map['online_count'] as int?,
       metadata: map['metadata'] as Map<String, dynamic>?,
       timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+  }
+}
+
+/// Presence event message for video/livestream viewers
+/// Notifies clients about viewer presence on videos
+class PresenceMessage extends SyncMessage {
+  final String presenceType; // 'viewers_list', 'user_joined', 'user_left'
+  final String? videoId;
+  final String? streamId;
+  final int? viewerCount;
+  final List<Map<String, dynamic>>? viewers; // List of {id, username, avatar_url}
+  final Map<String, dynamic>? user; // For user_joined events
+  final String? userId; // For user_left events
+  final int timestamp;
+
+  const PresenceMessage({
+    required this.presenceType,
+    this.videoId,
+    this.streamId,
+    this.viewerCount,
+    this.viewers,
+    this.user,
+    this.userId,
+    required this.timestamp,
+  });
+
+  bool get isViewersList => presenceType == 'viewers_list';
+  bool get isUserJoined => presenceType == 'user_joined';
+  bool get isUserLeft => presenceType == 'user_left';
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'presence',
+    'presence_type': presenceType,
+    if (videoId != null) 'video_id': videoId,
+    if (streamId != null) 'stream_id': streamId,
+    if (viewerCount != null) 'count': viewerCount,
+    if (viewers != null) 'viewers': viewers,
+    if (user != null) 'user': user,
+    if (userId != null) 'user_id': userId,
+    'timestamp': timestamp,
+  };
+
+  factory PresenceMessage.fromMap(Map<String, dynamic> map) {
+    // Read from inner_type which contains the original type before WebSocketManager overwrote it
+    // Falls back to checking for common type values in case inner_type wasn't set
+    final presenceType = map['inner_type'] as String? ?? 'viewers_list';
+
+    // Parse viewers list if present
+    List<Map<String, dynamic>>? viewers;
+    if (map['viewers'] != null) {
+      final viewersList = map['viewers'] as List;
+      viewers = viewersList.map((v) => Map<String, dynamic>.from(v as Map)).toList();
+    }
+
+    return PresenceMessage(
+      presenceType: presenceType,
+      videoId: map['video_id'] as String?,
+      streamId: map['stream_id'] as String?,
+      viewerCount: map['count'] as int?,
+      viewers: viewers,
+      user: map['user'] as Map<String, dynamic>?,
+      userId: map['user_id'] as String?,
+      timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch,
+    );
+  }
+}
+
+/// Feed status event message
+/// Notifies clients about global feed updates (new videos, online count)
+class FeedStatusMessage extends SyncMessage {
+  final String statusType; // 'new_video', 'online_count'
+  final String? videoId;
+  final Map<String, dynamic>? video; // Video data for new_video events
+  final int? onlineCount;
+  final int timestamp;
+
+  const FeedStatusMessage({
+    required this.statusType,
+    this.videoId,
+    this.video,
+    this.onlineCount,
+    required this.timestamp,
+  });
+
+  bool get isNewVideo => statusType == 'new_video';
+  bool get isOnlineCount => statusType == 'online_count';
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'feed_status',
+    'status_type': statusType,
+    if (videoId != null) 'video_id': videoId,
+    if (video != null) 'video': video,
+    if (onlineCount != null) 'count': onlineCount,
+    'timestamp': timestamp,
+  };
+
+  factory FeedStatusMessage.fromMap(Map<String, dynamic> map) {
+    // Read from inner_type which contains the original type before WebSocketManager overwrote it
+    final statusType = map['inner_type'] as String? ?? 'online_count';
+
+    return FeedStatusMessage(
+      statusType: statusType,
+      videoId: map['video_id'] as String?,
+      video: map['video'] as Map<String, dynamic>?,
+      onlineCount: map['count'] as int?,
+      timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch,
+    );
+  }
+}
+
+/// Interaction event message for video likes, comments, and comment likes
+/// Broadcasts realtime updates to all viewers of a video
+class InteractionMessage extends SyncMessage {
+  final String interactionType; // 'like_added', 'like_removed', 'comment_added', 'comment_removed', 'comment_like_added', 'comment_like_removed'
+  final String? videoId;
+  final String? userId;
+  final String? commentId;
+  final Map<String, dynamic>? comment; // Full comment data for comment_added
+  final int timestamp;
+
+  const InteractionMessage({
+    required this.interactionType,
+    this.videoId,
+    this.userId,
+    this.commentId,
+    this.comment,
+    required this.timestamp,
+  });
+
+  bool get isLikeAdded => interactionType == 'like_added';
+  bool get isLikeRemoved => interactionType == 'like_removed';
+  bool get isCommentAdded => interactionType == 'comment_added';
+  bool get isCommentRemoved => interactionType == 'comment_removed';
+  bool get isCommentLikeAdded => interactionType == 'comment_like_added';
+  bool get isCommentLikeRemoved => interactionType == 'comment_like_removed';
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'interaction',
+    'interaction_type': interactionType,
+    if (videoId != null) 'video_id': videoId,
+    if (userId != null) 'user_id': userId,
+    if (commentId != null) 'comment_id': commentId,
+    if (comment != null) 'comment': comment,
+    'timestamp': timestamp,
+  };
+
+  factory InteractionMessage.fromMap(Map<String, dynamic> map) {
+    // Read from inner_type which contains the original type before WebSocketManager overwrote it
+    final interactionType = map['inner_type'] as String? ?? 'like_added';
+
+    return InteractionMessage(
+      interactionType: interactionType,
+      videoId: map['video_id'] as String?,
+      userId: map['user_id'] as String?,
+      commentId: map['comment_id'] as String?,
+      comment: map['comment'] as Map<String, dynamic>?,
+      timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch,
     );
   }
 }

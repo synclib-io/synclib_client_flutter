@@ -293,7 +293,13 @@ class WebSocketManager {
       // Convert Phoenix message to SyncMessage
       final payload = Map<String, dynamic>.from(message.payload as Map<String, dynamic>? ?? {});
 
-      // Add type to payload for SyncMessage decoding
+      // Preserve the inner type (e.g., "viewers_list", "online_count") before overwriting
+      // This is used by presence and feed_status messages to distinguish event subtypes
+      if (payload['type'] != null) {
+        payload['inner_type'] = payload['type'];
+      }
+
+      // Add type to payload for SyncMessage decoding (this is the Phoenix event type)
       payload['type'] = eventType;
 
       final syncMessage = SyncMessage.fromMap(payload);
