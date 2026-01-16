@@ -40,6 +40,10 @@ abstract class SyncMessage {
         return SchemaUpdateMessage.fromMap(map);
       case 'livestream:started':
       case 'livestream:stopped':
+      case 'grid:created':
+      case 'grid:stopped':
+      case 'grid:participant_change':
+      case 'grid:chat':
         return LivestreamMessage.fromMap(map);
       case 'conversation:user_joined':
       case 'conversation:user_left':
@@ -474,12 +478,18 @@ class SchemaUpdateMessage extends SyncMessage {
 
 /// Livestream event message
 /// Notifies tribe members when a livestream starts or stops
+/// Also handles grid events for multi-user livestreaming
 class LivestreamMessage extends SyncMessage {
-  final String event; // 'livestream:started' or 'livestream:stopped'
+  final String event; // 'livestream:started', 'livestream:stopped', 'grid:created', 'grid:stopped', etc.
   final String? streamId;
   final String? tribeId;
   final String? userId; // User who started/stopped the stream
   final String? hlsUrl; // HLS URL for playing the stream
+  final String? gridId; // For grid events
+  final String? creatorUserId; // For grid:created
+  final List<dynamic>? participants; // For grid:participant_change
+  final String? text; // For grid:chat
+  final String? username; // For grid:chat
   final int timestamp;
 
   const LivestreamMessage({
@@ -488,11 +498,20 @@ class LivestreamMessage extends SyncMessage {
     this.tribeId,
     this.userId,
     this.hlsUrl,
+    this.gridId,
+    this.creatorUserId,
+    this.participants,
+    this.text,
+    this.username,
     required this.timestamp,
   });
 
   bool get isStarted => event == 'livestream:started';
   bool get isStopped => event == 'livestream:stopped';
+  bool get isGridCreated => event == 'grid:created';
+  bool get isGridStopped => event == 'grid:stopped';
+  bool get isGridParticipantChange => event == 'grid:participant_change';
+  bool get isGridChat => event == 'grid:chat';
 
   @override
   Map<String, dynamic> toMap() => {
@@ -501,6 +520,11 @@ class LivestreamMessage extends SyncMessage {
     if (tribeId != null) 'tribe_id': tribeId,
     if (userId != null) 'user_id': userId,
     if (hlsUrl != null) 'hls_url': hlsUrl,
+    if (gridId != null) 'grid_id': gridId,
+    if (creatorUserId != null) 'creator_user_id': creatorUserId,
+    if (participants != null) 'participants': participants,
+    if (text != null) 'text': text,
+    if (username != null) 'username': username,
     'timestamp': timestamp,
   };
 
@@ -514,6 +538,11 @@ class LivestreamMessage extends SyncMessage {
       tribeId: map['tribe_id'] as String?,
       userId: map['user_id'] as String?,
       hlsUrl: map['hls_url'] as String?,
+      gridId: map['grid_id'] as String?,
+      creatorUserId: map['creator_user_id'] as String?,
+      participants: map['participants'] as List<dynamic>?,
+      text: map['text'] as String?,
+      username: map['username'] as String?,
       timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );
   }
