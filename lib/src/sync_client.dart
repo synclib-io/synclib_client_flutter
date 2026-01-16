@@ -424,6 +424,29 @@ class SyncClient {
     _logger.info('Left channel: $channelId');
   }
 
+  /// Join a channel by its full topic (e.g., "grid:lobby:abc123")
+  ///
+  /// Use this for channels that don't follow the sync:{name}:{id} pattern.
+  ///
+  /// Example:
+  /// ```dart
+  /// await syncClient.joinChannelByTopic('grid:lobby:abc123');
+  /// ```
+  Future<void> joinChannelByTopic(String topic, {Map<String, dynamic>? params}) async {
+    if (!_ws.isConnected) {
+      throw StateError('Not connected. Call connect() first.');
+    }
+
+    _logger.info('Joining channel by topic: $topic');
+
+    await _ws.joinChannel(topic, {
+      'client_id': config.clientId,
+      ...?params,
+    });
+
+    _logger.info('Successfully joined channel: $topic');
+  }
+
   /// Disconnect from sync server
   Future<void> disconnect() async {
     _stopPeriodicSync();
