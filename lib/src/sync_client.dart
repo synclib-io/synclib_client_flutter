@@ -1320,36 +1320,33 @@ class SyncClient {
       incremental: incremental,
     ));
 
-    int? sinceSeqnum;
+    Map<String, int>? tableSeqnums;
 
     if (incremental) {
-      sinceSeqnum = await _getMaxServerSeqnum(tables); // seqnum is global across all tables. we have anything under the max
-      _logger.info('Requesting incremental snapshot since seqnum: $sinceSeqnum');
+      tableSeqnums = await _getPerTableSeqnums(tables);
+      _logger.info('Requesting incremental snapshot with per-table seqnums: $tableSeqnums');
     } else {
       _logger.info('Requesting full snapshot');
     }
 
     final payload = {
       'tables': tables,
-      if (sinceSeqnum != null) 'since_seqnum': sinceSeqnum,
+      if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
     };
 
     await _ws.sendRaw('stream_snapshot', payload, channelTopic: channelTopic);
   }
 
-  /// Get the max seqnum across multiple tables
-  /// Returns null if any table has no data
-  Future<int?> _getMaxServerSeqnum(List<String> tables) async {
-    int? maxSeqnum;
+  /// Get the max seqnum for each table separately
+  /// Returns a map of table name to its max seqnum
+  Future<Map<String, int>> _getPerTableSeqnums(List<String> tables) async {
+    final result = <String, int>{};
 
     for (final table in tables) {
-      final seqnum = await _getMaxSeqnumFromTable(table);
-      if (maxSeqnum == null || seqnum > maxSeqnum) {
-        maxSeqnum = seqnum;
-      }
+      result[table] = await _getMaxSeqnumFromTable(table);
     }
 
-    return maxSeqnum;
+    return result;
   }
 
   /// Query the max seqnum from a local SQLite table

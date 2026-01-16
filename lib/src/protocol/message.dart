@@ -51,6 +51,7 @@ abstract class SyncMessage {
       case 'feed_status':
         return FeedStatusMessage.fromMap(map);
       case 'interaction':
+      case 'view_count_updated':
         return InteractionMessage.fromMap(map);
       default:
         throw UnsupportedError('Unknown message type: $type');
@@ -680,14 +681,15 @@ class FeedStatusMessage extends SyncMessage {
   }
 }
 
-/// Interaction event message for video likes, comments, and comment likes
+/// Interaction event message for video likes, comments, comment likes, and view counts
 /// Broadcasts realtime updates to all viewers of a video
 class InteractionMessage extends SyncMessage {
-  final String interactionType; // 'like_added', 'like_removed', 'comment_added', 'comment_removed', 'comment_like_added', 'comment_like_removed'
+  final String interactionType; // 'like_added', 'like_removed', 'comment_added', 'comment_removed', 'comment_like_added', 'comment_like_removed', 'view_count_updated'
   final String? videoId;
   final String? userId;
   final String? commentId;
   final Map<String, dynamic>? comment; // Full comment data for comment_added
+  final int? viewCount; // Total view count for view_count_updated
   final int timestamp;
 
   const InteractionMessage({
@@ -696,6 +698,7 @@ class InteractionMessage extends SyncMessage {
     this.userId,
     this.commentId,
     this.comment,
+    this.viewCount,
     required this.timestamp,
   });
 
@@ -705,6 +708,7 @@ class InteractionMessage extends SyncMessage {
   bool get isCommentRemoved => interactionType == 'comment_removed';
   bool get isCommentLikeAdded => interactionType == 'comment_like_added';
   bool get isCommentLikeRemoved => interactionType == 'comment_like_removed';
+  bool get isViewCountUpdated => interactionType == 'view_count_updated';
 
   @override
   Map<String, dynamic> toMap() => {
@@ -714,12 +718,14 @@ class InteractionMessage extends SyncMessage {
     if (userId != null) 'user_id': userId,
     if (commentId != null) 'comment_id': commentId,
     if (comment != null) 'comment': comment,
+    if (viewCount != null) 'view_count': viewCount,
     'timestamp': timestamp,
   };
 
   factory InteractionMessage.fromMap(Map<String, dynamic> map) {
     // Read from inner_type which contains the original type before WebSocketManager overwrote it
-    final interactionType = map['inner_type'] as String? ?? 'like_added';
+    // Fall back to the event type (in 'type' field) for events like view_count_updated
+    final interactionType = map['inner_type'] as String? ?? map['type'] as String? ?? 'like_added';
 
     return InteractionMessage(
       interactionType: interactionType,
@@ -727,6 +733,7 @@ class InteractionMessage extends SyncMessage {
       userId: map['user_id'] as String?,
       commentId: map['comment_id'] as String?,
       comment: map['comment'] as Map<String, dynamic>?,
+      viewCount: map['view_count'] as int?,
       timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch,
     );
   }
