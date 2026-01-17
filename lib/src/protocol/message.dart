@@ -45,6 +45,13 @@ abstract class SyncMessage {
       case 'grid:participant_change':
       case 'grid:chat':
         return LivestreamMessage.fromMap(map);
+      case 'direct_stream:created':
+      case 'direct_stream:ended':
+      case 'direct_stream:participant_joined':
+      case 'direct_stream:participant_left':
+      case 'direct_stream:segment_available':
+      case 'direct_stream:thumbnail_updated':
+        return DirectStreamMessage.fromMap(map);
       case 'conversation:user_joined':
       case 'conversation:user_left':
       case 'conversation:message_sent':
@@ -764,6 +771,84 @@ class InteractionMessage extends SyncMessage {
       comment: map['comment'] as Map<String, dynamic>?,
       viewCount: map['view_count'] as int?,
       timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch,
+    );
+  }
+}
+
+/// Direct stream event message (Jumpcut low-latency direct playback)
+/// Events: direct_stream:created, direct_stream:ended, direct_stream:participant_joined,
+/// direct_stream:participant_left, direct_stream:segment_available
+class DirectStreamMessage extends SyncMessage {
+  final String event;
+  final String? streamId;
+  final String? creatorUserId;
+  final String? userId;
+  final String? username;
+  final String? avatarUrl;
+  final String? thumbnailUrl;
+  final String? streamUrl;
+  final int? participantCount;
+  final List<dynamic>? participants;
+  final int? sequence;
+  final int timestamp;
+
+  const DirectStreamMessage({
+    required this.event,
+    this.streamId,
+    this.creatorUserId,
+    this.userId,
+    this.username,
+    this.avatarUrl,
+    this.thumbnailUrl,
+    this.streamUrl,
+    this.participantCount,
+    this.participants,
+    this.sequence,
+    required this.timestamp,
+  });
+
+  bool get isCreated => event == 'direct_stream:created';
+  bool get isEnded => event == 'direct_stream:ended';
+  bool get isParticipantJoined => event == 'direct_stream:participant_joined';
+  bool get isParticipantLeft => event == 'direct_stream:participant_left';
+  bool get isSegmentAvailable => event == 'direct_stream:segment_available';
+  bool get isThumbnailUpdated => event == 'direct_stream:thumbnail_updated';
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': event,
+    if (streamId != null) 'stream_id': streamId,
+    if (creatorUserId != null) 'creator_user_id': creatorUserId,
+    if (userId != null) 'user_id': userId,
+    if (username != null) 'username': username,
+    if (avatarUrl != null) 'avatar_url': avatarUrl,
+    if (thumbnailUrl != null) 'thumbnail_url': thumbnailUrl,
+    if (streamUrl != null) 'stream_url': streamUrl,
+    if (participantCount != null) 'participant_count': participantCount,
+    if (participants != null) 'participants': participants,
+    if (sequence != null) 'sequence': sequence,
+    'timestamp': timestamp,
+  };
+
+  factory DirectStreamMessage.fromMap(Map<String, dynamic> map) {
+    final event = map['type'] as String? ?? 'direct_stream:created';
+
+    // Extract participant info if present (for participant_joined events)
+    final participant = map['participant'] as Map<String, dynamic>?;
+
+    return DirectStreamMessage(
+      event: event,
+      streamId: map['stream_id'] as String?,
+      creatorUserId: map['creator_user_id'] as String?,
+      userId: participant?['user_id'] as String? ?? map['user_id'] as String?,
+      username: participant?['username'] as String? ?? map['username'] as String?,
+      avatarUrl: participant?['avatar_url'] as String? ?? map['avatar_url'] as String?,
+      thumbnailUrl: participant?['thumbnail_url'] as String? ?? map['thumbnail_url'] as String?,
+      streamUrl: participant?['stream_url'] as String? ?? map['stream_url'] as String?,
+      participantCount: map['participant_count'] as int?,
+      participants: map['participants'] as List<dynamic>?,
+      sequence: map['sequence'] as int?,
+      timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );
   }
 }

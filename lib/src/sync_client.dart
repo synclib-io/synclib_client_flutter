@@ -227,6 +227,9 @@ class SyncClient {
   // Stream controller for interaction events (likes, comments, comment likes)
   final StreamController<InteractionMessage> _interactionController = StreamController<InteractionMessage>.broadcast();
 
+  // Stream controller for direct stream events (participant changes, segment availability)
+  final StreamController<DirectStreamMessage> _directStreamController = StreamController<DirectStreamMessage>.broadcast();
+
   // Stream controller for sync ready state changes
   final StreamController<SyncReadyState> _syncReadyStateController = StreamController<SyncReadyState>.broadcast();
 
@@ -669,6 +672,8 @@ class SyncClient {
         _handleFeedStatus(message);
       } else if (message is InteractionMessage) {
         _handleInteraction(message);
+      } else if (message is DirectStreamMessage) {
+        _handleDirectStream(message);
       } else if (message is SchemaUpdateMessage) {
         await _handleSchemaUpdate(message);
       } else {
@@ -976,6 +981,12 @@ class SyncClient {
   void _handleInteraction(InteractionMessage message) {
     _logger.info('Interaction event: ${message.interactionType} - video ${message.videoId}, comment ${message.commentId}');
     _interactionController.add(message);
+  }
+
+  /// Handle direct stream message (participant changes, segment availability)
+  void _handleDirectStream(DirectStreamMessage message) {
+    _logger.info('Direct stream event: ${message.event} - stream ${message.streamId}');
+    _directStreamController.add(message);
   }
 
   /// Handle schema update notification
@@ -1522,6 +1533,9 @@ class SyncClient {
   /// Stream of interaction events (likes, comments, comment likes)
   Stream<InteractionMessage> get interactionEvents => _interactionController.stream;
 
+  /// Stream of direct stream events (participant changes, segment availability)
+  Stream<DirectStreamMessage> get directStreamEvents => _directStreamController.stream;
+
   /// Stream of sync ready state changes
   /// Listen to this to know when the client is ready to stream snapshots
   /// States: waitingForHello -> applyingMigrations -> ready
@@ -1551,6 +1565,7 @@ class SyncClient {
     await _presenceController.close();
     await _feedStatusController.close();
     await _interactionController.close();
+    await _directStreamController.close();
     await _syncReadyStateController.close();
     await _ws.dispose();
     await _db?.close();
