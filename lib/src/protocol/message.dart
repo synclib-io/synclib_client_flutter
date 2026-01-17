@@ -51,6 +51,7 @@ abstract class SyncMessage {
       case 'direct_stream:participant_left':
       case 'direct_stream:segment_available':
       case 'direct_stream:thumbnail_updated':
+      case 'direct_stream:stream_ready':
         return DirectStreamMessage.fromMap(map);
       case 'conversation:user_joined':
       case 'conversation:user_left':
@@ -777,7 +778,7 @@ class InteractionMessage extends SyncMessage {
 
 /// Direct stream event message (Jumpcut low-latency direct playback)
 /// Events: direct_stream:created, direct_stream:ended, direct_stream:participant_joined,
-/// direct_stream:participant_left, direct_stream:segment_available
+/// direct_stream:participant_left, direct_stream:segment_available, direct_stream:stream_ready
 class DirectStreamMessage extends SyncMessage {
   final String event;
   final String? streamId;
@@ -813,6 +814,7 @@ class DirectStreamMessage extends SyncMessage {
   bool get isParticipantLeft => event == 'direct_stream:participant_left';
   bool get isSegmentAvailable => event == 'direct_stream:segment_available';
   bool get isThumbnailUpdated => event == 'direct_stream:thumbnail_updated';
+  bool get isStreamReady => event == 'direct_stream:stream_ready';
 
   @override
   Map<String, dynamic> toMap() => {
