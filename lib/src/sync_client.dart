@@ -1324,6 +1324,7 @@ class SyncClient {
   /// Stream snapshot of tables from server
   ///
   /// Supports incremental sync by querying max seqnum from local tables.
+  /// Supports custom ordering via [orderBy] and [orderDesc] parameters.
   ///
   /// Example:
   /// ```dart
@@ -1332,12 +1333,17 @@ class SyncClient {
   ///
   /// // Incremental sync (only changes since last sync)
   /// await syncClient.streamSnapshot(['users', 'journal_entries'], incremental: true);
+  ///
+  /// // With custom ordering (newest first)
+  /// await syncClient.streamSnapshot(['videos'], orderBy: 'created_at', orderDesc: true);
   /// ```
   Future<void> streamSnapshot(
     List<String> tables, {
     bool incremental = false,
     String? channelTopic,
     bool waitForReconnect = true,
+    String? orderBy,       // Column name like 'created_at', 'last_modified_ms', 'seqnum'
+    bool orderDesc = true, // true = DESC, false = ASC (default descending)
   }) async {
     if (!_ws.isConnected) {
       if (waitForReconnect) {
@@ -1358,14 +1364,16 @@ class SyncClient {
 
     if (incremental) {
       tableSeqnums = await _getPerTableSeqnums(tables);
-      _logger.info('Requesting incremental snapshot with per-table seqnums: $tableSeqnums');
+      _logger.info('Requesting incremental snapshot with per-table seqnums: $tableSeqnums, orderBy: $orderBy, orderDesc: $orderDesc');
     } else {
-      _logger.info('Requesting full snapshot');
+      _logger.info('Requesting full snapshot, orderBy: $orderBy, orderDesc: $orderDesc');
     }
 
     final payload = {
       'tables': tables,
       if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
+      if (orderBy != null) 'order_by': orderBy,
+      if (orderBy != null) 'order_desc': orderDesc,
     };
 
     await _ws.sendRaw('stream_snapshot', payload, channelTopic: channelTopic);
