@@ -66,9 +66,22 @@ abstract class SyncMessage {
       case 'view_count_updated':
         return InteractionMessage.fromMap(map);
       default:
-        throw UnsupportedError('Unknown message type: $type');
+        // Unknown message types are logged but not thrown - allows forward compatibility
+        // and handles internal server messages that shouldn't be sent to clients
+        return IgnoredMessage(type: type ?? 'unknown');
     }
   }
+}
+
+/// Message type for unknown/ignored messages
+/// Used for forward compatibility and internal server messages
+class IgnoredMessage extends SyncMessage {
+  final String type;
+
+  const IgnoredMessage({required this.type});
+
+  @override
+  Map<String, dynamic> toMap() => {'type': type};
 }
 
 /// Initial handshake message from client to server
