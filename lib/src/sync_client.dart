@@ -59,17 +59,6 @@ class SnapshotRequestEvent {
   });
 }
 
-/// Event emitted when server reports stale tables on connect
-class StaleTablesEvent {
-  final List<StaleTableInfo> staleTables;
-  final String channelTopic;
-
-  const StaleTablesEvent({
-    required this.staleTables,
-    required this.channelTopic,
-  });
-}
-
 /// Info about a single stale table
 class StaleTableInfo {
   final String table;
@@ -89,6 +78,37 @@ class StaleTableInfo {
       serverSeqnum: map['server_seqnum'] as int,
     );
   }
+}
+
+/// State of auto-sync operation
+enum AutoSyncState {
+  /// No stale tables detected or auto-sync not configured
+  idle,
+  /// Stale tables detected, sync in progress
+  syncing,
+  /// Auto-sync completed successfully
+  completed,
+  /// Auto-sync failed
+  failed,
+}
+
+/// Event emitted when auto-sync state changes
+/// Contains both the discovery (what's stale) and progress (syncing/completed)
+class AutoSyncEvent {
+  final AutoSyncState state;
+  final List<StaleTableInfo> staleTables;
+  final String? channelTopic;
+  final String? error;
+
+  const AutoSyncEvent({
+    required this.state,
+    this.staleTables = const [],
+    this.channelTopic,
+    this.error,
+  });
+
+  /// Convenience getter for just the table names
+  List<String> get tableNames => staleTables.map((t) => t.table).toList();
 }
 
 class SyncClientChannel {
@@ -175,17 +195,13 @@ class SyncClientConfig {
   /// parts of your app (e.g., a UI layer that also reads from the database).
   final SynclibDatabase? database;
 
-  /// Tables to check for staleness on connect.
+  /// Tables to auto-sync on connect.
   /// When specified, the client will send per-table seqnums to the server
-  /// on channel join, and the server will report which tables are stale.
-  /// Listen to [SyncClient.staleTablesEvents] to get notified.
-  final List<String>? staleTablesToCheck;
-
-  /// Whether to automatically sync stale tables on connect.
-  /// If true, when the server reports stale tables, the client will
-  /// automatically call streamSnapshot for those tables.
-  /// Defaults to false - you handle the staleTablesEvents yourself.
-  final bool autoSyncStaleTables;
+  /// on channel join. The server reports which tables are stale, and the
+  /// client automatically syncs them.
+  /// Listen to [SyncClient.autoSyncEvents] for progress updates.
+  /// If empty or null, auto-sync is disabled.
+  final List<String>? autoSyncTables;
 
   const SyncClientConfig({
     required this.dbPath,
@@ -206,8 +222,7 @@ class SyncClientConfig {
     this.syncOnWrite = false,
     this.syncOnWriteDebounce = const Duration(milliseconds: 100),
     this.database,
-    this.staleTablesToCheck,
-    this.autoSyncStaleTables = false,
+    this.autoSyncTables,
   });
 }
 
@@ -279,8 +294,14 @@ class SyncClient {
   // Stream controller for sync ready state changes
   final StreamController<SyncReadyState> _syncReadyStateController = StreamController<SyncReadyState>.broadcast();
 
-  // Stream controller for stale tables events (server reports stale tables on connect)
-  final StreamController<StaleTablesEvent> _staleTablesController = StreamController<StaleTablesEvent>.broadcast();
+  // Stream controller for auto-sync events (stale tables detection + sync progress)
+  final StreamController<AutoSyncEvent> _autoSyncController = StreamController<AutoSyncEvent>.broadcast();
+
+  // Track auto-sync state
+  AutoSyncState _autoSyncState = AutoSyncState.idle;
+  Completer<void>? _autoSyncCompleter;
+  List<StaleTableInfo> _autoSyncStaleTables = [];
+  String? _autoSyncChannelTopic;
 
   // Lock to ensure only one batch operation happens at a time
   final Lock _batchLock = Lock();
@@ -385,10 +406,10 @@ class SyncClient {
   /// Join all configured channels
   // todo use initial channels
   Future<void> _joinChannels() async {
-    // Get per-table seqnums if configured
+    // Get per-table seqnums if auto-sync is configured
     Map<String, int>? tableSeqnums;
-    if (config.staleTablesToCheck != null && config.staleTablesToCheck!.isNotEmpty) {
-      tableSeqnums = await _getPerTableSeqnums(config.staleTablesToCheck!);
+    if (config.autoSyncTables != null && config.autoSyncTables!.isNotEmpty) {
+      tableSeqnums = await _getPerTableSeqnums(config.autoSyncTables!);
       _logger.info('Sending table seqnums on join: $tableSeqnums');
     }
 
@@ -420,6 +441,11 @@ class SyncClient {
 
   /// Handle join response from server, including stale tables
   Future<void> _handleJoinResponse(Map<String, dynamic> response, String channelTopic) async {
+    // Skip if auto-sync not configured
+    if (config.autoSyncTables == null || config.autoSyncTables!.isEmpty) {
+      return;
+    }
+
     final staleTablesRaw = response['stale_tables'];
     if (staleTablesRaw == null || staleTablesRaw is! List || staleTablesRaw.isEmpty) {
       return;
@@ -431,33 +457,97 @@ class SyncClient {
 
     _logger.info('Server reports ${staleTables.length} stale table(s): ${staleTables.map((t) => '${t.table}(behind by ${t.behindBy})').join(', ')}');
 
-    // Emit event for listeners
-    _staleTablesController.add(StaleTablesEvent(
+    // Start auto-sync
+    final tableNames = staleTables.map((t) => t.table).toList();
+    _startAutoSync(staleTables, channelTopic);
+
+    // Use incremental sync since we already have some data
+    await streamSnapshot(
+      tableNames,
+      incremental: true,
+      channelTopic: channelTopic,
+      waitForReconnect: false, // We're already connected
+    );
+  }
+
+  /// Start tracking auto-sync operation
+  void _startAutoSync(List<StaleTableInfo> staleTables, String channelTopic) {
+    _autoSyncState = AutoSyncState.syncing;
+    _autoSyncStaleTables = staleTables;
+    _autoSyncChannelTopic = channelTopic;
+    _autoSyncCompleter = Completer<void>();
+
+    _autoSyncController.add(AutoSyncEvent(
+      state: AutoSyncState.syncing,
       staleTables: staleTables,
       channelTopic: channelTopic,
     ));
 
-    // Auto-sync if configured
-    if (config.autoSyncStaleTables && staleTables.isNotEmpty) {
-      final tableNames = staleTables.map((t) => t.table).toList();
-      _logger.info('Auto-syncing stale tables: $tableNames');
+    _logger.info('Auto-sync started for ${staleTables.length} table(s) on $channelTopic');
+  }
 
-      // Use incremental sync since we already have some data
-      await streamSnapshot(
-        tableNames,
-        incremental: true,
-        channelTopic: channelTopic,
-        waitForReconnect: false, // We're already connected
-      );
+  /// Called when snapshot stream completes (from snapshot complete handler)
+  void _onSnapshotStreamComplete(String channelId) {
+    if (_autoSyncState != AutoSyncState.syncing) return;
+
+    // Check if this completion is for our auto-sync channel
+    // channelId format: "sync:tribe:xyz" or "sync:user:abc"
+    if (_autoSyncChannelTopic != null && channelId.contains(_autoSyncChannelTopic!)) {
+      _completeAutoSync();
     }
+  }
+
+  /// Complete the auto-sync operation
+  void _completeAutoSync() {
+    final staleTables = _autoSyncStaleTables;
+    _autoSyncState = AutoSyncState.completed;
+    _autoSyncStaleTables = [];
+    _autoSyncChannelTopic = null;
+
+    _autoSyncController.add(AutoSyncEvent(
+      state: AutoSyncState.completed,
+      staleTables: staleTables,
+    ));
+
+    if (_autoSyncCompleter != null && !_autoSyncCompleter!.isCompleted) {
+      _autoSyncCompleter!.complete();
+    }
+    _autoSyncCompleter = null;
+
+    _logger.info('Auto-sync completed for ${staleTables.length} table(s)');
+
+    // Reset to idle after a short delay
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (_autoSyncState == AutoSyncState.completed) {
+        _autoSyncState = AutoSyncState.idle;
+      }
+    });
+  }
+
+  /// Fail the auto-sync operation
+  void _failAutoSync(String error) {
+    _autoSyncState = AutoSyncState.failed;
+    _autoSyncStaleTables = [];
+    _autoSyncChannelTopic = null;
+
+    _autoSyncController.add(AutoSyncEvent(
+      state: AutoSyncState.failed,
+      error: error,
+    ));
+
+    if (_autoSyncCompleter != null && !_autoSyncCompleter!.isCompleted) {
+      _autoSyncCompleter!.completeError(Exception(error));
+    }
+    _autoSyncCompleter = null;
+
+    _logger.warning('Auto-sync failed: $error');
   }
 
   /// Join an additional channel after initial connection
   ///
-  /// Optionally provide [tablesToCheckStaleness] to check if specific tables
-  /// have newer data on the server. If stale tables are found:
-  /// - A [StaleTablesEvent] is emitted on [staleTablesEvents]
-  /// - If [autoSync] is true, the stale tables are automatically synced
+  /// Optionally provide [autoSyncTables] to check and auto-sync specific tables.
+  /// If stale tables are found, they are automatically synced and an
+  /// [AutoSyncEvent] is emitted on [autoSyncEvents].
   ///
   /// Example:
   /// ```dart
@@ -466,14 +556,12 @@ class SyncClient {
   ///     channelName: 'user',
   ///     channelId: userId,
   ///   ),
-  ///   tablesToCheckStaleness: ['videos', 'users'],
-  ///   autoSync: true,
+  ///   autoSyncTables: ['videos', 'users'],
   /// );
   /// ```
   Future<void> joinChannel(
     SyncClientChannel channel, {
-    List<String>? tablesToCheckStaleness,
-    bool autoSync = false,
+    List<String>? autoSyncTables,
   }) async {
     if (!_ws.isConnected) {
       throw StateError('Not connected. Call connect() first.');
@@ -482,10 +570,10 @@ class SyncClient {
     final topic = 'sync:${channel.channelName}:${channel.channelId}';
     _logger.info('Joining additional channel: $topic');
 
-    // Get per-table seqnums if tables to check are specified
+    // Get per-table seqnums if auto-sync tables are specified
     Map<String, int>? tableSeqnums;
-    if (tablesToCheckStaleness != null && tablesToCheckStaleness.isNotEmpty) {
-      tableSeqnums = await _getPerTableSeqnums(tablesToCheckStaleness);
+    if (autoSyncTables != null && autoSyncTables.isNotEmpty) {
+      tableSeqnums = await _getPerTableSeqnums(autoSyncTables);
       _logger.info('Sending table seqnums on join: $tableSeqnums');
     }
 
@@ -497,16 +585,21 @@ class SyncClient {
 
     _logger.info('Successfully joined channel: $topic');
 
-    // Handle stale tables from server response
-    await _handleJoinResponseDynamic(response, topic, autoSync);
+    // Handle stale tables from server response (auto-sync if tables specified)
+    await _handleJoinResponseDynamic(response, topic, autoSyncTables);
   }
 
   /// Handle join response for dynamically joined channels
   Future<void> _handleJoinResponseDynamic(
     Map<String, dynamic> response,
     String channelTopic,
-    bool autoSync,
+    List<String>? autoSyncTables,
   ) async {
+    // Skip if auto-sync not requested
+    if (autoSyncTables == null || autoSyncTables.isEmpty) {
+      return;
+    }
+
     final staleTablesRaw = response['stale_tables'];
     if (staleTablesRaw == null || staleTablesRaw is! List || staleTablesRaw.isEmpty) {
       return;
@@ -518,24 +611,16 @@ class SyncClient {
 
     _logger.info('Server reports ${staleTables.length} stale table(s): ${staleTables.map((t) => '${t.table}(behind by ${t.behindBy})').join(', ')}');
 
-    // Emit event for listeners
-    _staleTablesController.add(StaleTablesEvent(
-      staleTables: staleTables,
+    // Start auto-sync
+    final tableNames = staleTables.map((t) => t.table).toList();
+    _startAutoSync(staleTables, channelTopic);
+
+    await streamSnapshot(
+      tableNames,
+      incremental: true,
       channelTopic: channelTopic,
-    ));
-
-    // Auto-sync if requested
-    if (autoSync && staleTables.isNotEmpty) {
-      final tableNames = staleTables.map((t) => t.table).toList();
-      _logger.info('Auto-syncing stale tables: $tableNames');
-
-      await streamSnapshot(
-        tableNames,
-        incremental: true,
-        channelTopic: channelTopic,
-        waitForReconnect: false,
-      );
-    }
+      waitForReconnect: false,
+    );
   }
 
   /// Check if a channel is currently joined
@@ -1104,6 +1189,9 @@ class SyncClient {
       streamId: message.streamId,
       channelId: message.channelId,
     ));
+
+    // Check if this completes an auto-sync operation
+    _onSnapshotStreamComplete(message.channelId);
   }
 
   /// Handle job update message
@@ -1711,15 +1799,33 @@ class SyncClient {
   /// Get current sync ready state
   SyncReadyState get readyState => _readyState;
 
-  /// Stream of stale tables events
-  /// Emitted when the server reports that some tables are behind on connect.
-  /// Use this to show a "syncing" indicator or trigger manual sync.
-  /// If autoSyncStaleTables is true, sync happens automatically.
-  Stream<StaleTablesEvent> get staleTablesEvents => _staleTablesController.stream;
+  /// Stream of auto-sync events
+  /// Emitted when stale tables are detected and auto-sync starts, completes, or fails.
+  /// Contains both the discovery (what's stale) and progress (syncing/completed).
+  Stream<AutoSyncEvent> get autoSyncEvents => _autoSyncController.stream;
+
+  /// Current auto-sync state
+  AutoSyncState get autoSyncState => _autoSyncState;
+
+  /// Whether auto-sync is currently in progress
+  bool get isAutoSyncing => _autoSyncState == AutoSyncState.syncing;
+
+  /// Wait for auto-sync to complete
+  /// Returns immediately if not auto-syncing.
+  /// Throws if auto-sync fails.
+  Future<void> waitForAutoSyncComplete() async {
+    if (_autoSyncState != AutoSyncState.syncing) {
+      return;
+    }
+    if (_autoSyncCompleter != null) {
+      await _autoSyncCompleter!.future;
+    }
+  }
 
   /// Check if client is ready to stream snapshots
-  /// Returns true only when state is SyncReadyState.ready
-  bool get isReady => _readyState == SyncReadyState.ready;
+  /// Returns true only when state is SyncReadyState.ready AND not auto-syncing.
+  /// Use this to gate UI rendering until initial data is loaded.
+  bool get isReady => _readyState == SyncReadyState.ready && !isAutoSyncing;
 
   /// Dispose resources
   Future<void> dispose() async {
@@ -1740,7 +1846,7 @@ class SyncClient {
     await _interactionController.close();
     await _directStreamController.close();
     await _syncReadyStateController.close();
-    await _staleTablesController.close();
+    await _autoSyncController.close();
     await _ws.dispose();
     await _db?.close();
     _isInitialized = false;
