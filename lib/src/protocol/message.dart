@@ -65,6 +65,17 @@ abstract class SyncMessage {
       case 'interaction':
       case 'view_count_updated':
         return InteractionMessage.fromMap(map);
+      // New simplified sync handshake messages
+      case 'sync_request':
+        return SyncRequestMessage.fromMap(map);
+      case 'schema_migrations':
+        return SchemaMigrationsMessage.fromMap(map);
+      case 'change_acks':
+        return ChangeAcksMessage.fromMap(map);
+      case 'sync_data_batch':
+        return SyncDataBatchMessage.fromMap(map);
+      case 'sync_complete':
+        return SyncCompleteMessage.fromMap(map);
       default:
         // Unknown message types are logged but not thrown - allows forward compatibility
         // and handles internal server messages that shouldn't be sent to clients
@@ -788,6 +799,250 @@ class InteractionMessage extends SyncMessage {
     );
   }
 }
+
+// ============================================================================
+// SIMPLIFIED SYNC HANDSHAKE PROTOCOL MESSAGES
+// ============================================================================
+
+/// Reference to a specific row in a table
+class RowRef {
+  final String table;
+  final String rowId;
+
+  const RowRef({required this.table, required this.rowId});
+
+  Map<String, dynamic> toMap() => {'table': table, 'row_id': rowId};
+
+  factory RowRef.fromMap(Map<String, dynamic> map) => RowRef(
+    table: map['table'] as String,
+    rowId: map['row_id'] as String,
+  );
+}
+
+/// A pending local change to push to server
+class PendingChange {
+  final int localSeqnum;
+  final String table;
+  final String rowId;
+  final String operation; // insert/update/delete
+  final Map<String, dynamic>? data;
+
+  const PendingChange({
+    required this.localSeqnum,
+    required this.table,
+    required this.rowId,
+    required this.operation,
+    this.data,
+  });
+
+  Map<String, dynamic> toMap() => {
+    'local_seqnum': localSeqnum,
+    'table': table,
+    'row_id': rowId,
+    'operation': operation,
+    if (data != null) 'data': data,
+  };
+
+  factory PendingChange.fromMap(Map<String, dynamic> map) => PendingChange(
+    localSeqnum: map['local_seqnum'] as int,
+    table: map['table'] as String,
+    rowId: map['row_id'] as String,
+    operation: map['operation'] as String,
+    data: map['data'] as Map<String, dynamic>?,
+  );
+}
+
+/// Unified sync request message
+/// Handles push (pending changes), pull (table seqnums), schema, and stripped content
+class SyncRequestMessage extends SyncMessage {
+  final String clientId;
+  final int schemaVersion;
+
+  /// Per-table seqnums for incremental pull
+  final Map<String, int> tableSeqnums;
+
+  /// Specific tables to sync (null = all configured)
+  final List<String>? tables;
+
+  /// Force refresh these tables (ignore seqnums)
+  final List<String>? forceRefreshTables;
+
+  /// Rows that have _stripped=true locally - server will send fresh versions
+  final List<RowRef>? strippedRows;
+
+  /// Local changes to push to server
+  final List<PendingChange>? pendingChanges;
+
+  const SyncRequestMessage({
+    required this.clientId,
+    required this.schemaVersion,
+    required this.tableSeqnums,
+    this.tables,
+    this.forceRefreshTables,
+    this.strippedRows,
+    this.pendingChanges,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'sync_request',
+    'client_id': clientId,
+    'schema_version': schemaVersion,
+    'table_seqnums': tableSeqnums,
+    if (tables != null) 'tables': tables,
+    if (forceRefreshTables != null) 'force_refresh_tables': forceRefreshTables,
+    if (strippedRows != null) 'stripped_rows': strippedRows!.map((r) => r.toMap()).toList(),
+    if (pendingChanges != null) 'pending_changes': pendingChanges!.map((c) => c.toMap()).toList(),
+  };
+
+  factory SyncRequestMessage.fromMap(Map<String, dynamic> map) {
+    final tableSeqnums = Map<String, int>.from(map['table_seqnums'] as Map? ?? {});
+    final strippedRowsRaw = map['stripped_rows'] as List?;
+    final pendingChangesRaw = map['pending_changes'] as List?;
+
+    return SyncRequestMessage(
+      clientId: map['client_id'] as String,
+      schemaVersion: map['schema_version'] as int? ?? 0,
+      tableSeqnums: tableSeqnums,
+      tables: (map['tables'] as List?)?.cast<String>(),
+      forceRefreshTables: (map['force_refresh_tables'] as List?)?.cast<String>(),
+      strippedRows: strippedRowsRaw?.map((r) => RowRef.fromMap(r as Map<String, dynamic>)).toList(),
+      pendingChanges: pendingChangesRaw?.map((c) => PendingChange.fromMap(c as Map<String, dynamic>)).toList(),
+    );
+  }
+}
+
+/// Schema migrations response (sent if schema upgrade needed)
+class SchemaMigrationsMessage extends SyncMessage {
+  final int targetVersion;
+  final List<Map<String, dynamic>> migrations;
+
+  const SchemaMigrationsMessage({
+    required this.targetVersion,
+    required this.migrations,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'schema_migrations',
+    'target_version': targetVersion,
+    'migrations': migrations,
+  };
+
+  factory SchemaMigrationsMessage.fromMap(Map<String, dynamic> map) {
+    final migrations = (map['migrations'] as List? ?? [])
+        .map((m) => Map<String, dynamic>.from(m as Map))
+        .toList();
+    return SchemaMigrationsMessage(
+      targetVersion: map['target_version'] as int,
+      migrations: migrations,
+    );
+  }
+}
+
+/// Single change acknowledgment
+class ChangeAck {
+  final int localSeqnum;
+  final bool success;
+  final int? serverSeqnum;
+  final String? error;
+
+  const ChangeAck({
+    required this.localSeqnum,
+    required this.success,
+    this.serverSeqnum,
+    this.error,
+  });
+
+  Map<String, dynamic> toMap() => {
+    'local_seqnum': localSeqnum,
+    'success': success,
+    if (serverSeqnum != null) 'server_seqnum': serverSeqnum,
+    if (error != null) 'error': error,
+  };
+
+  factory ChangeAck.fromMap(Map<String, dynamic> map) => ChangeAck(
+    localSeqnum: map['local_seqnum'] as int,
+    success: map['success'] as bool,
+    serverSeqnum: map['server_seqnum'] as int?,
+    error: map['error'] as String?,
+  );
+}
+
+/// Batch of change acknowledgments from server
+class ChangeAcksMessage extends SyncMessage {
+  final List<ChangeAck> acks;
+
+  const ChangeAcksMessage({required this.acks});
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'change_acks',
+    'acks': acks.map((a) => a.toMap()).toList(),
+  };
+
+  factory ChangeAcksMessage.fromMap(Map<String, dynamic> map) {
+    final acksRaw = map['acks'] as List? ?? [];
+    return ChangeAcksMessage(
+      acks: acksRaw.map((a) => ChangeAck.fromMap(a as Map<String, dynamic>)).toList(),
+    );
+  }
+}
+
+/// Data batch for sync response (streamed)
+class SyncDataBatchMessage extends SyncMessage {
+  final String table;
+  final List<Map<String, dynamic>> rows;
+
+  const SyncDataBatchMessage({
+    required this.table,
+    required this.rows,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'sync_data_batch',
+    'table': table,
+    'rows': rows,
+  };
+
+  factory SyncDataBatchMessage.fromMap(Map<String, dynamic> map) {
+    final rowsData = map['rows'] as List? ?? [];
+    return SyncDataBatchMessage(
+      table: map['table'] as String,
+      rows: rowsData.map((r) => Map<String, dynamic>.from(r as Map)).toList(),
+    );
+  }
+}
+
+/// Sync completion signal with final state
+class SyncCompleteMessage extends SyncMessage {
+  final int schemaVersion;
+  final Map<String, int> tableSeqnums;
+
+  const SyncCompleteMessage({
+    required this.schemaVersion,
+    required this.tableSeqnums,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'sync_complete',
+    'schema_version': schemaVersion,
+    'table_seqnums': tableSeqnums,
+  };
+
+  factory SyncCompleteMessage.fromMap(Map<String, dynamic> map) {
+    return SyncCompleteMessage(
+      schemaVersion: map['schema_version'] as int? ?? 0,
+      tableSeqnums: Map<String, int>.from(map['table_seqnums'] as Map? ?? {}),
+    );
+  }
+}
+
+// ============================================================================
+// END SIMPLIFIED SYNC HANDSHAKE PROTOCOL MESSAGES
+// ============================================================================
 
 /// Direct stream event message (Jumpcut low-latency direct playback)
 /// Events: direct_stream:created, direct_stream:ended, direct_stream:participant_joined,

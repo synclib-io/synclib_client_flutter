@@ -7,7 +7,7 @@ import 'connection/websocket_manager.dart';
 import 'protocol/message.dart';
 import 'protocol/codec.dart';
 
-/// Sync readiness state
+/// Sync readiness state (legacy - kept for backwards compatibility)
 enum SyncReadyState {
   /// Waiting for initial hello reply from server
   waitingForHello,
@@ -15,6 +15,49 @@ enum SyncReadyState {
   applyingMigrations,
   /// Ready to stream snapshots and sync data
   ready,
+}
+
+/// Simplified sync state for the new unified sync handshake
+enum SyncState {
+  /// Not connected to server
+  disconnected,
+  /// Connecting to server
+  connecting,
+  /// Sync operation in progress
+  syncing,
+  /// Connected and ready
+  ready,
+  /// Error occurred
+  error,
+}
+
+/// Progress information during sync operation
+class SyncProgress {
+  /// Current phase of sync
+  final String phase; // 'pushing', 'pulling', 'migrating', 'complete'
+
+  /// Current table being synced (if applicable)
+  final String? table;
+
+  /// Row count for current batch (if applicable)
+  final int? rowCount;
+
+  /// Number of changes pushed (if applicable)
+  final int? changesPushed;
+
+  /// Number of changes acked (if applicable)
+  final int? changesAcked;
+
+  const SyncProgress({
+    required this.phase,
+    this.table,
+    this.rowCount,
+    this.changesPushed,
+    this.changesAcked,
+  });
+
+  @override
+  String toString() => 'SyncProgress(phase: $phase, table: $table, rowCount: $rowCount)';
 }
 
 /// Callback for conflict resolution
@@ -327,6 +370,18 @@ class SyncClient {
 
   // Stream controller for auto-sync events (stale tables detection + sync progress)
   final StreamController<AutoSyncEvent> _autoSyncController = StreamController<AutoSyncEvent>.broadcast();
+
+  // Stream controller for new simplified sync state
+  final StreamController<SyncState> _syncStateController = StreamController<SyncState>.broadcast();
+
+  // Stream controller for sync progress events
+  final StreamController<SyncProgress> _syncProgressController = StreamController<SyncProgress>.broadcast();
+
+  // Current sync state
+  SyncState _syncState = SyncState.disconnected;
+
+  // Whether a sync operation is currently in progress
+  bool _isSyncing = false;
 
   // Track per-channel sync state
   final Map<String, ChannelSyncState> _channelStates = {};
@@ -938,6 +993,260 @@ class SyncClient {
     await _pullRemoteChanges();
   }
 
+  // ==========================================================================
+  // SIMPLIFIED SYNC HANDSHAKE - New unified sync implementation
+  // ==========================================================================
+
+  /// Find all rows that have _stripped=true in their document
+  /// These rows need to be refreshed to get full content
+  Future<List<RowRef>> _findStrippedRows(List<String> tables) async {
+    final rows = <RowRef>[];
+
+    for (final table in tables) {
+      try {
+        final result = await _db!.read('''
+          SELECT id FROM $table
+          WHERE json_extract(document, '\$._stripped') = 1
+             OR json_extract(document, '\$._stripped') = true
+        ''');
+
+        for (final row in result) {
+          rows.add(RowRef(table: table, rowId: row['id'] as String));
+        }
+
+        if (result.isNotEmpty) {
+          _logger.info('Found ${result.length} stripped rows in $table');
+        }
+      } catch (e) {
+        // Table might not exist or have different schema, continue
+        _logger.fine('Could not check stripped rows in $table: $e');
+      }
+    }
+
+    return rows;
+  }
+
+  /// Update sync state and broadcast change
+  void _updateSyncState(SyncState newState) {
+    if (_syncState != newState) {
+      _syncState = newState;
+      _syncStateController.add(newState);
+      _logger.info('Sync state changed to: $newState');
+    }
+  }
+
+  /// Emit sync progress event
+  void _emitSyncProgress(SyncProgress progress) {
+    _syncProgressController.add(progress);
+    _logger.fine('Sync progress: $progress');
+  }
+
+  /// The ONE unified sync method - handles push, pull, schema, and stripped content
+  ///
+  /// This is the simplified sync handshake that replaces the multi-step flow
+  /// of sendHello(), requestSnapshots(), runAutoSync(), etc.
+  ///
+  /// [tables] - Specific tables to sync (null = all configured in autoSyncTables)
+  /// [forceRefresh] - Tables to force refresh (ignore seqnums)
+  /// [includeStripped] - Auto-detect and refresh stripped rows (default: true)
+  /// [channelTopic] - Channel to sync on (default: broadcastChannel)
+  Future<void> syncUnified({
+    List<String>? tables,
+    List<String>? forceRefresh,
+    bool includeStripped = true,
+    String? channelTopic,
+  }) async {
+    if (!_ws.isConnected) {
+      _logger.warning('syncUnified: Not connected, waiting for connection...');
+      await _waitForConnection();
+    }
+
+    if (_isSyncing) {
+      _logger.info('syncUnified: Already syncing, skipping');
+      return;
+    }
+
+    _isSyncing = true;
+    _updateSyncState(SyncState.syncing);
+
+    try {
+      // Determine which tables to sync
+      final tablesToSync = tables ?? config.autoSyncTables ?? [];
+      if (tablesToSync.isEmpty) {
+        _logger.warning('syncUnified: No tables configured for sync');
+        _isSyncing = false;
+        _updateSyncState(SyncState.ready);
+        return;
+      }
+
+      // 1. Get pending local changes to push
+      _emitSyncProgress(const SyncProgress(phase: 'pushing'));
+      final pendingChanges = await _db!.getPendingChanges(limit: config.pushBatchSize);
+      _logger.info('syncUnified: ${pendingChanges.length} pending changes to push');
+
+      // Convert to PendingChange format
+      final pendingChangeMessages = pendingChanges.map((c) => PendingChange(
+        localSeqnum: c.seqnum,
+        table: c.tableName,
+        rowId: c.rowId,
+        operation: c.operation.name,
+        data: c.data != null ? _parseJson(c.data!) : null,
+      )).toList();
+
+      // 2. Get per-table seqnums for incremental pull
+      final tableSeqnums = await _getPerTableSeqnums(tablesToSync);
+      _logger.info('syncUnified: Table seqnums: $tableSeqnums');
+
+      // 3. Find stripped rows if needed
+      List<RowRef>? strippedRows;
+      if (includeStripped) {
+        strippedRows = await _findStrippedRows(tablesToSync);
+        if (strippedRows.isNotEmpty) {
+          _logger.info('syncUnified: Found ${strippedRows.length} stripped rows to refresh');
+        }
+      }
+
+      // 4. Get current schema version
+      final schemaVersion = await _db!.getSchemaVersion();
+
+      // 5. Build and send sync request
+      final request = SyncRequestMessage(
+        clientId: config.clientId,
+        schemaVersion: schemaVersion,
+        tableSeqnums: tableSeqnums,
+        tables: tablesToSync,
+        forceRefreshTables: forceRefresh,
+        strippedRows: strippedRows?.isNotEmpty == true ? strippedRows : null,
+        pendingChanges: pendingChangeMessages.isNotEmpty ? pendingChangeMessages : null,
+      );
+
+      _logger.info('syncUnified: Sending sync request');
+      final response = await _ws.sendRaw('sync', request.toMap(), channelTopic: channelTopic ?? config.broadcastChannel);
+
+      // 6. Process response
+      await _processSyncResponse(response, pendingChanges);
+
+      _updateSyncState(SyncState.ready);
+      _logger.info('syncUnified: Complete');
+
+    } catch (e, stack) {
+      _logger.severe('syncUnified: Error - $e', e, stack);
+      _updateSyncState(SyncState.error);
+      rethrow;
+    } finally {
+      _isSyncing = false;
+    }
+  }
+
+  /// Process the sync response from server
+  Future<void> _processSyncResponse(Map<String, dynamic> response, List<Change> pendingChanges) async {
+    // Handle schema migrations if present
+    if (response['migrations'] != null) {
+      _emitSyncProgress(const SyncProgress(phase: 'migrating'));
+      await _applyMigrations(response);
+    }
+
+    // Handle change acknowledgments
+    if (response['change_acks'] != null) {
+      final acks = (response['change_acks'] as List)
+          .map((a) => ChangeAck.fromMap(a as Map<String, dynamic>))
+          .toList();
+
+      _emitSyncProgress(SyncProgress(
+        phase: 'pushing',
+        changesAcked: acks.length,
+      ));
+
+      for (final ack in acks) {
+        if (ack.success) {
+          // DELETE from _sync_changes instead of just marking synced
+          // This ensures the table is cleaned up and doesn't grow indefinitely
+          await _db!.deleteChange(ack.localSeqnum);
+          _logger.fine('Deleted acknowledged change: ${ack.localSeqnum}');
+
+          // Update local row seqnum if provided
+          if (ack.serverSeqnum != null) {
+            // Find the change info
+            final change = pendingChanges.firstWhere(
+              (c) => c.seqnum == ack.localSeqnum,
+              orElse: () => Change(seqnum: 0, tableName: '', rowId: '', operation: SynclibOperation.insert),
+            );
+            if (change.seqnum != 0) {
+              await _updateLocalSeqnum(change.tableName, change.rowId, ack.serverSeqnum!);
+            }
+          }
+        } else {
+          _logger.warning('Change ${ack.localSeqnum} failed: ${ack.error}');
+        }
+      }
+    }
+
+    // Handle data batches
+    if (response['data_batches'] != null) {
+      _emitSyncProgress(const SyncProgress(phase: 'pulling'));
+      final batches = response['data_batches'] as List;
+
+      await _db!.beginBulkRemote();
+      try {
+        for (final batchData in batches) {
+          final batch = SyncDataBatchMessage.fromMap(batchData as Map<String, dynamic>);
+          _emitSyncProgress(SyncProgress(
+            phase: 'pulling',
+            table: batch.table,
+            rowCount: batch.rows.length,
+          ));
+
+          for (final row in batch.rows) {
+            final change = ChangeMessage(
+              table: batch.table,
+              operation: 'insert',
+              rowId: row['id'] as String,
+              data: row,
+            );
+            final sql = _generateSql(change);
+            await _db!.execBulkRemote(sql);
+          }
+        }
+        await _db!.endBulkRemote();
+      } catch (e) {
+        await _db!.endBulkRemote(rollback: true);
+        rethrow;
+      }
+    }
+
+    // Handle sync complete
+    if (response['table_seqnums'] != null) {
+      _emitSyncProgress(const SyncProgress(phase: 'complete'));
+      final newSeqnums = Map<String, int>.from(response['table_seqnums'] as Map);
+      _logger.info('syncUnified: Final table seqnums: $newSeqnums');
+    }
+  }
+
+  /// Parse JSON string to map
+  static Map<String, dynamic>? _parseJson(String jsonString) {
+    try {
+      return jsonDecode(jsonString) as Map<String, dynamic>;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// Get current sync state
+  SyncState get syncState => _syncState;
+
+  /// Whether a sync is currently in progress
+  bool get isSyncing => _isSyncing;
+
+  /// Stream of sync state changes
+  Stream<SyncState> get syncStateChanges => _syncStateController.stream;
+
+  /// Stream of sync progress events (for UI progress indicators)
+  Stream<SyncProgress> get syncProgressEvents => _syncProgressController.stream;
+
+  // ==========================================================================
+  // END SIMPLIFIED SYNC HANDSHAKE
+  // ==========================================================================
+
   /// Push local changes to server
   Future<void> _pushLocalChanges() async {
     if (!_ws.isConnected) return;
@@ -1490,6 +1799,8 @@ class SyncClient {
 
     switch (state) {
       case ConnectionState.connected:
+        // Update sync state
+        _updateSyncState(SyncState.ready);
         // When reconnected (not initial connection), rejoin channels
         if (_hasConnectedOnce) {
           _logger.info('Reconnected - rejoining channels');
@@ -1498,11 +1809,17 @@ class SyncClient {
           });
         }
         break;
+      case ConnectionState.connecting:
+      case ConnectionState.reconnecting:
+        _updateSyncState(SyncState.connecting);
+        break;
       case ConnectionState.disconnected:
       case ConnectionState.failed:
+        _updateSyncState(SyncState.disconnected);
         _stopPeriodicSync();
         break;
-      default:
+      case ConnectionState.authFailed:
+        _updateSyncState(SyncState.error);
         break;
     }
   }
@@ -2016,6 +2333,8 @@ class SyncClient {
     await _directStreamController.close();
     await _syncReadyStateController.close();
     await _autoSyncController.close();
+    await _syncStateController.close();
+    await _syncProgressController.close();
     await _ws.dispose();
     await _db?.close();
     _isInitialized = false;
