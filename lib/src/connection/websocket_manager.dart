@@ -92,6 +92,9 @@ class WebSocketManager {
     _connectStartTime = DateTime.now();
     _logger.info('Connecting to $url');
 
+    // Completer to wait for actual connection (not just initiation)
+    final connectionCompleter = Completer<void>();
+
     try {
       // Create Phoenix socket
       // Convert params to Map<String, String> as required by PhoenixSocketOptions
@@ -111,11 +114,19 @@ class WebSocketManager {
       _socket!.closeStream.listen((event) {
         _logger.warning('Socket closed');
         _onDone();
+        // Complete with error if we're still waiting for connection
+        if (!connectionCompleter.isCompleted) {
+          connectionCompleter.completeError(StateError('Socket closed before connection established'));
+        }
       });
 
       _socket!.errorStream.listen((error) {
         _logger.severe('Socket error: $error');
         _onError(error);
+        // Complete with error if we're still waiting for connection
+        if (!connectionCompleter.isCompleted) {
+          connectionCompleter.completeError(error);
+        }
       });
 
       _socket!.openStream.listen((event) {
@@ -123,18 +134,31 @@ class WebSocketManager {
         _updateState(ConnectionState.connected);
         _reconnectAttempts = 0;
         _quickFailureCount = 0; // Reset quick failure counter on successful connection
+        // Signal that connection is ready
+        if (!connectionCompleter.isCompleted) {
+          connectionCompleter.complete();
+        }
       });
 
       // Connect socket
       _logger.info('Connecting to $url');
       await _socket!.connect();
 
-      _logger.info('Connect call completed');
+      // Wait for the socket to actually open (or fail)
+      await connectionCompleter.future.timeout(
+        const Duration(seconds: 15),
+        onTimeout: () {
+          throw TimeoutException('Connection timed out waiting for socket to open');
+        },
+      );
+
+      _logger.info('Connect call completed - socket is open');
 
     } catch (e) {
       _logger.severe('Connection failed: $e');
       _updateState(ConnectionState.failed);
       _scheduleReconnect();
+      rethrow; // Re-throw so caller knows connection failed
     }
   }
 
@@ -146,11 +170,20 @@ class WebSocketManager {
     }
 
     try {
-      // Leave existing channel with this topic if present
+      // Leave existing channel with this topic if present in our map
       if (_channels.containsKey(topic)) {
-        _logger.info('Channel $topic already exists, leaving old one');
+        _logger.info('Channel $topic already exists in our map, leaving old one');
         _channels[topic]?.leave();
         _channels.remove(topic);
+      }
+
+      // Also check if the socket has this channel cached and remove it
+      // This prevents the "_joinedOnce" assertion error when reconnecting
+      final existingChannel = _socket!.channels[topic];
+      if (existingChannel != null) {
+        _logger.info('Channel $topic exists in socket cache, removing it');
+        existingChannel.leave();
+        _socket!.removeChannel(existingChannel);
       }
 
       final channel = _socket!.addChannel(topic: topic, parameters: params);

@@ -119,7 +119,32 @@ class SyncClientChannel {
     required this.channelName,
     required this.channelId,
     this.params
-  });  
+  });
+}
+
+/// Tracks the sync state of an individual channel
+class ChannelSyncState {
+  final String topic;
+  bool joined;
+  bool autoSyncInProgress;
+  bool autoSyncComplete;
+  Completer<void>? completer;
+  List<StaleTableInfo> staleTables;
+
+  ChannelSyncState({
+    required this.topic,
+    this.joined = false,
+    this.autoSyncInProgress = false,
+    this.autoSyncComplete = false,
+    this.completer,
+    this.staleTables = const [],
+  });
+
+  /// Whether this channel needs auto-sync (has stale tables)
+  bool get needsAutoSync => staleTables.isNotEmpty;
+
+  /// Whether this channel is fully ready (joined and sync complete if needed)
+  bool get isReady => joined && (!needsAutoSync || autoSyncComplete);
 }
 
 /// Configuration for sync client
@@ -203,6 +228,11 @@ class SyncClientConfig {
   /// If empty or null, auto-sync is disabled.
   final List<String>? autoSyncTables;
 
+  /// Whether to automatically sync stale tables on connect.
+  /// If false, auto-sync can be triggered manually via [SyncClient.runAutoSync()].
+  /// Defaults to true.
+  final bool autoSyncOnConnect;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -223,6 +253,7 @@ class SyncClientConfig {
     this.syncOnWriteDebounce = const Duration(milliseconds: 100),
     this.database,
     this.autoSyncTables,
+    this.autoSyncOnConnect = true,
   });
 }
 
@@ -297,11 +328,11 @@ class SyncClient {
   // Stream controller for auto-sync events (stale tables detection + sync progress)
   final StreamController<AutoSyncEvent> _autoSyncController = StreamController<AutoSyncEvent>.broadcast();
 
-  // Track auto-sync state
-  AutoSyncState _autoSyncState = AutoSyncState.idle;
-  Completer<void>? _autoSyncCompleter;
-  List<StaleTableInfo> _autoSyncStaleTables = [];
-  String? _autoSyncChannelTopic;
+  // Track per-channel sync state
+  final Map<String, ChannelSyncState> _channelStates = {};
+
+  // Store join responses for deferred auto-sync
+  Map<String, Map<String, dynamic>> _pendingJoinResponses = {};
 
   // Lock to ensure only one batch operation happens at a time
   final Lock _batchLock = Lock();
@@ -387,6 +418,14 @@ class SyncClient {
       throw StateError('Not initialized. Call initialize() first.');
     }
 
+    // Only disconnect if actually connected or connecting
+    // This prevents phoenix_socket's "_joinedOnce" assertion error on reconnect
+    // but avoids disrupting operations if we're already disconnected
+    if (_ws.isConnected || _ws.state == ConnectionState.connecting) {
+      _logger.info('Already connected/connecting (state: ${_ws.state}), disconnecting first...');
+      await disconnect();
+    }
+
     // Store connection params for reconnection
     _token = token;
     _joinWorld = joinWorld;
@@ -406,6 +445,9 @@ class SyncClient {
   /// Join all configured channels
   // todo use initial channels
   Future<void> _joinChannels() async {
+    // Clear channel states for fresh connection
+    _channelStates.clear();
+
     // Get per-table seqnums if auto-sync is configured
     Map<String, int>? tableSeqnums;
     if (config.autoSyncTables != null && config.autoSyncTables!.isNotEmpty) {
@@ -413,10 +455,16 @@ class SyncClient {
       _logger.info('Sending table seqnums on join: $tableSeqnums');
     }
 
-    // Join user-specific channel (always required)
+    // First, join ALL channels (don't wait for auto-sync)
+    // This prevents timeouts from one channel's sync blocking the next join
+    final joinResponses = <String, Map<String, dynamic>>{};
+
     for (final channel in config.initialChannels) {
       final topic = 'sync:${channel.channelName}:${channel.channelId}';
       _logger.info('Joining channel: $topic');
+
+      // Create channel state
+      _channelStates[topic] = ChannelSyncState(topic: topic);
 
       final joinParams = {
         'client_id': config.clientId,
@@ -427,8 +475,9 @@ class SyncClient {
       final response = await _ws.joinChannel(topic, joinParams);
       _logger.info('Channel join response: $response');
 
-      // Handle stale tables from server response
-      await _handleJoinResponse(response, topic);
+      // Mark channel as joined
+      _channelStates[topic]!.joined = true;
+      joinResponses[topic] = response;
     }
 
     _logger.info('All channels joined successfully');
@@ -437,17 +486,43 @@ class SyncClient {
       startPeriodicSync(pullRemote: _pullRemoteEnabled, pushLocal: _pushLocalEnabled);
     }
     await _sendHello();
+
+    // Store join responses for potential later auto-sync
+    _pendingJoinResponses = joinResponses;
+
+    // Handle stale tables if auto-sync on connect is enabled
+    if (config.autoSyncOnConnect) {
+      _logger.info('Auto-sync on connect enabled, processing stale tables...');
+      for (final entry in joinResponses.entries) {
+        await _handleJoinResponse(entry.value, entry.key);
+      }
+    } else {
+      _logger.info('Auto-sync on connect disabled, marking channels as ready');
+      // Mark all channels as ready (no auto-sync needed)
+      for (final channelState in _channelStates.values) {
+        channelState.autoSyncComplete = true;
+      }
+    }
   }
 
   /// Handle join response from server, including stale tables
   Future<void> _handleJoinResponse(Map<String, dynamic> response, String channelTopic) async {
-    // Skip if auto-sync not configured
+    final channelState = _channelStates[channelTopic];
+
+    // Skip if auto-sync not configured - mark channel as ready
     if (config.autoSyncTables == null || config.autoSyncTables!.isEmpty) {
+      if (channelState != null) {
+        channelState.autoSyncComplete = true;
+      }
       return;
     }
 
     final staleTablesRaw = response['stale_tables'];
     if (staleTablesRaw == null || staleTablesRaw is! List || staleTablesRaw.isEmpty) {
+      // No stale tables - mark channel as ready
+      if (channelState != null) {
+        channelState.autoSyncComplete = true;
+      }
       return;
     }
 
@@ -470,12 +545,18 @@ class SyncClient {
     );
   }
 
-  /// Start tracking auto-sync operation
+  /// Start tracking auto-sync operation for a specific channel
   void _startAutoSync(List<StaleTableInfo> staleTables, String channelTopic) {
-    _autoSyncState = AutoSyncState.syncing;
-    _autoSyncStaleTables = staleTables;
-    _autoSyncChannelTopic = channelTopic;
-    _autoSyncCompleter = Completer<void>();
+    final channelState = _channelStates[channelTopic];
+    if (channelState == null) {
+      _logger.warning('Cannot start auto-sync: channel $channelTopic not found in state map');
+      return;
+    }
+
+    channelState.staleTables = staleTables;
+    channelState.autoSyncInProgress = true;
+    channelState.autoSyncComplete = false;
+    channelState.completer = Completer<void>();
 
     _autoSyncController.add(AutoSyncEvent(
       state: AutoSyncState.syncing,
@@ -488,59 +569,113 @@ class SyncClient {
 
   /// Called when snapshot stream completes (from snapshot complete handler)
   void _onSnapshotStreamComplete(String channelId) {
-    if (_autoSyncState != AutoSyncState.syncing) return;
-
-    // Check if this completion is for our auto-sync channel
+    // Find the channel that matches this channelId
     // channelId format: "sync:tribe:xyz" or "sync:user:abc"
-    if (_autoSyncChannelTopic != null && channelId.contains(_autoSyncChannelTopic!)) {
-      _completeAutoSync();
+    for (final entry in _channelStates.entries) {
+      if (entry.value.autoSyncInProgress && channelId.contains(entry.key)) {
+        _completeAutoSync(entry.key);
+        return;
+      }
     }
   }
 
-  /// Complete the auto-sync operation
-  void _completeAutoSync() {
-    final staleTables = _autoSyncStaleTables;
-    _autoSyncState = AutoSyncState.completed;
-    _autoSyncStaleTables = [];
-    _autoSyncChannelTopic = null;
+  /// Complete the auto-sync operation for a specific channel
+  void _completeAutoSync(String channelTopic) {
+    final channelState = _channelStates[channelTopic];
+    if (channelState == null) {
+      _logger.warning('Cannot complete auto-sync: channel $channelTopic not found');
+      return;
+    }
+
+    final staleTables = channelState.staleTables;
+    channelState.autoSyncInProgress = false;
+    channelState.autoSyncComplete = true;
 
     _autoSyncController.add(AutoSyncEvent(
       state: AutoSyncState.completed,
       staleTables: staleTables,
+      channelTopic: channelTopic,
     ));
 
-    if (_autoSyncCompleter != null && !_autoSyncCompleter!.isCompleted) {
-      _autoSyncCompleter!.complete();
+    if (channelState.completer != null && !channelState.completer!.isCompleted) {
+      channelState.completer!.complete();
     }
-    _autoSyncCompleter = null;
 
-    _logger.info('Auto-sync completed for ${staleTables.length} table(s)');
+    _logger.info('Auto-sync completed for ${staleTables.length} table(s) on $channelTopic');
 
-    // Reset to idle after a short delay
-    Future.delayed(const Duration(milliseconds: 100), () {
-      if (_autoSyncState == AutoSyncState.completed) {
-        _autoSyncState = AutoSyncState.idle;
-      }
-    });
+    // Check if all channels are now synced, and if so, re-emit ready state
+    if (allChannelsSynced && _readyState == SyncReadyState.ready) {
+      // Small delay to ensure state is consistent
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (allChannelsSynced && _readyState == SyncReadyState.ready) {
+          _syncReadyStateController.add(SyncReadyState.ready);
+          _logger.info('All channels synced - re-emitting ready state');
+        }
+      });
+    }
   }
 
-  /// Fail the auto-sync operation
-  void _failAutoSync(String error) {
-    _autoSyncState = AutoSyncState.failed;
-    _autoSyncStaleTables = [];
-    _autoSyncChannelTopic = null;
+  /// Fail the auto-sync operation for a specific channel
+  void _failAutoSync(String channelTopic, String error) {
+    final channelState = _channelStates[channelTopic];
+    if (channelState == null) {
+      _logger.warning('Cannot fail auto-sync: channel $channelTopic not found');
+      return;
+    }
+
+    channelState.autoSyncInProgress = false;
+    channelState.autoSyncComplete = false; // Failed, not complete
 
     _autoSyncController.add(AutoSyncEvent(
       state: AutoSyncState.failed,
+      staleTables: channelState.staleTables,
+      channelTopic: channelTopic,
       error: error,
     ));
 
-    if (_autoSyncCompleter != null && !_autoSyncCompleter!.isCompleted) {
-      _autoSyncCompleter!.completeError(Exception(error));
+    if (channelState.completer != null && !channelState.completer!.isCompleted) {
+      channelState.completer!.completeError(Exception(error));
     }
-    _autoSyncCompleter = null;
 
-    _logger.warning('Auto-sync failed: $error');
+    _logger.warning('Auto-sync failed for $channelTopic: $error');
+  }
+
+  /// Manually trigger auto-sync for stale tables.
+  /// Use this when [SyncClientConfig.autoSyncOnConnect] is false
+  /// and you want to run auto-sync after other initialization steps.
+  ///
+  /// Returns immediately if auto-sync is already in progress or
+  /// if there are no pending join responses to process.
+  Future<void> runAutoSync() async {
+    if (!_ws.isConnected) {
+      throw StateError('Not connected. Call connect() first.');
+    }
+
+    if (_pendingJoinResponses.isEmpty) {
+      _logger.info('No pending join responses for auto-sync');
+      return;
+    }
+
+    // Check if any channel is already syncing
+    if (isAutoSyncing) {
+      _logger.info('Auto-sync already in progress');
+      return;
+    }
+
+    _logger.info('Running manual auto-sync for ${_pendingJoinResponses.length} channel(s)');
+
+    // Reset channel sync states before running
+    for (final channelState in _channelStates.values) {
+      channelState.autoSyncComplete = false;
+    }
+
+    // Process stored join responses
+    for (final entry in _pendingJoinResponses.entries) {
+      await _handleJoinResponse(entry.value, entry.key);
+    }
+
+    // Clear pending responses after processing
+    _pendingJoinResponses = {};
   }
 
   /// Join an additional channel after initial connection
@@ -570,6 +705,9 @@ class SyncClient {
     final topic = 'sync:${channel.channelName}:${channel.channelId}';
     _logger.info('Joining additional channel: $topic');
 
+    // Create channel state for this dynamic channel
+    _channelStates[topic] = ChannelSyncState(topic: topic);
+
     // Get per-table seqnums if auto-sync tables are specified
     Map<String, int>? tableSeqnums;
     if (autoSyncTables != null && autoSyncTables.isNotEmpty) {
@@ -583,6 +721,8 @@ class SyncClient {
       if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
     });
 
+    // Mark channel as joined
+    _channelStates[topic]!.joined = true;
     _logger.info('Successfully joined channel: $topic');
 
     // Handle stale tables from server response (auto-sync if tables specified)
@@ -595,13 +735,22 @@ class SyncClient {
     String channelTopic,
     List<String>? autoSyncTables,
   ) async {
-    // Skip if auto-sync not requested
+    final channelState = _channelStates[channelTopic];
+
+    // Skip if auto-sync not requested - mark channel as ready
     if (autoSyncTables == null || autoSyncTables.isEmpty) {
+      if (channelState != null) {
+        channelState.autoSyncComplete = true;
+      }
       return;
     }
 
     final staleTablesRaw = response['stale_tables'];
     if (staleTablesRaw == null || staleTablesRaw is! List || staleTablesRaw.isEmpty) {
+      // No stale tables - mark channel as ready
+      if (channelState != null) {
+        channelState.autoSyncComplete = true;
+      }
       return;
     }
 
@@ -1804,28 +1953,48 @@ class SyncClient {
   /// Contains both the discovery (what's stale) and progress (syncing/completed).
   Stream<AutoSyncEvent> get autoSyncEvents => _autoSyncController.stream;
 
-  /// Current auto-sync state
-  AutoSyncState get autoSyncState => _autoSyncState;
+  /// Per-channel sync states (read-only view)
+  Map<String, ChannelSyncState> get channelStates => Map.unmodifiable(_channelStates);
 
-  /// Whether auto-sync is currently in progress
-  bool get isAutoSyncing => _autoSyncState == AutoSyncState.syncing;
+  /// Current auto-sync state (derived from channel states)
+  /// Returns syncing if ANY channel is syncing, idle otherwise
+  AutoSyncState get autoSyncState {
+    if (_channelStates.values.any((c) => c.autoSyncInProgress)) {
+      return AutoSyncState.syncing;
+    }
+    if (_channelStates.values.any((c) => c.autoSyncComplete)) {
+      return AutoSyncState.completed;
+    }
+    return AutoSyncState.idle;
+  }
 
-  /// Wait for auto-sync to complete
-  /// Returns immediately if not auto-syncing.
-  /// Throws if auto-sync fails.
+  /// Whether ANY channel is currently auto-syncing
+  bool get isAutoSyncing => _channelStates.values.any((c) => c.autoSyncInProgress);
+
+  /// Whether ALL channels have completed their initial sync (or had no stale tables)
+  bool get allChannelsSynced => _channelStates.isNotEmpty &&
+      _channelStates.values.every((c) => c.isReady);
+
+  /// Wait for ALL channels to complete their auto-sync
+  /// Returns immediately if no channels are syncing.
+  /// Throws if any auto-sync fails.
   Future<void> waitForAutoSyncComplete() async {
-    if (_autoSyncState != AutoSyncState.syncing) {
+    final pendingCompleters = _channelStates.values
+        .where((c) => c.completer != null && !c.completer!.isCompleted)
+        .map((c) => c.completer!.future)
+        .toList();
+
+    if (pendingCompleters.isEmpty) {
       return;
     }
-    if (_autoSyncCompleter != null) {
-      await _autoSyncCompleter!.future;
-    }
+
+    await Future.wait(pendingCompleters);
   }
 
   /// Check if client is ready to stream snapshots
-  /// Returns true only when state is SyncReadyState.ready AND not auto-syncing.
+  /// Returns true only when state is SyncReadyState.ready AND all channels are synced.
   /// Use this to gate UI rendering until initial data is loaded.
-  bool get isReady => _readyState == SyncReadyState.ready && !isAutoSyncing;
+  bool get isReady => _readyState == SyncReadyState.ready && allChannelsSynced;
 
   /// Dispose resources
   Future<void> dispose() async {
