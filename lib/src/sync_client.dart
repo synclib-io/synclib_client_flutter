@@ -59,6 +59,38 @@ class SnapshotRequestEvent {
   });
 }
 
+/// Event emitted when server reports stale tables on connect
+class StaleTablesEvent {
+  final List<StaleTableInfo> staleTables;
+  final String channelTopic;
+
+  const StaleTablesEvent({
+    required this.staleTables,
+    required this.channelTopic,
+  });
+}
+
+/// Info about a single stale table
+class StaleTableInfo {
+  final String table;
+  final int behindBy;
+  final int serverSeqnum;
+
+  const StaleTableInfo({
+    required this.table,
+    required this.behindBy,
+    required this.serverSeqnum,
+  });
+
+  factory StaleTableInfo.fromMap(Map<String, dynamic> map) {
+    return StaleTableInfo(
+      table: map['table'] as String,
+      behindBy: map['behind_by'] as int,
+      serverSeqnum: map['server_seqnum'] as int,
+    );
+  }
+}
+
 class SyncClientChannel {
   final String channelName;
   final String channelId;
@@ -143,6 +175,18 @@ class SyncClientConfig {
   /// parts of your app (e.g., a UI layer that also reads from the database).
   final SynclibDatabase? database;
 
+  /// Tables to check for staleness on connect.
+  /// When specified, the client will send per-table seqnums to the server
+  /// on channel join, and the server will report which tables are stale.
+  /// Listen to [SyncClient.staleTablesEvents] to get notified.
+  final List<String>? staleTablesToCheck;
+
+  /// Whether to automatically sync stale tables on connect.
+  /// If true, when the server reports stale tables, the client will
+  /// automatically call streamSnapshot for those tables.
+  /// Defaults to false - you handle the staleTablesEvents yourself.
+  final bool autoSyncStaleTables;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -162,6 +206,8 @@ class SyncClientConfig {
     this.syncOnWrite = false,
     this.syncOnWriteDebounce = const Duration(milliseconds: 100),
     this.database,
+    this.staleTablesToCheck,
+    this.autoSyncStaleTables = false,
   });
 }
 
@@ -232,6 +278,9 @@ class SyncClient {
 
   // Stream controller for sync ready state changes
   final StreamController<SyncReadyState> _syncReadyStateController = StreamController<SyncReadyState>.broadcast();
+
+  // Stream controller for stale tables events (server reports stale tables on connect)
+  final StreamController<StaleTablesEvent> _staleTablesController = StreamController<StaleTablesEvent>.broadcast();
 
   // Lock to ensure only one batch operation happens at a time
   final Lock _batchLock = Lock();
@@ -336,12 +385,29 @@ class SyncClient {
   /// Join all configured channels
   // todo use initial channels
   Future<void> _joinChannels() async {
-    // Join user-specific channel (always required)
+    // Get per-table seqnums if configured
+    Map<String, int>? tableSeqnums;
+    if (config.staleTablesToCheck != null && config.staleTablesToCheck!.isNotEmpty) {
+      tableSeqnums = await _getPerTableSeqnums(config.staleTablesToCheck!);
+      _logger.info('Sending table seqnums on join: $tableSeqnums');
+    }
 
+    // Join user-specific channel (always required)
     for (final channel in config.initialChannels) {
       final topic = 'sync:${channel.channelName}:${channel.channelId}';
       _logger.info('Joining channel: $topic');
-      await _ws.joinChannel(topic, {'client_id': config.clientId, ...?channel.params});
+
+      final joinParams = {
+        'client_id': config.clientId,
+        ...?channel.params,
+        if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
+      };
+
+      final response = await _ws.joinChannel(topic, joinParams);
+      _logger.info('Channel join response: $response');
+
+      // Handle stale tables from server response
+      await _handleJoinResponse(response, topic);
     }
 
     _logger.info('All channels joined successfully');
@@ -352,7 +418,46 @@ class SyncClient {
     await _sendHello();
   }
 
+  /// Handle join response from server, including stale tables
+  Future<void> _handleJoinResponse(Map<String, dynamic> response, String channelTopic) async {
+    final staleTablesRaw = response['stale_tables'];
+    if (staleTablesRaw == null || staleTablesRaw is! List || staleTablesRaw.isEmpty) {
+      return;
+    }
+
+    final staleTables = staleTablesRaw
+        .map((t) => StaleTableInfo.fromMap(Map<String, dynamic>.from(t as Map)))
+        .toList();
+
+    _logger.info('Server reports ${staleTables.length} stale table(s): ${staleTables.map((t) => '${t.table}(behind by ${t.behindBy})').join(', ')}');
+
+    // Emit event for listeners
+    _staleTablesController.add(StaleTablesEvent(
+      staleTables: staleTables,
+      channelTopic: channelTopic,
+    ));
+
+    // Auto-sync if configured
+    if (config.autoSyncStaleTables && staleTables.isNotEmpty) {
+      final tableNames = staleTables.map((t) => t.table).toList();
+      _logger.info('Auto-syncing stale tables: $tableNames');
+
+      // Use incremental sync since we already have some data
+      await streamSnapshot(
+        tableNames,
+        incremental: true,
+        channelTopic: channelTopic,
+        waitForReconnect: false, // We're already connected
+      );
+    }
+  }
+
   /// Join an additional channel after initial connection
+  ///
+  /// Optionally provide [tablesToCheckStaleness] to check if specific tables
+  /// have newer data on the server. If stale tables are found:
+  /// - A [StaleTablesEvent] is emitted on [staleTablesEvents]
+  /// - If [autoSync] is true, the stale tables are automatically synced
   ///
   /// Example:
   /// ```dart
@@ -361,9 +466,15 @@ class SyncClient {
   ///     channelName: 'user',
   ///     channelId: userId,
   ///   ),
+  ///   tablesToCheckStaleness: ['videos', 'users'],
+  ///   autoSync: true,
   /// );
   /// ```
-  Future<void> joinChannel(SyncClientChannel channel) async {
+  Future<void> joinChannel(
+    SyncClientChannel channel, {
+    List<String>? tablesToCheckStaleness,
+    bool autoSync = false,
+  }) async {
     if (!_ws.isConnected) {
       throw StateError('Not connected. Call connect() first.');
     }
@@ -371,12 +482,60 @@ class SyncClient {
     final topic = 'sync:${channel.channelName}:${channel.channelId}';
     _logger.info('Joining additional channel: $topic');
 
-    await _ws.joinChannel(topic, {
+    // Get per-table seqnums if tables to check are specified
+    Map<String, int>? tableSeqnums;
+    if (tablesToCheckStaleness != null && tablesToCheckStaleness.isNotEmpty) {
+      tableSeqnums = await _getPerTableSeqnums(tablesToCheckStaleness);
+      _logger.info('Sending table seqnums on join: $tableSeqnums');
+    }
+
+    final response = await _ws.joinChannel(topic, {
       'client_id': config.clientId,
       ...?channel.params,
+      if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
     });
 
     _logger.info('Successfully joined channel: $topic');
+
+    // Handle stale tables from server response
+    await _handleJoinResponseDynamic(response, topic, autoSync);
+  }
+
+  /// Handle join response for dynamically joined channels
+  Future<void> _handleJoinResponseDynamic(
+    Map<String, dynamic> response,
+    String channelTopic,
+    bool autoSync,
+  ) async {
+    final staleTablesRaw = response['stale_tables'];
+    if (staleTablesRaw == null || staleTablesRaw is! List || staleTablesRaw.isEmpty) {
+      return;
+    }
+
+    final staleTables = staleTablesRaw
+        .map((t) => StaleTableInfo.fromMap(Map<String, dynamic>.from(t as Map)))
+        .toList();
+
+    _logger.info('Server reports ${staleTables.length} stale table(s): ${staleTables.map((t) => '${t.table}(behind by ${t.behindBy})').join(', ')}');
+
+    // Emit event for listeners
+    _staleTablesController.add(StaleTablesEvent(
+      staleTables: staleTables,
+      channelTopic: channelTopic,
+    ));
+
+    // Auto-sync if requested
+    if (autoSync && staleTables.isNotEmpty) {
+      final tableNames = staleTables.map((t) => t.table).toList();
+      _logger.info('Auto-syncing stale tables: $tableNames');
+
+      await streamSnapshot(
+        tableNames,
+        incremental: true,
+        channelTopic: channelTopic,
+        waitForReconnect: false,
+      );
+    }
   }
 
   /// Check if a channel is currently joined
@@ -1552,6 +1711,12 @@ class SyncClient {
   /// Get current sync ready state
   SyncReadyState get readyState => _readyState;
 
+  /// Stream of stale tables events
+  /// Emitted when the server reports that some tables are behind on connect.
+  /// Use this to show a "syncing" indicator or trigger manual sync.
+  /// If autoSyncStaleTables is true, sync happens automatically.
+  Stream<StaleTablesEvent> get staleTablesEvents => _staleTablesController.stream;
+
   /// Check if client is ready to stream snapshots
   /// Returns true only when state is SyncReadyState.ready
   bool get isReady => _readyState == SyncReadyState.ready;
@@ -1575,6 +1740,7 @@ class SyncClient {
     await _interactionController.close();
     await _directStreamController.close();
     await _syncReadyStateController.close();
+    await _staleTablesController.close();
     await _ws.dispose();
     await _db?.close();
     _isInitialized = false;

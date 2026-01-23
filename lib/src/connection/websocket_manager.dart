@@ -123,7 +123,8 @@ class WebSocketManager {
   }
 
   /// Join a Phoenix channel
-  Future<void> joinChannel(String topic, Map<String, dynamic> params) async {
+  /// Returns the server's join response (e.g., status, stale_tables, etc.)
+  Future<Map<String, dynamic>> joinChannel(String topic, Map<String, dynamic> params) async {
     if (!isConnected) {
       throw StateError('Not connected to server');
     }
@@ -149,6 +150,12 @@ class WebSocketManager {
       if (pushResponse.isOk) {
         _channels[topic] = channel;
         _logger.info('Joined channel: $topic');
+        // Return the server's response data
+        final response = pushResponse.response;
+        if (response is Map<String, dynamic>) {
+          return response;
+        }
+        return {'status': 'connected'};
       } else {
         _logger.severe('Failed to join channel: ${pushResponse.response}');
         throw Exception('Failed to join channel: ${pushResponse.response}');
