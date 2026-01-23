@@ -72,6 +72,22 @@ class WebSocketManager {
       _connectionParams = params;
     }
 
+    // Clean up any existing socket and channels before reconnecting
+    // This ensures we don't have stale channel objects with _joinedOnce = true
+    if (_socket != null) {
+      _logger.info('Cleaning up existing socket before reconnect');
+      for (final channel in _channels.values) {
+        try {
+          channel.leave();
+        } catch (e) {
+          _logger.fine('Error leaving channel during cleanup: $e');
+        }
+      }
+      _channels.clear();
+      _socket?.dispose();
+      _socket = null;
+    }
+
     _updateState(ConnectionState.connecting);
     _connectStartTime = DateTime.now();
     _logger.info('Connecting to $url');
