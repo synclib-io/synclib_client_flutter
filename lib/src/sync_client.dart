@@ -1099,10 +1099,15 @@ class SyncClient {
 
   /// Manually trigger a sync cycle
   ///
-  /// This is the safe version that waits for push acks before pulling,
-  /// preventing race conditions with stale data.
+  /// When useUnifiedSync is enabled (default), this calls syncUnified() which
+  /// handles push, pull, schema, and stripped content in one request.
+  /// Otherwise falls back to the legacy syncSafe() push/pull flow.
   Future<void> sync() async {
-    await syncSafe();
+    if (config.useUnifiedSync) {
+      await syncUnified();
+    } else {
+      await syncSafe();
+    }
   }
 
   /// Push local changes to server (public API)
@@ -1146,9 +1151,28 @@ class SyncClient {
 
     for (final table in tables) {
       try {
+        // First check how many rows exist in the table
+        final countResult = await _db!.read('SELECT COUNT(*) as cnt FROM $table');
+        final totalRows = countResult.isNotEmpty ? countResult.first['cnt'] as int : 0;
+
+        // Check for NULL documents specifically
+        // Note: JSONB columns store null as binary bytes, not SQL NULL
+        // So we check both SQL NULL and json(document) = 'null'
+        final nullDocResult = await _db!.read('''
+          SELECT COUNT(*) as cnt FROM $table
+          WHERE document IS NULL
+             OR json(document) IS NULL
+             OR json(document) = 'null'
+        ''');
+        final nullDocCount = nullDocResult.isNotEmpty ? nullDocResult.first['cnt'] as int : 0;
+
+        // Stripped content has NULL/null document OR _stripped flag in document
         final result = await _db!.read('''
           SELECT id FROM $table
-          WHERE json_extract(document, '\$._stripped') = 1
+          WHERE document IS NULL
+             OR json(document) IS NULL
+             OR json(document) = 'null'
+             OR json_extract(document, '\$._stripped') = 1
              OR json_extract(document, '\$._stripped') = true
         ''');
 
@@ -1157,15 +1181,52 @@ class SyncClient {
         }
 
         if (result.isNotEmpty) {
-          _logger.info('Found ${result.length} stripped rows in $table');
+          _logger.info('Found ${result.length} stripped rows in $table (total rows: $totalRows)');
+        } else if (nullDocCount > 0) {
+          _logger.warning('$table has $nullDocCount rows with NULL document but query returned 0 stripped rows!');
         }
-      } catch (e) {
-        // Table might not exist or have different schema, continue
-        _logger.fine('Could not check stripped rows in $table: $e');
+      } catch (e, stack) {
+        // Log at warning level so we can see errors
+        _logger.warning('Could not check stripped rows in $table: $e');
+        _logger.fine('Stack trace: $stack');
       }
     }
 
     return rows;
+  }
+
+  /// Detect tables with corrupted JSONB storage (stored as TEXT instead of BLOB)
+  /// Returns list of tables that need force refresh to fix corruption
+  Future<List<String>> _detectCorruptedJsonbTables(List<String> tables) async {
+    final corruptedTables = <String>[];
+
+    for (final table in tables) {
+      try {
+        // Check if any documents are stored as TEXT instead of BLOB
+        // Proper JSONB is stored as BLOB, corrupted data is stored as TEXT
+        final result = await _db!.read('''
+          SELECT COUNT(*) as cnt FROM $table
+          WHERE document IS NOT NULL
+            AND typeof(document) = 'text'
+        ''');
+
+        final corruptedCount = result.isNotEmpty ? result.first['cnt'] as int : 0;
+
+        if (corruptedCount > 0) {
+          _logger.warning('JSONB CORRUPTION DETECTED: $table has $corruptedCount rows with document stored as TEXT instead of BLOB');
+          corruptedTables.add(table);
+        }
+      } catch (e) {
+        // Table might not have document column - ignore
+        _logger.fine('Could not check JSONB corruption in $table: $e');
+      }
+    }
+
+    if (corruptedTables.isNotEmpty) {
+      _logger.warning('Tables with corrupted JSONB will be force-refreshed: $corruptedTables');
+    }
+
+    return corruptedTables;
   }
 
   /// Update sync state and broadcast change
@@ -1254,27 +1315,76 @@ class SyncClient {
       // 4. Find stripped rows if needed
       List<RowRef>? strippedRows;
       if (includeStripped) {
+        _logger.info('syncUnified: Checking for stripped rows in tables: $tablesToSync');
         strippedRows = await _findStrippedRows(tablesToSync);
         if (strippedRows.isNotEmpty) {
-          _logger.info('syncUnified: Found ${strippedRows.length} stripped rows to refresh');
+          _logger.info('syncUnified: Found ${strippedRows.length} stripped rows to refresh: ${strippedRows.map((r) => '${r.table}:${r.rowId}').join(', ')}');
+        } else {
+          _logger.info('syncUnified: No stripped rows found');
         }
       }
 
-      // 5. Build and send sync request
-      final request = SyncRequestMessage(
+      // 4b. Detect JSONB corruption (documents stored as TEXT instead of BLOB)
+      // If corruption found, auto-add to forceRefresh to fix it
+      final corruptedTables = await _detectCorruptedJsonbTables(tablesToSync);
+      final effectiveForceRefresh = <String>{
+        ...?forceRefresh,
+        ...corruptedTables,
+      }.toList();
+
+      if (corruptedTables.isNotEmpty) {
+        _logger.warning('syncUnified: Auto-forcing refresh for ${corruptedTables.length} corrupted tables');
+      }
+
+      // 5. Determine channels for push and pull
+      // Push uses broadcastChannel (user channel) - where user has write permission
+      // Pull uses pullChannel (tribe channel) - where tribe query builders exist
+      final pushChannel = config.broadcastChannel;
+      final pullChannel = channelTopic ?? config.pullChannel ?? config.broadcastChannel;
+
+      // 6. If we have pending changes, push them first on user channel
+      String? streamId;
+      if (pendingChangeMessages.isNotEmpty) {
+        _logger.info('syncUnified: Pushing ${pendingChangeMessages.length} changes on $pushChannel');
+        final pushRequest = SyncRequestMessage(
+          clientId: config.clientId,
+          schemaVersion: schemaVersion,
+          tableSeqnums: {},  // No pull in push request
+          tables: [],
+          pendingChanges: pendingChangeMessages,
+        );
+
+        final pushResponse = await _ws.sendRaw('sync', pushRequest.toMap(), channelTopic: pushChannel);
+
+        // Handle push response
+        if (pushResponse['status'] == 'ok') {
+          streamId = pushResponse['stream_id'] as String?;
+          _logger.info('syncUnified: Push complete, stream_id=$streamId');
+        } else if (pushResponse['status'] == 'error') {
+          throw StateError('Push failed: ${pushResponse['error']}');
+        }
+
+        // Store pending changes for ack processing
+        if (streamId != null) {
+          _activeSyncPendingChanges[streamId] = pendingChanges;
+        }
+      }
+
+      // 7. Pull data on tribe channel
+      _logger.info('syncUnified: Pulling on $pullChannel (schema v$schemaVersion)');
+      final pullRequest = SyncRequestMessage(
         clientId: config.clientId,
         schemaVersion: schemaVersion,
         tableSeqnums: tableSeqnums,
         tables: tablesToSync,
-        forceRefreshTables: forceRefresh,
+        forceRefreshTables: effectiveForceRefresh.isNotEmpty ? effectiveForceRefresh : null,
         strippedRows: strippedRows?.isNotEmpty == true ? strippedRows : null,
-        pendingChanges: pendingChangeMessages.isNotEmpty ? pendingChangeMessages : null,
+        pendingChanges: null,  // No push in pull request
       );
 
-      _logger.info('syncUnified: Sending sync request (schema v$schemaVersion)');
-      final response = await _ws.sendRaw('sync', request.toMap(), channelTopic: channelTopic ?? config.broadcastChannel);
+      final response = await _ws.sendRaw('sync', pullRequest.toMap(), channelTopic: pullChannel);
 
-      // 6. Check if schema upgrade is required FIRST
+      // 8. Check if schema upgrade is required FIRST
       if (response['status'] == 'schema_upgrade_required') {
         final targetVersion = response['target_version'] as int;
         _logger.info('syncUnified: Schema upgrade required to v$targetVersion');
@@ -1299,21 +1409,21 @@ class SyncClient {
         );
       }
 
-      // 7. Handle error responses
+      // 9. Handle error responses
       if (response['status'] == 'error') {
         throw StateError('Sync error: ${response['error']}');
       }
 
-      // 8. Get stream_id and set up completer for streamed response
-      final streamId = response['stream_id'] as String?;
-      if (streamId == null) {
+      // 10. Get stream_id from pull response and set up completer for streamed response
+      final pullStreamId = response['stream_id'] as String?;
+      if (pullStreamId == null) {
         throw StateError('Server did not return stream_id');
       }
 
-      _logger.info('syncUnified: Got stream_id $streamId, waiting for streamed data');
+      _logger.info('syncUnified: Got pull stream_id $pullStreamId, waiting for streamed data');
 
-      // Store pending changes for ack processing
-      _activeSyncPendingChanges[streamId] = pendingChanges;
+      // Use the pull stream_id for tracking (push acks come on their own stream if any)
+      streamId = pullStreamId;
 
       // Create completer for this sync operation
       final completer = Completer<void>();
@@ -2286,7 +2396,17 @@ class SyncClient {
       case 'insert':
       case 'upsert':
         final columns = ['id', ...filteredData.keys].join(', ');
-        final placeholders = ['?', ...List.generate(filteredData.length, (_) => '?')].join(', ');
+
+        // Build placeholders - use jsonb(?) for Map/List values, ? for others
+        final placeholderList = <String>['?']; // id is always a simple value
+        for (final value in filteredData.values) {
+          if (value is Map || value is List) {
+            placeholderList.add('jsonb(?)');
+          } else {
+            placeholderList.add('?');
+          }
+        }
+        final placeholders = placeholderList.join(', ');
 
         // Build parameters array
         params.add(change.rowId);
