@@ -68,10 +68,13 @@ abstract class SyncMessage {
       // New simplified sync handshake messages
       case 'sync_request':
         return SyncRequestMessage.fromMap(map);
+      case 'sync_schema': // Server event name
       case 'schema_migrations':
         return SchemaMigrationsMessage.fromMap(map);
+      case 'sync_acks': // Server event name
       case 'change_acks':
         return ChangeAcksMessage.fromMap(map);
+      case 'sync_batch': // Server event name
       case 'sync_data_batch':
         return SyncDataBatchMessage.fromMap(map);
       case 'sync_complete':
@@ -914,10 +917,12 @@ class SyncRequestMessage extends SyncMessage {
 
 /// Schema migrations response (sent if schema upgrade needed)
 class SchemaMigrationsMessage extends SyncMessage {
+  final String? streamId;
   final int targetVersion;
   final List<Map<String, dynamic>> migrations;
 
   const SchemaMigrationsMessage({
+    this.streamId,
     required this.targetVersion,
     required this.migrations,
   });
@@ -925,16 +930,18 @@ class SchemaMigrationsMessage extends SyncMessage {
   @override
   Map<String, dynamic> toMap() => {
     'type': 'schema_migrations',
+    if (streamId != null) 'stream_id': streamId,
     'target_version': targetVersion,
     'migrations': migrations,
   };
 
   factory SchemaMigrationsMessage.fromMap(Map<String, dynamic> map) {
-    final migrations = (map['migrations'] as List? ?? [])
-        .map((m) => Map<String, dynamic>.from(m as Map))
+    final migrations = (map['migrations'] as List? ?? map['statements'] as List? ?? [])
+        .map((m) => m is Map ? Map<String, dynamic>.from(m) : {'sql': m.toString()})
         .toList();
     return SchemaMigrationsMessage(
-      targetVersion: map['target_version'] as int,
+      streamId: map['stream_id'] as String?,
+      targetVersion: map['target_version'] as int? ?? 0,
       migrations: migrations,
     );
   }
@@ -971,19 +978,22 @@ class ChangeAck {
 
 /// Batch of change acknowledgments from server
 class ChangeAcksMessage extends SyncMessage {
+  final String? streamId;
   final List<ChangeAck> acks;
 
-  const ChangeAcksMessage({required this.acks});
+  const ChangeAcksMessage({this.streamId, required this.acks});
 
   @override
   Map<String, dynamic> toMap() => {
     'type': 'change_acks',
+    if (streamId != null) 'stream_id': streamId,
     'acks': acks.map((a) => a.toMap()).toList(),
   };
 
   factory ChangeAcksMessage.fromMap(Map<String, dynamic> map) {
     final acksRaw = map['acks'] as List? ?? [];
     return ChangeAcksMessage(
+      streamId: map['stream_id'] as String?,
       acks: acksRaw.map((a) => ChangeAck.fromMap(a as Map<String, dynamic>)).toList(),
     );
   }
@@ -991,51 +1001,107 @@ class ChangeAcksMessage extends SyncMessage {
 
 /// Data batch for sync response (streamed)
 class SyncDataBatchMessage extends SyncMessage {
+  final String? streamId;
   final String table;
   final List<Map<String, dynamic>> rows;
+  final bool isStrippedRefresh; // Indicates this batch contains refreshed stripped rows
 
   const SyncDataBatchMessage({
+    this.streamId,
     required this.table,
     required this.rows,
+    this.isStrippedRefresh = false,
   });
 
   @override
   Map<String, dynamic> toMap() => {
     'type': 'sync_data_batch',
+    if (streamId != null) 'stream_id': streamId,
     'table': table,
     'rows': rows,
+    if (isStrippedRefresh) 'is_stripped_refresh': isStrippedRefresh,
   };
 
   factory SyncDataBatchMessage.fromMap(Map<String, dynamic> map) {
     final rowsData = map['rows'] as List? ?? [];
     return SyncDataBatchMessage(
+      streamId: map['stream_id'] as String?,
       table: map['table'] as String,
       rows: rowsData.map((r) => Map<String, dynamic>.from(r as Map)).toList(),
+      isStrippedRefresh: map['is_stripped_refresh'] as bool? ?? false,
     );
   }
 }
 
-/// Sync completion signal with final state
+/// Sync completion signal with final state and stats
 class SyncCompleteMessage extends SyncMessage {
+  final String? streamId;
   final int schemaVersion;
   final Map<String, int> tableSeqnums;
 
+  // Stats from server
+  final bool schemaUpgraded;
+  final int migrationsApplied;
+  final int pushTotal;
+  final int pushSuccess;
+  final int pushFailed;
+  final Map<String, Map<String, dynamic>> pushByTable;
+  final int pullTotal;
+  final Map<String, Map<String, dynamic>> pullByTable;
+  final int strippedRefreshed;
+  final int? elapsedMs;
+
   const SyncCompleteMessage({
+    this.streamId,
     required this.schemaVersion,
     required this.tableSeqnums,
+    this.schemaUpgraded = false,
+    this.migrationsApplied = 0,
+    this.pushTotal = 0,
+    this.pushSuccess = 0,
+    this.pushFailed = 0,
+    this.pushByTable = const {},
+    this.pullTotal = 0,
+    this.pullByTable = const {},
+    this.strippedRefreshed = 0,
+    this.elapsedMs,
   });
 
   @override
   Map<String, dynamic> toMap() => {
     'type': 'sync_complete',
+    if (streamId != null) 'stream_id': streamId,
     'schema_version': schemaVersion,
     'table_seqnums': tableSeqnums,
   };
 
   factory SyncCompleteMessage.fromMap(Map<String, dynamic> map) {
+    final stats = map['stats'] as Map<String, dynamic>? ?? {};
+
+    // Parse push_by_table
+    final pushByTableRaw = stats['push_by_table'] as Map? ?? {};
+    final pushByTable = pushByTableRaw.map((k, v) =>
+        MapEntry(k.toString(), Map<String, dynamic>.from(v as Map)));
+
+    // Parse pull_by_table
+    final pullByTableRaw = stats['pull_by_table'] as Map? ?? {};
+    final pullByTable = pullByTableRaw.map((k, v) =>
+        MapEntry(k.toString(), Map<String, dynamic>.from(v as Map)));
+
     return SyncCompleteMessage(
+      streamId: map['stream_id'] as String?,
       schemaVersion: map['schema_version'] as int? ?? 0,
       tableSeqnums: Map<String, int>.from(map['table_seqnums'] as Map? ?? {}),
+      schemaUpgraded: stats['schema_upgraded'] as bool? ?? false,
+      migrationsApplied: stats['migrations_applied'] as int? ?? 0,
+      pushTotal: stats['push_total'] as int? ?? 0,
+      pushSuccess: stats['push_success'] as int? ?? 0,
+      pushFailed: stats['push_failed'] as int? ?? 0,
+      pushByTable: pushByTable,
+      pullTotal: stats['pull_total'] as int? ?? 0,
+      pullByTable: pullByTable,
+      strippedRefreshed: stats['stripped_refreshed'] as int? ?? 0,
+      elapsedMs: stats['elapsed_ms'] as int?,
     );
   }
 }

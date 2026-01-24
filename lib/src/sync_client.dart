@@ -60,6 +60,117 @@ class SyncProgress {
   String toString() => 'SyncProgress(phase: $phase, table: $table, rowCount: $rowCount)';
 }
 
+/// Stats for a single table during sync
+class SyncTableStats {
+  /// Number of rows pulled from server
+  final int rowsPulled;
+
+  /// Number of stripped rows refreshed
+  final int strippedRefreshed;
+
+  /// Number of changes pushed to server
+  final int changesPushed;
+
+  /// Number of push changes that succeeded
+  final int changesSucceeded;
+
+  /// Number of push changes that failed
+  final int changesFailed;
+
+  const SyncTableStats({
+    this.rowsPulled = 0,
+    this.strippedRefreshed = 0,
+    this.changesPushed = 0,
+    this.changesSucceeded = 0,
+    this.changesFailed = 0,
+  });
+
+  factory SyncTableStats.fromMap(Map<String, dynamic> map) => SyncTableStats(
+    rowsPulled: map['rows'] as int? ?? 0,
+    strippedRefreshed: map['stripped'] as int? ?? 0,
+    changesPushed: map['total'] as int? ?? 0,
+    changesSucceeded: map['success'] as int? ?? 0,
+    changesFailed: map['failed'] as int? ?? 0,
+  );
+
+  @override
+  String toString() => 'SyncTableStats(pulled: $rowsPulled, stripped: $strippedRefreshed, pushed: $changesPushed)';
+}
+
+/// Event emitted when a unified sync operation completes
+class SyncCompleteEvent {
+  /// Stream ID for this sync operation
+  final String? streamId;
+
+  /// Final schema version after sync
+  final int schemaVersion;
+
+  /// Final per-table seqnums after sync
+  final Map<String, int> tableSeqnums;
+
+  /// Whether schema was upgraded during this sync
+  final bool schemaUpgraded;
+
+  /// Schema version before upgrade (if upgraded)
+  final int? schemaVersionBefore;
+
+  /// Number of schema migrations applied (if upgraded)
+  final int migrationsApplied;
+
+  /// Total rows pulled from all tables
+  final int totalRowsPulled;
+
+  /// Total changes pushed to server
+  final int totalChangesPushed;
+
+  /// Total push changes that succeeded
+  final int totalChangesSucceeded;
+
+  /// Total push changes that failed
+  final int totalChangesFailed;
+
+  /// Per-table pull stats (rows pulled, stripped refreshed)
+  final Map<String, SyncTableStats> pullStats;
+
+  /// Per-table push stats (changes pushed, succeeded, failed)
+  final Map<String, SyncTableStats> pushStats;
+
+  /// Tables that had data pulled (non-empty pull)
+  List<String> get tablesWithPulledData =>
+      pullStats.entries.where((e) => e.value.rowsPulled > 0).map((e) => e.key).toList();
+
+  /// Tables that had changes pushed
+  List<String> get tablesWithPushedChanges =>
+      pushStats.entries.where((e) => e.value.changesPushed > 0).map((e) => e.key).toList();
+
+  const SyncCompleteEvent({
+    this.streamId,
+    required this.schemaVersion,
+    required this.tableSeqnums,
+    this.schemaUpgraded = false,
+    this.schemaVersionBefore,
+    this.migrationsApplied = 0,
+    this.totalRowsPulled = 0,
+    this.totalChangesPushed = 0,
+    this.totalChangesSucceeded = 0,
+    this.totalChangesFailed = 0,
+    this.pullStats = const {},
+    this.pushStats = const {},
+  });
+
+  @override
+  String toString() {
+    final parts = <String>['SyncCompleteEvent('];
+    if (streamId != null) parts.add('stream: $streamId, ');
+    parts.add('schema: v$schemaVersion');
+    if (schemaUpgraded) parts.add(' (upgraded from v$schemaVersionBefore, $migrationsApplied migrations)');
+    if (totalChangesPushed > 0) parts.add(', pushed: $totalChangesSucceeded/$totalChangesPushed');
+    if (totalRowsPulled > 0) parts.add(', pulled: $totalRowsPulled rows');
+    parts.add(', tables: ${tableSeqnums.keys.toList()})');
+    return parts.join();
+  }
+}
+
 /// Callback for conflict resolution
 /// Returns the resolved change, or null to skip
 typedef ConflictResolver = Future<ChangeMessage?> Function(
@@ -276,6 +387,19 @@ class SyncClientConfig {
   /// Defaults to true.
   final bool autoSyncOnConnect;
 
+  /// Whether to use the new unified sync mechanism.
+  /// When true (default):
+  /// - Periodic push/pull timers are disabled
+  /// - syncOnWrite calls syncUnified() instead of legacy _pushLocalChanges()
+  /// - All sync happens via the single syncUnified() call which handles:
+  ///   - Push: Send pending local changes
+  ///   - Pull: Get remote changes (incremental by seqnum)
+  ///   - Schema: Apply migrations if needed
+  ///   - Stripped: Refresh stripped content
+  /// When false, uses legacy periodic push/pull timers.
+  /// Defaults to true for new clients.
+  final bool useUnifiedSync;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -297,6 +421,7 @@ class SyncClientConfig {
     this.database,
     this.autoSyncTables,
     this.autoSyncOnConnect = true,
+    this.useUnifiedSync = true,
   });
 }
 
@@ -377,6 +502,9 @@ class SyncClient {
   // Stream controller for sync progress events
   final StreamController<SyncProgress> _syncProgressController = StreamController<SyncProgress>.broadcast();
 
+  // Stream controller for unified sync completion events
+  final StreamController<SyncCompleteEvent> _syncCompleteController = StreamController<SyncCompleteEvent>.broadcast();
+
   // Current sync state
   SyncState _syncState = SyncState.disconnected;
 
@@ -392,6 +520,10 @@ class SyncClient {
   // Lock to ensure only one batch operation happens at a time
   final Lock _batchLock = Lock();
   final List<SnapshotBatchMessage> _batchQueue = [];
+
+  // Unified sync: track active sync operations by stream_id
+  final Map<String, Completer<void>> _activeSyncCompleters = {};
+  final Map<String, List<Change>> _activeSyncPendingChanges = {};
 
   // syncOnWrite: subscription to local changes and debounce timer
   StreamSubscription? _localChangeSubscription;
@@ -452,7 +584,15 @@ class SyncClient {
     // Start a new debounce timer
     _syncOnWriteDebounceTimer = Timer(config.syncOnWriteDebounce, () {
       _logger.fine('syncOnWrite: pushing changes after debounce');
-      _pushLocalChanges();
+      if (config.useUnifiedSync) {
+        // Use unified sync - handles push, pull, and cleanup in one call
+        syncUnified().catchError((e) {
+          _logger.warning('syncOnWrite: syncUnified failed: $e');
+        });
+      } else {
+        // Legacy: just push local changes
+        _pushLocalChanges();
+      }
     });
   }
 
@@ -537,7 +677,9 @@ class SyncClient {
 
     _logger.info('All channels joined successfully');
     _hasConnectedOnce = true;
-    if (config.enablePeriodicSync) {
+    // Only start periodic timers if NOT using unified sync
+    // Unified sync handles push/pull in a single call, no timers needed
+    if (config.enablePeriodicSync && !config.useUnifiedSync) {
       startPeriodicSync(pullRemote: _pullRemoteEnabled, pushLocal: _pushLocalEnabled);
     }
     await _sendHello();
@@ -1050,11 +1192,13 @@ class SyncClient {
   /// [forceRefresh] - Tables to force refresh (ignore seqnums)
   /// [includeStripped] - Auto-detect and refresh stripped rows (default: true)
   /// [channelTopic] - Channel to sync on (default: broadcastChannel)
+  /// [cleanupLegacyChanges] - Clean up old synced=1 records from legacy sync (default: true on first run)
   Future<void> syncUnified({
     List<String>? tables,
     List<String>? forceRefresh,
     bool includeStripped = true,
     String? channelTopic,
+    bool? cleanupLegacyChanges,
   }) async {
     if (!_ws.isConnected) {
       _logger.warning('syncUnified: Not connected, waiting for connection...');
@@ -1070,6 +1214,13 @@ class SyncClient {
     _updateSyncState(SyncState.syncing);
 
     try {
+      // Backwards compatibility: Clean up old synced=1 records from legacy sync
+      // These records were marked synced but never deleted, causing table growth
+      if (cleanupLegacyChanges ?? !_hasCleanedUpLegacyChanges) {
+        await _cleanupLegacySyncedChanges();
+        _hasCleanedUpLegacyChanges = true;
+      }
+
       // Determine which tables to sync
       final tablesToSync = tables ?? config.autoSyncTables ?? [];
       if (tablesToSync.isEmpty) {
@@ -1079,7 +1230,10 @@ class SyncClient {
         return;
       }
 
-      // 1. Get pending local changes to push
+      // 1. Get current schema version first
+      final schemaVersion = await _db!.getSchemaVersion();
+
+      // 2. Get pending local changes to push
       _emitSyncProgress(const SyncProgress(phase: 'pushing'));
       final pendingChanges = await _db!.getPendingChanges(limit: config.pushBatchSize);
       _logger.info('syncUnified: ${pendingChanges.length} pending changes to push');
@@ -1093,11 +1247,11 @@ class SyncClient {
         data: c.data != null ? _parseJson(c.data!) : null,
       )).toList();
 
-      // 2. Get per-table seqnums for incremental pull
+      // 3. Get per-table seqnums for incremental pull
       final tableSeqnums = await _getPerTableSeqnums(tablesToSync);
       _logger.info('syncUnified: Table seqnums: $tableSeqnums');
 
-      // 3. Find stripped rows if needed
+      // 4. Find stripped rows if needed
       List<RowRef>? strippedRows;
       if (includeStripped) {
         strippedRows = await _findStrippedRows(tablesToSync);
@@ -1105,9 +1259,6 @@ class SyncClient {
           _logger.info('syncUnified: Found ${strippedRows.length} stripped rows to refresh');
         }
       }
-
-      // 4. Get current schema version
-      final schemaVersion = await _db!.getSchemaVersion();
 
       // 5. Build and send sync request
       final request = SyncRequestMessage(
@@ -1120,11 +1271,63 @@ class SyncClient {
         pendingChanges: pendingChangeMessages.isNotEmpty ? pendingChangeMessages : null,
       );
 
-      _logger.info('syncUnified: Sending sync request');
+      _logger.info('syncUnified: Sending sync request (schema v$schemaVersion)');
       final response = await _ws.sendRaw('sync', request.toMap(), channelTopic: channelTopic ?? config.broadcastChannel);
 
-      // 6. Process response
-      await _processSyncResponse(response, pendingChanges);
+      // 6. Check if schema upgrade is required FIRST
+      if (response['status'] == 'schema_upgrade_required') {
+        final targetVersion = response['target_version'] as int;
+        _logger.info('syncUnified: Schema upgrade required to v$targetVersion');
+        _emitSyncProgress(const SyncProgress(phase: 'migrating'));
+
+        // Apply migrations synchronously (this also sends schema_migrated confirmation)
+        await _applyMigrations({
+          'current_version': targetVersion,
+          'migrations': response['migrations'],
+        });
+
+        _logger.info('syncUnified: Schema upgraded to v$targetVersion, restarting sync');
+
+        // Recursively call sync with updated schema (don't cleanup again)
+        _isSyncing = false;
+        return syncUnified(
+          tables: tables,
+          forceRefresh: forceRefresh,
+          includeStripped: includeStripped,
+          channelTopic: channelTopic,
+          cleanupLegacyChanges: false,
+        );
+      }
+
+      // 7. Handle error responses
+      if (response['status'] == 'error') {
+        throw StateError('Sync error: ${response['error']}');
+      }
+
+      // 8. Get stream_id and set up completer for streamed response
+      final streamId = response['stream_id'] as String?;
+      if (streamId == null) {
+        throw StateError('Server did not return stream_id');
+      }
+
+      _logger.info('syncUnified: Got stream_id $streamId, waiting for streamed data');
+
+      // Store pending changes for ack processing
+      _activeSyncPendingChanges[streamId] = pendingChanges;
+
+      // Create completer for this sync operation
+      final completer = Completer<void>();
+      _activeSyncCompleters[streamId] = completer;
+
+      // Wait for sync_complete message
+      await completer.future.timeout(
+        const Duration(minutes: 5),
+        onTimeout: () {
+          _activeSyncCompleters.remove(streamId);
+          _activeSyncPendingChanges.remove(streamId);
+          throw TimeoutException('Unified sync timed out', const Duration(minutes: 5));
+        },
+      );
 
       _updateSyncState(SyncState.ready);
       _logger.info('syncUnified: Complete');
@@ -1138,87 +1341,197 @@ class SyncClient {
     }
   }
 
-  /// Process the sync response from server
-  Future<void> _processSyncResponse(Map<String, dynamic> response, List<Change> pendingChanges) async {
-    // Handle schema migrations if present
-    if (response['migrations'] != null) {
-      _emitSyncProgress(const SyncProgress(phase: 'migrating'));
-      await _applyMigrations(response);
+  /// Track whether we've cleaned up legacy synced changes
+  bool _hasCleanedUpLegacyChanges = false;
+
+  /// Clean up old synced=1 records from legacy sync that were never deleted.
+  /// This runs once when upgrading to unified sync to prevent table growth.
+  Future<void> _cleanupLegacySyncedChanges() async {
+    try {
+      // Check if there are any synced=1 records
+      final result = await _db!.read(
+        'SELECT COUNT(*) as count FROM _synclib_changes WHERE synced = 1'
+      );
+      final count = result.isNotEmpty ? (result.first['count'] as int? ?? 0) : 0;
+
+      if (count > 0) {
+        _logger.info('syncUnified: Cleaning up $count legacy synced records');
+        await _db!.exec('DELETE FROM _synclib_changes WHERE synced = 1');
+        _logger.info('syncUnified: Legacy cleanup complete');
+      }
+    } catch (e) {
+      // Table might not exist or have different schema - that's fine
+      _logger.fine('syncUnified: Could not cleanup legacy records: $e');
     }
+  }
 
-    // Handle change acknowledgments
-    if (response['change_acks'] != null) {
-      final acks = (response['change_acks'] as List)
-          .map((a) => ChangeAck.fromMap(a as Map<String, dynamic>))
-          .toList();
+  /// Handle schema migrations from unified sync
+  Future<void> _handleSyncSchemaMigrations(SchemaMigrationsMessage message) async {
+    _logger.info('syncUnified: Received schema migrations to v${message.targetVersion}');
+    _emitSyncProgress(const SyncProgress(phase: 'migrating'));
 
-      _emitSyncProgress(SyncProgress(
-        phase: 'pushing',
-        changesAcked: acks.length,
-      ));
+    // Apply migrations using existing logic
+    await _applyMigrations({
+      'current_version': message.targetVersion,
+      'migrations': message.migrations,
+    });
+  }
 
-      for (final ack in acks) {
-        if (ack.success) {
-          // DELETE from _sync_changes instead of just marking synced
-          // This ensures the table is cleaned up and doesn't grow indefinitely
+  /// Handle change acknowledgments from unified sync
+  Future<void> _handleSyncChangeAcks(ChangeAcksMessage message) async {
+    _logger.info('syncUnified: Received ${message.acks.length} change acknowledgments');
+
+    _emitSyncProgress(SyncProgress(
+      phase: 'pushing',
+      changesAcked: message.acks.length,
+    ));
+
+    // Find the pending changes for this stream (we may have multiple syncs)
+    // For simplicity, process acks regardless of which stream they came from
+    for (final ack in message.acks) {
+      if (ack.success) {
+        // DELETE from _sync_changes instead of just marking synced
+        // This ensures the table is cleaned up and doesn't grow indefinitely
+        try {
           await _db!.deleteChange(ack.localSeqnum);
           _logger.fine('Deleted acknowledged change: ${ack.localSeqnum}');
+        } catch (e) {
+          _logger.warning('Failed to delete change ${ack.localSeqnum}: $e');
+        }
 
-          // Update local row seqnum if provided
-          if (ack.serverSeqnum != null) {
-            // Find the change info
-            final change = pendingChanges.firstWhere(
-              (c) => c.seqnum == ack.localSeqnum,
-              orElse: () => Change(seqnum: 0, tableName: '', rowId: '', operation: SynclibOperation.insert),
-            );
-            if (change.seqnum != 0) {
+        // Update local row seqnum if provided
+        if (ack.serverSeqnum != null) {
+          // Look up the change info in pending changes
+          for (final pending in _activeSyncPendingChanges.values) {
+            final change = pending.where((c) => c.seqnum == ack.localSeqnum).firstOrNull;
+            if (change != null) {
               await _updateLocalSeqnum(change.tableName, change.rowId, ack.serverSeqnum!);
+              break;
             }
           }
+        }
+      } else {
+        _logger.warning('Change ${ack.localSeqnum} failed: ${ack.error}');
+      }
+    }
+  }
+
+  /// Handle data batch from unified sync
+  Future<void> _handleSyncDataBatch(SyncDataBatchMessage message) async {
+    _logger.info('syncUnified: Received batch for ${message.table} with ${message.rows.length} rows');
+
+    _emitSyncProgress(SyncProgress(
+      phase: 'pulling',
+      table: message.table,
+      rowCount: message.rows.length,
+    ));
+
+    // Check if table exists
+    try {
+      final tableCheck = await _db!.read(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='${message.table}'"
+      );
+      if (tableCheck.isEmpty) {
+        _logger.warning('Table ${message.table} does not exist, skipping batch');
+        return;
+      }
+    } catch (e) {
+      _logger.severe('Error checking if table ${message.table} exists: $e');
+      return;
+    }
+
+    // Apply batch
+    await _db!.beginBulkRemote();
+    try {
+      for (final row in message.rows) {
+        final deletedAt = row['deleted_at'];
+
+        if (deletedAt != null) {
+          // Soft-deleted row - delete locally
+          final rowId = row['id'] as String;
+          final deleteSql = "DELETE FROM ${message.table} WHERE id = '${_escapeSql(rowId)}'";
+          await _db!.execBulkRemote(deleteSql);
         } else {
-          _logger.warning('Change ${ack.localSeqnum} failed: ${ack.error}');
+          // Normal row - insert/replace
+          final change = ChangeMessage(
+            table: message.table,
+            operation: 'insert',
+            rowId: row['id'] as String,
+            data: row,
+          );
+          final sql = _generateSql(change);
+          await _db!.execBulkRemote(sql);
         }
       }
+      await _db!.endBulkRemote();
+      _logger.info('Applied sync batch for ${message.table}');
+    } catch (e) {
+      _logger.severe('Failed to apply sync batch for ${message.table}: $e');
+      await _db!.endBulkRemote(rollback: true);
+    }
+  }
+
+  /// Handle sync complete from unified sync
+  void _handleSyncComplete(SyncCompleteMessage message) {
+    _logger.info('syncUnified: Sync complete - stream ${message.streamId}, '
+        'schema v${message.schemaVersion}, '
+        'pushed ${message.pushSuccess}/${message.pushTotal}, '
+        'pulled ${message.pullTotal} rows, '
+        'seqnums: ${message.tableSeqnums}');
+
+    _emitSyncProgress(const SyncProgress(phase: 'complete'));
+
+    // Build per-table stats
+    final pullStats = <String, SyncTableStats>{};
+    for (final entry in message.pullByTable.entries) {
+      pullStats[entry.key] = SyncTableStats.fromMap(entry.value);
     }
 
-    // Handle data batches
-    if (response['data_batches'] != null) {
-      _emitSyncProgress(const SyncProgress(phase: 'pulling'));
-      final batches = response['data_batches'] as List;
+    final pushStats = <String, SyncTableStats>{};
+    for (final entry in message.pushByTable.entries) {
+      pushStats[entry.key] = SyncTableStats.fromMap(entry.value);
+    }
 
-      await _db!.beginBulkRemote();
-      try {
-        for (final batchData in batches) {
-          final batch = SyncDataBatchMessage.fromMap(batchData as Map<String, dynamic>);
-          _emitSyncProgress(SyncProgress(
-            phase: 'pulling',
-            table: batch.table,
-            rowCount: batch.rows.length,
-          ));
+    // Emit sync complete event with all details for invalidation
+    final event = SyncCompleteEvent(
+      streamId: message.streamId,
+      schemaVersion: message.schemaVersion,
+      tableSeqnums: message.tableSeqnums,
+      schemaUpgraded: message.schemaUpgraded,
+      migrationsApplied: message.migrationsApplied,
+      totalRowsPulled: message.pullTotal,
+      totalChangesPushed: message.pushTotal,
+      totalChangesSucceeded: message.pushSuccess,
+      totalChangesFailed: message.pushFailed,
+      pullStats: pullStats,
+      pushStats: pushStats,
+    );
 
-          for (final row in batch.rows) {
-            final change = ChangeMessage(
-              table: batch.table,
-              operation: 'insert',
-              rowId: row['id'] as String,
-              data: row,
-            );
-            final sql = _generateSql(change);
-            await _db!.execBulkRemote(sql);
-          }
-        }
-        await _db!.endBulkRemote();
-      } catch (e) {
-        await _db!.endBulkRemote(rollback: true);
-        rethrow;
+    _logger.info('syncUnified: Emitting completion event - '
+        'tables with pulled data: ${event.tablesWithPulledData}, '
+        'tables with pushed changes: ${event.tablesWithPushedChanges}');
+
+    _syncCompleteController.add(event);
+
+    // Complete the specific sync operation by streamId if provided
+    if (message.streamId != null && _activeSyncCompleters.containsKey(message.streamId)) {
+      final completer = _activeSyncCompleters.remove(message.streamId);
+      _activeSyncPendingChanges.remove(message.streamId);
+      if (completer != null && !completer.isCompleted) {
+        completer.complete();
       }
-    }
+    } else {
+      // Fallback: complete all active sync operations
+      // In practice there should only be one, but handle multiple just in case
+      for (final entry in _activeSyncCompleters.entries) {
+        if (!entry.value.isCompleted) {
+          entry.value.complete();
+        }
+      }
 
-    // Handle sync complete
-    if (response['table_seqnums'] != null) {
-      _emitSyncProgress(const SyncProgress(phase: 'complete'));
-      final newSeqnums = Map<String, int>.from(response['table_seqnums'] as Map);
-      _logger.info('syncUnified: Final table seqnums: $newSeqnums');
+      // Clean up
+      _activeSyncCompleters.clear();
+      _activeSyncPendingChanges.clear();
     }
   }
 
@@ -1242,6 +1555,9 @@ class SyncClient {
 
   /// Stream of sync progress events (for UI progress indicators)
   Stream<SyncProgress> get syncProgressEvents => _syncProgressController.stream;
+
+  /// Stream of sync completion events (emitted when unified sync completes)
+  Stream<SyncCompleteEvent> get syncCompleteEvents => _syncCompleteController.stream;
 
   // ==========================================================================
   // END SIMPLIFIED SYNC HANDSHAKE
@@ -1378,6 +1694,14 @@ class SyncClient {
         _handleDirectStream(message);
       } else if (message is SchemaUpdateMessage) {
         await _handleSchemaUpdate(message);
+      } else if (message is SchemaMigrationsMessage) {
+        await _handleSyncSchemaMigrations(message);
+      } else if (message is ChangeAcksMessage) {
+        await _handleSyncChangeAcks(message);
+      } else if (message is SyncDataBatchMessage) {
+        await _handleSyncDataBatch(message);
+      } else if (message is SyncCompleteMessage) {
+        _handleSyncComplete(message);
       } else {
         _logger.warning('Unhandled message type: ${message.runtimeType}');
       }
