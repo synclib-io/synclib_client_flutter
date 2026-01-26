@@ -1527,6 +1527,7 @@ class SyncClient {
   }
 
   /// Handle data batch from unified sync
+  /// Uses _batchLock to ensure serial processing with other batch operations
   Future<void> _handleSyncDataBatch(SyncDataBatchMessage message) async {
     _logger.info('syncUnified: Received batch for ${message.table} with ${message.rows.length} rows');
 
@@ -1536,49 +1537,53 @@ class SyncClient {
       rowCount: message.rows.length,
     ));
 
-    // Check if table exists
-    try {
-      final tableCheck = await _db!.read(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='${message.table}'"
-      );
-      if (tableCheck.isEmpty) {
-        _logger.warning('Table ${message.table} does not exist, skipping batch');
+    // Use lock to ensure serial processing - prevents race conditions when
+    // multiple batches arrive faster than they can be processed
+    await _batchLock.synchronized(() async {
+      // Check if table exists
+      try {
+        final tableCheck = await _db!.read(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='${message.table}'"
+        );
+        if (tableCheck.isEmpty) {
+          _logger.warning('Table ${message.table} does not exist, skipping batch');
+          return;
+        }
+      } catch (e) {
+        _logger.severe('Error checking if table ${message.table} exists: $e');
         return;
       }
-    } catch (e) {
-      _logger.severe('Error checking if table ${message.table} exists: $e');
-      return;
-    }
 
-    // Apply batch
-    await _db!.beginBulkRemote();
-    try {
-      for (final row in message.rows) {
-        final deletedAt = row['deleted_at'];
+      // Apply batch
+      await _db!.beginBulkRemote();
+      try {
+        for (final row in message.rows) {
+          final deletedAt = row['deleted_at'];
 
-        if (deletedAt != null) {
-          // Soft-deleted row - delete locally
-          final rowId = row['id'] as String;
-          final deleteSql = "DELETE FROM ${message.table} WHERE id = '${_escapeSql(rowId)}'";
-          await _db!.execBulkRemote(deleteSql);
-        } else {
-          // Normal row - insert/replace
-          final change = ChangeMessage(
-            table: message.table,
-            operation: 'insert',
-            rowId: row['id'] as String,
-            data: row,
-          );
-          final sql = _generateSql(change);
-          await _db!.execBulkRemote(sql);
+          if (deletedAt != null) {
+            // Soft-deleted row - delete locally
+            final rowId = row['id'] as String;
+            final deleteSql = "DELETE FROM ${message.table} WHERE id = '${_escapeSql(rowId)}'";
+            await _db!.execBulkRemote(deleteSql);
+          } else {
+            // Normal row - insert/replace
+            final change = ChangeMessage(
+              table: message.table,
+              operation: 'insert',
+              rowId: row['id'] as String,
+              data: row,
+            );
+            final sql = _generateSql(change);
+            await _db!.execBulkRemote(sql);
+          }
         }
+        await _db!.endBulkRemote();
+        _logger.info('Applied sync batch for ${message.table}');
+      } catch (e) {
+        _logger.severe('Failed to apply sync batch for ${message.table}: $e');
+        await _db!.endBulkRemote(rollback: true);
       }
-      await _db!.endBulkRemote();
-      _logger.info('Applied sync batch for ${message.table}');
-    } catch (e) {
-      _logger.severe('Failed to apply sync batch for ${message.table}: $e');
-      await _db!.endBulkRemote(rollback: true);
-    }
+    });
   }
 
   /// Handle sync complete from unified sync
