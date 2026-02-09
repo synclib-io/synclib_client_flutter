@@ -7,6 +7,10 @@ import 'connection/websocket_manager.dart';
 import 'protocol/message.dart';
 import 'protocol/codec.dart';
 
+/// Default block size for Merkle verification (rows per block).
+/// Server provides this value; this is only a fallback.
+const int _defaultMerkleBlockSize = 100;
+
 /// Sync readiness state (legacy - kept for backwards compatibility)
 enum SyncReadyState {
   /// Waiting for initial hello reply from server
@@ -265,6 +269,20 @@ class AutoSyncEvent {
   List<String> get tableNames => staleTables.map((t) => t.table).toList();
 }
 
+/// Event emitted when Merkle verification completes
+/// Fires after background verification, especially useful when repairs occurred
+class MerkleVerificationEvent {
+  /// Tables that were repaired (empty if all matched)
+  final List<String> repairedTables;
+
+  /// Whether any repairs were made
+  bool get hadMismatches => repairedTables.isNotEmpty;
+
+  const MerkleVerificationEvent({
+    required this.repairedTables,
+  });
+}
+
 class SyncClientChannel {
   final String channelName;
   final String channelId;
@@ -400,6 +418,24 @@ class SyncClientConfig {
   /// Defaults to true for new clients.
   final bool useUnifiedSync;
 
+  /// Interval for periodic Merkle integrity verification.
+  /// When set, the client will periodically verify data integrity
+  /// for the specified tables using Merkle tree comparison.
+  /// Defaults to null (disabled).
+  final Duration? merkleVerifyInterval;
+
+  /// Tables to verify on the pull channel during Merkle integrity checks.
+  /// These are typically "tribe" tables that the user pulls from a shared channel.
+  final List<String>? merkleVerifyPullTables;
+
+  /// Tables to verify on the broadcast/push channel during Merkle integrity checks.
+  /// These are typically "user" tables that belong to the user's own channel.
+  final List<String>? merkleVerifyPushTables;
+
+  /// @deprecated Use merkleVerifyPullTables and merkleVerifyPushTables instead.
+  /// If set, tables are verified on the default channel (pullChannel or broadcastChannel).
+  final List<String>? merkleVerifyTables;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -422,6 +458,10 @@ class SyncClientConfig {
     this.autoSyncTables,
     this.autoSyncOnConnect = true,
     this.useUnifiedSync = true,
+    this.merkleVerifyInterval,
+    this.merkleVerifyPullTables,
+    this.merkleVerifyPushTables,
+    this.merkleVerifyTables,
   });
 }
 
@@ -434,6 +474,8 @@ class SyncClient {
   SynclibDatabase? _db;
   Timer? _pushTimer;
   Timer? _pullTimer;
+  /// Merkle block size from server (received in hello response)
+  int? _serverMerkleBlockSize;
   StreamSubscription? _messageSubscription;
   StreamSubscription? _stateSubscription;
 
@@ -495,6 +537,9 @@ class SyncClient {
 
   // Stream controller for auto-sync events (stale tables detection + sync progress)
   final StreamController<AutoSyncEvent> _autoSyncController = StreamController<AutoSyncEvent>.broadcast();
+
+  // Stream controller for Merkle verification events (repairs after background verification)
+  final StreamController<MerkleVerificationEvent> _merkleVerificationController = StreamController<MerkleVerificationEvent>.broadcast();
 
   // Stream controller for new simplified sync state
   final StreamController<SyncState> _syncStateController = StreamController<SyncState>.broadcast();
@@ -1439,6 +1484,10 @@ class SyncClient {
         },
       );
 
+      // Check if Merkle verification is needed (staleness check)
+      // Run in background - don't block sync completion
+      _checkMerkleVerification();
+
       _updateSyncState(SyncState.ready);
       _logger.info('syncUnified: Complete');
 
@@ -1574,6 +1623,10 @@ class SyncClient {
               data: row,
             );
             final sql = _generateSql(change);
+            // DEBUG: Log first row SQL to verify column names are lowercase
+            if (message.table == 'posts') {
+              _logger.warning('DEBUG _handleSyncDataBatch: SQL for posts: $sql');
+            }
             await _db!.execBulkRemote(sql);
           }
         }
@@ -1587,12 +1640,20 @@ class SyncClient {
   }
 
   /// Handle sync complete from unified sync
-  void _handleSyncComplete(SyncCompleteMessage message) {
-    _logger.info('syncUnified: Sync complete - stream ${message.streamId}, '
+  /// Waits for all pending batch operations to complete before signaling done.
+  Future<void> _handleSyncComplete(SyncCompleteMessage message) async {
+    _logger.info('syncUnified: Sync complete message received - stream ${message.streamId}, '
         'schema v${message.schemaVersion}, '
         'pushed ${message.pushSuccess}/${message.pushTotal}, '
         'pulled ${message.pullTotal} rows, '
         'seqnums: ${message.tableSeqnums}');
+
+    // CRITICAL: Wait for all pending batch operations to complete before
+    // signaling sync is done. Without this, merkle verification can run
+    // before all DB writes finish, causing false hash mismatches.
+    await _batchLock.synchronized(() async {
+      _logger.info('syncUnified: All batch operations complete');
+    });
 
     _emitSyncProgress(const SyncProgress(phase: 'complete'));
 
@@ -1816,7 +1877,7 @@ class SyncClient {
       } else if (message is SyncDataBatchMessage) {
         await _handleSyncDataBatch(message);
       } else if (message is SyncCompleteMessage) {
-        _handleSyncComplete(message);
+        await _handleSyncComplete(message);
       } else {
         _logger.warning('Unhandled message type: ${message.runtimeType}');
       }
@@ -2051,6 +2112,10 @@ class SyncClient {
           );
 
           final sql = _generateSql(change);
+          // DEBUG: Log first row SQL to verify column names are lowercase
+          if (processedCount == 0) {
+            _logger.warning('DEBUG: First row SQL for ${batch.table}: $sql');
+          }
           await _db!.execBulkRemote(sql);
         }
         processedCount++;
@@ -2161,6 +2226,12 @@ class SyncClient {
   /// Handle Phoenix reply messages (especially hello response with migrations)
   Future<void> _handlePhoenixReply(PhoenixReplyMessage reply) async {
     final response = reply.response;
+
+    // Store merkle_block_size from server if provided
+    if (response['merkle_block_size'] != null) {
+      _serverMerkleBlockSize = response['merkle_block_size'] as int;
+      _logger.info('Server merkle_block_size: $_serverMerkleBlockSize');
+    }
 
     // Check if this is a hello response with migrations
     if (response['status'] == 'upgrade_needed') {
@@ -2288,6 +2359,7 @@ class SyncClient {
       _pullTimer?.cancel();
       _pullTimer = null;
     }
+
   }
 
   /// Update whether periodic sync should pull from remote
@@ -2386,7 +2458,11 @@ class SyncClient {
     final data = change.data as Map<String, dynamic>;
     final params = <String?>[];
 
-    // Filter out metadata fields
+    // Filter out metadata fields and normalize COLUMN NAMES to lowercase
+    // PostgreSQL identifiers are lowercase by default, so our schema has userid, createdat, etc.
+    // But the JSON keys from server are camelCase like userId, createdAt
+    // Note: This only affects column names - the content inside 'document' is jsonEncoded
+    // and preserves its internal camelCase keys (e.g., document: {"someField": "value"})
     final filteredData = <String, dynamic>{};
     for (final entry in data.entries) {
       final key = entry.key;
@@ -2394,7 +2470,8 @@ class SyncClient {
 
       if (key == 'id' || key == 'updated_at' || key == 'inserted_at') continue;
 
-      filteredData[key] = value;
+      // Normalize column name to lowercase to match schema (values stay as-is)
+      filteredData[key.toLowerCase()] = value;
     }
 
     switch (change.operation) {
@@ -2719,6 +2796,11 @@ class SyncClient {
   /// Contains both the discovery (what's stale) and progress (syncing/completed).
   Stream<AutoSyncEvent> get autoSyncEvents => _autoSyncController.stream;
 
+  /// Stream of Merkle verification events
+  /// Emitted when background Merkle verification completes, especially if repairs occurred.
+  /// Subscribe to this to invalidate caches/refs when data was repaired.
+  Stream<MerkleVerificationEvent> get merkleVerificationEvents => _merkleVerificationController.stream;
+
   /// Per-channel sync states (read-only view)
   Map<String, ChannelSyncState> get channelStates => Map.unmodifiable(_channelStates);
 
@@ -2761,6 +2843,363 @@ class SyncClient {
   /// Returns true only when state is SyncReadyState.ready AND all channels are synced.
   /// Use this to gate UI rendering until initial data is loaded.
   bool get isReady => _readyState == SyncReadyState.ready && allChannelsSynced;
+
+  // ==========================================================================
+  // MERKLE TREE INTEGRITY VERIFICATION
+  // ==========================================================================
+
+  /// Check if Merkle verification is needed based on staleness.
+  /// Called at the end of syncUnified to run verification if interval has elapsed.
+  Future<void> _checkMerkleVerification() async {
+    // Skip if not configured
+    final hasPullTables = config.merkleVerifyPullTables?.isNotEmpty ?? false;
+    final hasPushTables = config.merkleVerifyPushTables?.isNotEmpty ?? false;
+    final hasLegacyTables = config.merkleVerifyTables?.isNotEmpty ?? false;
+
+    if (config.merkleVerifyInterval == null || (!hasPullTables && !hasPushTables && !hasLegacyTables)) {
+      return;
+    }
+
+    try {
+      final now = DateTime.now().millisecondsSinceEpoch;
+
+      // Ensure metadata table exists (for merkle verification tracking)
+      await _db!.exec('''
+        CREATE TABLE IF NOT EXISTS _synclib_metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      ''');
+
+      // Read last verified timestamp from metadata
+      final results = await _db!.read(
+        "SELECT value FROM _synclib_metadata WHERE key = 'merkle_last_verified'"
+      );
+      int lastVerified = 0;
+      if (results.isNotEmpty) {
+        final value = results.first['value'];
+        if (value is int) {
+          lastVerified = value;
+        } else if (value is String) {
+          lastVerified = int.tryParse(value) ?? 0;
+        }
+      }
+
+      // On first run (no timestamp), skip verification but set the timestamp.
+      // Seqnum-based sync is sufficient for initial population.
+      if (lastVerified == 0) {
+        _logger.info('Merkle verification: first run - skipping, setting initial timestamp');
+        await _db!.exec(
+          "INSERT OR REPLACE INTO _synclib_metadata (key, value) VALUES ('merkle_last_verified', '$now')"
+        );
+        return;
+      }
+
+      final intervalMs = config.merkleVerifyInterval!.inMilliseconds;
+      if (now - lastVerified < intervalMs) {
+        _logger.info('Merkle verification not needed (last: ${DateTime.fromMillisecondsSinceEpoch(lastVerified)})');
+        return;
+      }
+
+      _logger.info('Running Merkle verification (last: ${DateTime.fromMillisecondsSinceEpoch(lastVerified)})');
+
+      // Use server's block size if available, otherwise fall back to default
+      final blockSize = _serverMerkleBlockSize ?? _defaultMerkleBlockSize;
+
+      final allRepairedTables = <String>[];
+
+      // Verify pull channel tables (tribe tables)
+      final pullTables = config.merkleVerifyPullTables ?? config.merkleVerifyTables;
+      final pullChannel = config.pullChannel ?? config.broadcastChannel;
+      if (pullTables != null && pullTables.isNotEmpty && pullChannel != null) {
+        try {
+          _logger.fine('Merkle verification on pull channel: $pullChannel');
+          final repairedTables = await verifyIntegrity(
+            tables: pullTables,
+            blockSize: blockSize,
+            channelTopic: pullChannel,
+          );
+          allRepairedTables.addAll(repairedTables);
+        } catch (e) {
+          _logger.warning('Merkle verification failed on pull channel: $e');
+        }
+      }
+
+      // Verify push/broadcast channel tables (user tables)
+      final pushTables = config.merkleVerifyPushTables;
+      final pushChannel = config.broadcastChannel;
+      if (pushTables != null && pushTables.isNotEmpty && pushChannel != null && pushChannel != pullChannel) {
+        try {
+          _logger.fine('Merkle verification on push channel: $pushChannel');
+          final repairedTables = await verifyIntegrity(
+            tables: pushTables,
+            blockSize: blockSize,
+            channelTopic: pushChannel,
+          );
+          allRepairedTables.addAll(repairedTables);
+        } catch (e) {
+          _logger.warning('Merkle verification failed on push channel: $e');
+        }
+      }
+
+      // Update last verified timestamp in metadata
+      await _db!.exec(
+        "INSERT OR REPLACE INTO _synclib_metadata (key, value) VALUES ('merkle_last_verified', '$now')"
+      );
+
+      if (allRepairedTables.isNotEmpty) {
+        _logger.info('Merkle verification repaired tables: ${allRepairedTables.join(', ')}');
+      } else {
+        _logger.info('Merkle verification: all tables match');
+      }
+
+      // Emit event so clients can invalidate caches if repairs occurred
+      _merkleVerificationController.add(MerkleVerificationEvent(
+        repairedTables: allRepairedTables,
+      ));
+    } catch (e) {
+      _logger.warning('Merkle verification failed: $e');
+      // Don't rethrow - verification failure shouldn't break sync
+    }
+  }
+
+  /// Verify data integrity using Merkle trees.
+  ///
+  /// Compares local Merkle roots against server and repairs any mismatched blocks.
+  /// This is a consistency audit that catches:
+  /// - Data corruption during development
+  /// - Seqnum drift from manual database edits
+  /// - Missed changes from network issues
+  /// - Any state where seqnums match but data differs
+  ///
+  /// Returns list of tables that were repaired. Empty list means all tables matched.
+  ///
+  /// Example:
+  /// ```dart
+  /// final repairedTables = await syncClient.verifyIntegrity(
+  ///   tables: ['users', 'workouts'],
+  ///   blockSize: 100,
+  /// );
+  /// if (repairedTables.isNotEmpty) {
+  ///   print('Repaired tables: $repairedTables');
+  /// }
+  /// ```
+  Future<List<String>> verifyIntegrity({
+    List<String>? tables,
+    int blockSize = 100,
+    String? channelTopic,
+  }) async {
+    if (!_ws.isConnected) {
+      _logger.warning('verifyIntegrity: Not connected');
+      throw StateError('Not connected to server');
+    }
+
+    final tablesToVerify = tables ?? config.autoSyncTables ?? [];
+    if (tablesToVerify.isEmpty) {
+      _logger.warning('verifyIntegrity: No tables specified');
+      return [];
+    }
+
+    _logger.info('verifyIntegrity: Starting integrity check for ${tablesToVerify.length} tables');
+
+    // 1. Compute local Merkle roots for each table
+    final tableHashes = <String, MerkleTableInfo>{};
+    for (final table in tablesToVerify) {
+      try {
+        final merkleInfo = await _db!.merkleRoot(table, blockSize: blockSize);
+        tableHashes[table] = MerkleTableInfo(
+          rootHash: merkleInfo.rootHash,
+          blockCount: merkleInfo.blockCount,
+          rowCount: merkleInfo.rowCount,
+        );
+        final hashPreview = merkleInfo.rootHash.length >= 16
+            ? '${merkleInfo.rootHash.substring(0, 16)}...'
+            : merkleInfo.rootHash.isEmpty ? '(empty)' : merkleInfo.rootHash;
+        _logger.fine('verifyIntegrity: $table - root=$hashPreview, '
+            'blocks=${merkleInfo.blockCount}, rows=${merkleInfo.rowCount}');
+      } catch (e) {
+        _logger.warning('verifyIntegrity: Failed to compute Merkle root for $table: $e');
+        // Skip tables that fail - they may not exist or have no id column
+      }
+    }
+
+    if (tableHashes.isEmpty) {
+      _logger.warning('verifyIntegrity: No valid tables to verify (merkle methods may not be implemented)');
+      throw StateError('No valid tables to verify - merkleRoot() may not be implemented on database');
+    }
+
+    // 2. Send verification request to server
+    final channel = channelTopic ?? config.pullChannel ?? config.broadcastChannel;
+
+    // Build payload matching MerkleVerifyMessage structure
+    final payload = <String, dynamic>{
+      'table_hashes': tableHashes.map((table, info) => MapEntry(table, {
+        'root_hash': info.rootHash,
+        'block_count': info.blockCount,
+        'row_count': info.rowCount,
+      })),
+      'block_size': blockSize,
+    };
+
+    try {
+      final responseMap = await _ws.sendRaw('merkle_verify', payload, channelTopic: channel);
+      _logger.fine('verifyIntegrity: Response received: $responseMap');
+      final response = MerkleVerifyResponse.fromMap(responseMap);
+
+      if (response.isOk) {
+        _logger.info('verifyIntegrity: All tables verified OK');
+        return [];
+      }
+
+      // 3. Handle mismatches - repair each table
+      final repairedTables = <String>[];
+      for (final mismatch in response.mismatches ?? []) {
+        final localHash = tableHashes[mismatch.table]?.rootHash ?? '';
+        final serverHash = mismatch.serverRootHash;
+        final localPreview = localHash.length >= 16 ? '${localHash.substring(0, 16)}...' : localHash.isEmpty ? '(empty)' : localHash;
+        final serverPreview = serverHash.length >= 16 ? '${serverHash.substring(0, 16)}...' : serverHash.isEmpty ? '(empty)' : serverHash;
+        _logger.info('verifyIntegrity: Mismatch detected for ${mismatch.table} - '
+            'local: $localPreview, server: $serverPreview');
+
+        await _repairTable(
+          mismatch.table,
+          blockSize,
+          channelTopic: channel,
+        );
+        repairedTables.add(mismatch.table);
+      }
+
+      _logger.info('verifyIntegrity: Repaired ${repairedTables.length} tables');
+      return repairedTables;
+
+    } catch (e, stack) {
+      _logger.severe('verifyIntegrity: Error - $e', e, stack);
+      rethrow;
+    }
+  }
+
+  /// Repair a table by fetching differing blocks from server
+  Future<void> _repairTable(
+    String table,
+    int blockSize, {
+    String? channelTopic,
+  }) async {
+    // 1. Get block hashes
+    final blockHashes = await _db!.merkleBlockHashes(table, blockSize: blockSize);
+    _logger.fine('verifyIntegrity: $table has ${blockHashes.length} blocks');
+
+    // 2. Send block hashes to server to find differences
+    final payload = <String, dynamic>{
+      'table': table,
+      'block_hashes': blockHashes,
+      'block_size': blockSize,
+    };
+
+    try {
+      final responseMap = await _ws.sendRaw('merkle_block_hashes', payload, channelTopic: channelTopic);
+      final response = MerkleBlockHashesResponse.fromMap(responseMap);
+
+      if (response.differingBlocks.isEmpty) {
+        _logger.info('verifyIntegrity: $table - no differing blocks (hash collision resolved)');
+        return;
+      }
+
+      _logger.info('verifyIntegrity: $table - ${response.differingBlocks.length} differing blocks: '
+          '${response.differingBlocks}');
+
+      // 3. Fetch and apply each differing block
+      for (final blockIndex in response.differingBlocks) {
+        await _fetchAndApplyBlock(table, blockIndex, blockSize, channelTopic: channelTopic);
+      }
+
+      _logger.info('verifyIntegrity: $table - repair complete');
+
+    } catch (e) {
+      _logger.severe('verifyIntegrity: Failed to repair $table: $e');
+      rethrow;
+    }
+  }
+
+  /// Fetch a block from server and apply to local database
+  Future<void> _fetchAndApplyBlock(
+    String table,
+    int blockIndex,
+    int blockSize, {
+    String? channelTopic,
+  }) async {
+    final payload = <String, dynamic>{
+      'table': table,
+      'blocks': [blockIndex],
+      'block_size': blockSize,
+    };
+
+    try {
+      final responseMap = await _ws.sendRaw('merkle_fetch_blocks', payload, channelTopic: channelTopic);
+      final response = MerkleFetchBlocksResponse.fromMap(responseMap);
+
+      // Get existing row IDs in this block to detect deletions
+      final existingRowIds = await _db!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
+      final serverRowIds = response.rows.map((r) => r['id']?.toString() ?? '').toSet();
+
+      // Use bulk operations for efficiency (no individual logging)
+      _db!.beginBulkRemote();
+      var updatedCount = 0;
+      var insertedCount = 0;
+      var deletedCount = 0;
+
+      try {
+        // Apply each row from server (inserts or updates)
+        for (final row in response.rows) {
+          final rowId = row['id']?.toString();
+          if (rowId == null) continue;
+
+          final isUpdate = existingRowIds.contains(rowId);
+          final change = ChangeMessage(
+            table: table,
+            operation: isUpdate ? 'update' : 'insert',
+            rowId: rowId,
+            data: row,
+          );
+          final sql = _generateSql(change);
+          _db!.execBulkRemote(sql);
+          if (isUpdate) {
+            updatedCount++;
+          } else {
+            insertedCount++;
+          }
+        }
+
+        // Delete rows that exist locally but not on server
+        for (final localRowId in existingRowIds) {
+          if (!serverRowIds.contains(localRowId)) {
+            final change = ChangeMessage(
+              table: table,
+              operation: 'delete',
+              rowId: localRowId,
+            );
+            final sql = _generateSql(change);
+            _db!.execBulkRemote(sql);
+            deletedCount++;
+          }
+        }
+
+        await _db!.endBulkRemote();
+        _logger.info('verifyIntegrity: $table block $blockIndex - applied ${response.rows.length} rows '
+            '(updated: $updatedCount, inserted: $insertedCount, deleted: $deletedCount)');
+      } catch (e) {
+        await _db!.endBulkRemote(rollback: true);
+        rethrow;
+      }
+
+    } catch (e) {
+      _logger.severe('verifyIntegrity: Failed to fetch block $blockIndex for $table: $e');
+      rethrow;
+    }
+  }
+
+  // ==========================================================================
+  // END MERKLE TREE INTEGRITY VERIFICATION
+  // ==========================================================================
 
   /// Dispose resources
   Future<void> dispose() async {

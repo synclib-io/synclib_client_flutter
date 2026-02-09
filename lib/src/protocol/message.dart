@@ -79,6 +79,19 @@ abstract class SyncMessage {
         return SyncDataBatchMessage.fromMap(map);
       case 'sync_complete':
         return SyncCompleteMessage.fromMap(map);
+      // Merkle tree integrity verification messages
+      case 'merkle_verify':
+        return MerkleVerifyMessage.fromMap(map);
+      case 'merkle_verify_response':
+        return MerkleVerifyResponse.fromMap(map);
+      case 'merkle_block_hashes':
+        return MerkleBlockHashesMessage.fromMap(map);
+      case 'merkle_block_hashes_response':
+        return MerkleBlockHashesResponse.fromMap(map);
+      case 'merkle_fetch_blocks':
+        return MerkleFetchBlocksMessage.fromMap(map);
+      case 'merkle_fetch_blocks_response':
+        return MerkleFetchBlocksResponse.fromMap(map);
       default:
         // Unknown message types are logged but not thrown - allows forward compatibility
         // and handles internal server messages that shouldn't be sent to clients
@@ -1108,6 +1121,241 @@ class SyncCompleteMessage extends SyncMessage {
 
 // ============================================================================
 // END SIMPLIFIED SYNC HANDSHAKE PROTOCOL MESSAGES
+// ============================================================================
+
+// ============================================================================
+// MERKLE TREE INTEGRITY VERIFICATION PROTOCOL MESSAGES
+// ============================================================================
+
+/// Information about a table's Merkle tree
+class MerkleTableInfo {
+  final String rootHash;
+  final int blockCount;
+  final int rowCount;
+
+  const MerkleTableInfo({
+    required this.rootHash,
+    required this.blockCount,
+    required this.rowCount,
+  });
+
+  Map<String, dynamic> toMap() => {
+    'root_hash': rootHash,
+    'block_count': blockCount,
+    'row_count': rowCount,
+  };
+
+  factory MerkleTableInfo.fromMap(Map<String, dynamic> map) => MerkleTableInfo(
+    rootHash: map['root_hash'] as String,
+    blockCount: map['block_count'] as int,
+    rowCount: map['row_count'] as int,
+  );
+}
+
+/// Mismatch information returned by server
+class MerkleMismatch {
+  final String table;
+  final String serverRootHash;
+  final int serverBlockCount;
+  final int serverRowCount;
+
+  const MerkleMismatch({
+    required this.table,
+    required this.serverRootHash,
+    required this.serverBlockCount,
+    required this.serverRowCount,
+  });
+
+  factory MerkleMismatch.fromMap(Map<String, dynamic> map) => MerkleMismatch(
+    table: map['table'] as String,
+    serverRootHash: map['server_root_hash'] as String,
+    serverBlockCount: map['server_block_count'] as int,
+    serverRowCount: map['server_row_count'] as int,
+  );
+}
+
+/// Client sends Merkle roots for integrity verification
+class MerkleVerifyMessage extends SyncMessage {
+  final Map<String, MerkleTableInfo> tableHashes;
+  final int? blockSize;
+
+  const MerkleVerifyMessage({
+    required this.tableHashes,
+    this.blockSize,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'merkle_verify',
+    'table_hashes': tableHashes.map((k, v) => MapEntry(k, v.toMap())),
+    if (blockSize != null) 'block_size': blockSize,
+  };
+
+  factory MerkleVerifyMessage.fromMap(Map<String, dynamic> map) {
+    final rawHashes = map['table_hashes'] as Map? ?? {};
+    return MerkleVerifyMessage(
+      tableHashes: rawHashes.map((k, v) => MapEntry(
+        k.toString(),
+        MerkleTableInfo.fromMap(v as Map<String, dynamic>),
+      )),
+      blockSize: map['block_size'] as int?,
+    );
+  }
+}
+
+/// Server response to Merkle verification
+class MerkleVerifyResponse extends SyncMessage {
+  final String status; // 'ok' or 'mismatch'
+  final List<String>? verifiedTables;
+  final List<MerkleMismatch>? mismatches;
+
+  const MerkleVerifyResponse({
+    required this.status,
+    this.verifiedTables,
+    this.mismatches,
+  });
+
+  bool get isOk => status == 'ok';
+  bool get hasMismatches => status == 'mismatch' && mismatches != null && mismatches!.isNotEmpty;
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'merkle_verify_response',
+    'status': status,
+    if (verifiedTables != null) 'verified_tables': verifiedTables,
+    if (mismatches != null) 'mismatches': mismatches!.map((m) => {
+      'table': m.table,
+      'server_root_hash': m.serverRootHash,
+      'server_block_count': m.serverBlockCount,
+      'server_row_count': m.serverRowCount,
+    }).toList(),
+  };
+
+  factory MerkleVerifyResponse.fromMap(Map<String, dynamic> map) {
+    final mismatchesRaw = map['mismatches'] as List?;
+    // Status might be 'ok' or 'mismatch' - default to 'ok' if missing
+    final status = (map['status'] as String?) ?? 'ok';
+    return MerkleVerifyResponse(
+      status: status,
+      verifiedTables: (map['verified_tables'] as List?)?.cast<String>(),
+      mismatches: mismatchesRaw?.map((m) =>
+        MerkleMismatch.fromMap(m as Map<String, dynamic>)).toList(),
+    );
+  }
+}
+
+/// Client sends block-level hashes for a specific table
+class MerkleBlockHashesMessage extends SyncMessage {
+  final String table;
+  final List<String> blockHashes;
+  final int? blockSize;
+
+  const MerkleBlockHashesMessage({
+    required this.table,
+    required this.blockHashes,
+    this.blockSize,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'merkle_block_hashes',
+    'table': table,
+    'block_hashes': blockHashes,
+    if (blockSize != null) 'block_size': blockSize,
+  };
+
+  factory MerkleBlockHashesMessage.fromMap(Map<String, dynamic> map) =>
+    MerkleBlockHashesMessage(
+      table: map['table'] as String,
+      blockHashes: (map['block_hashes'] as List).cast<String>(),
+      blockSize: map['block_size'] as int?,
+    );
+}
+
+/// Server identifies which blocks differ
+class MerkleBlockHashesResponse extends SyncMessage {
+  final String table;
+  final List<int> differingBlocks;
+
+  const MerkleBlockHashesResponse({
+    required this.table,
+    required this.differingBlocks,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'merkle_block_hashes_response',
+    'table': table,
+    'differing_blocks': differingBlocks,
+  };
+
+  factory MerkleBlockHashesResponse.fromMap(Map<String, dynamic> map) =>
+    MerkleBlockHashesResponse(
+      table: map['table'] as String,
+      differingBlocks: (map['differing_blocks'] as List).cast<int>(),
+    );
+}
+
+/// Client requests data for specific blocks
+class MerkleFetchBlocksMessage extends SyncMessage {
+  final String table;
+  final List<int> blocks;
+  final int? blockSize;
+
+  const MerkleFetchBlocksMessage({
+    required this.table,
+    required this.blocks,
+    this.blockSize,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'merkle_fetch_blocks',
+    'table': table,
+    'blocks': blocks,
+    if (blockSize != null) 'block_size': blockSize,
+  };
+
+  factory MerkleFetchBlocksMessage.fromMap(Map<String, dynamic> map) =>
+    MerkleFetchBlocksMessage(
+      table: map['table'] as String,
+      blocks: (map['blocks'] as List).cast<int>(),
+      blockSize: map['block_size'] as int?,
+    );
+}
+
+/// Server sends data for a block
+class MerkleFetchBlocksResponse extends SyncMessage {
+  final String table;
+  final int block;
+  final List<Map<String, dynamic>> rows;
+
+  const MerkleFetchBlocksResponse({
+    required this.table,
+    required this.block,
+    required this.rows,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'merkle_fetch_blocks_response',
+    'table': table,
+    'block': block,
+    'rows': rows,
+  };
+
+  factory MerkleFetchBlocksResponse.fromMap(Map<String, dynamic> map) {
+    final rowsRaw = map['rows'] as List? ?? [];
+    return MerkleFetchBlocksResponse(
+      table: map['table'] as String,
+      block: map['block'] as int,
+      rows: rowsRaw.map((r) => Map<String, dynamic>.from(r as Map)).toList(),
+    );
+  }
+}
+
+// ============================================================================
+// END MERKLE TREE INTEGRITY VERIFICATION PROTOCOL MESSAGES
 // ============================================================================
 
 /// Direct stream event message (Jumpcut low-latency direct playback)
