@@ -11,6 +11,15 @@ import 'protocol/codec.dart';
 /// Server provides this value; this is only a fallback.
 const int _defaultMerkleBlockSize = 100;
 
+/// Adapter to bridge SynclibDatabase to MerkleDatabase interface.
+class _SynclibMerkleDb implements MerkleDatabase {
+  final SynclibDatabase _db;
+  _SynclibMerkleDb(this._db);
+
+  @override
+  Future<List<Map<String, dynamic>>> read(String sql) => _db.read(sql);
+}
+
 /// Sync readiness state (legacy - kept for backwards compatibility)
 enum SyncReadyState {
   /// Waiting for initial hello reply from server
@@ -283,17 +292,6 @@ class MerkleVerificationEvent {
   });
 }
 
-class SyncClientChannel {
-  final String channelName;
-  final String channelId;
-  final Map<String, String>? params;
-  const SyncClientChannel({
-    required this.channelName,
-    required this.channelId,
-    this.params
-  });
-}
-
 /// Direction of repair when data differs between client and server.
 /// Applies to both seqnum-based sync and merkle tree verification.
 enum RepairDirection {
@@ -341,17 +339,14 @@ class SyncTable {
   const SyncTable.lww(this.name) : direction = RepairDirection.lww;
 }
 
-/// Defines a sync channel: its topic, role, and associated tables.
+/// A sync channel: its topic, role, associated tables, and join params.
 ///
 /// Used for both seqnum-based sync (which tables to push/pull) and merkle
 /// tree verification (which tables to verify and how to repair).
 ///
-/// Replaces the scattered broadcastChannel/pullChannel/merkleVerifyPullTables/
-/// merkleVerifyPushTables fields in [SyncClientConfig].
-///
 /// Example:
 /// ```dart
-/// SyncChannelType(
+/// SyncChannel(
 ///   topic: 'sync:tribe:$tribeId',
 ///   role: ChannelRole.pull,
 ///   tables: [
@@ -360,7 +355,7 @@ class SyncTable {
 ///   ],
 /// )
 /// ```
-class SyncChannelType {
+class SyncChannel {
   /// The Phoenix channel topic (e.g., "sync:tribe:trainer123", "sync:user:user456")
   final String topic;
 
@@ -371,10 +366,14 @@ class SyncChannelType {
   /// Each table's repair direction defaults to the channel role if not overridden.
   final List<SyncTable> tables;
 
-  const SyncChannelType({
+  /// Optional params to send when joining this channel.
+  final Map<String, String>? params;
+
+  const SyncChannel({
     required this.topic,
     required this.role,
     this.tables = const [],
+    this.params,
   });
 
   /// Default repair direction implied by this channel's role.
@@ -438,50 +437,21 @@ class SyncClientConfig {
   /// Unique client identifier
   final String clientId;
 
-  /// channels to connect to initially
-  // todo allow connecting to any channel dynamically later
-  final List<SyncClientChannel> initialChannels;
+  /// Channels to connect to and sync on.
+  /// Each channel defines its topic, role, tables, and optional join params.
+  final List<SyncChannel> channels;
 
   /// Codec for message encoding
   final SyncCodecType codec;
 
-  /// How often to push local changes (null = manual only)
-  final Duration? pushInterval;
-
   /// Batch size for pushing changes
   final int pushBatchSize;
-
-  /// How often to pull remote changes (null = reactive only)
-  final Duration? pullInterval;
 
   /// Conflict resolution strategy
   final ConflictResolver? onConflict;
 
   /// Optional metadata to send in hello message
   final Map<String, dynamic>? metadata;
-
-  /// Channel to use for broadcasting/pushing messages (e.g., "sync:user:123")
-  /// If not specified, uses the first channel
-  final String? broadcastChannel;
-
-  /// Channel to use for pulling remote changes (e.g., "sync:tribe:trainer123")
-  /// If not specified, uses broadcastChannel (or first channel if that's also null).
-  /// This allows pulling from a different channel than you push to.
-  /// Example: Members pull from tribe channel (trainer content) but push to user channel.
-  final String? pullChannel;
-
-  /// Whether to pull remote changes periodically.
-  /// If false, only pushes local changes. Defaults to true.
-  final bool pullRemote;
-
-  /// Whether to push local changes periodically.
-  /// If false, only pulls remote changes. Defaults to true.
-  final bool pushLocal;
-
-  /// Whether to enable periodic sync at all.
-  /// If false, no timers are started - sync is fully reactive (WebSocket events only).
-  /// Defaults to true.
-  final bool enablePeriodicSync;
 
   /// Whether to automatically push changes immediately when writes occur.
   /// If true, subscribes to database localChanges stream and pushes on each write.
@@ -500,54 +470,16 @@ class SyncClientConfig {
   /// parts of your app (e.g., a UI layer that also reads from the database).
   final SynclibDatabase? database;
 
-  /// Tables to auto-sync on connect.
-  /// When specified, the client will send per-table seqnums to the server
-  /// on channel join. The server reports which tables are stale, and the
-  /// client automatically syncs them.
-  /// Listen to [SyncClient.autoSyncEvents] for progress updates.
-  /// If empty or null, auto-sync is disabled.
-  final List<String>? autoSyncTables;
-
   /// Whether to automatically sync stale tables on connect.
   /// If false, auto-sync can be triggered manually via [SyncClient.runAutoSync()].
   /// Defaults to true.
   final bool autoSyncOnConnect;
 
-  /// Whether to use the new unified sync mechanism.
-  /// When true (default):
-  /// - Periodic push/pull timers are disabled
-  /// - syncOnWrite calls syncUnified() instead of legacy _pushLocalChanges()
-  /// - All sync happens via the single syncUnified() call which handles:
-  ///   - Push: Send pending local changes
-  ///   - Pull: Get remote changes (incremental by seqnum)
-  ///   - Schema: Apply migrations if needed
-  ///   - Stripped: Refresh stripped content
-  /// When false, uses legacy periodic push/pull timers.
-  /// Defaults to true for new clients.
-  final bool useUnifiedSync;
-
-  /// Sync channel types with per-table merkle repair directions.
-  ///
-  /// This is the preferred way to configure channels. When set, it replaces
-  /// [broadcastChannel], [pullChannel], [merkleVerifyPullTables],
-  /// [merkleVerifyPushTables], and [autoSyncTables].
-  ///
-  /// Example:
-  /// ```dart
-  /// channels: [
-  ///   SyncChannelType(
-  ///     topic: 'sync:user:$userId',
-  ///     role: ChannelRole.push,
-  ///     tables: [SyncTable('journal_entries')],  // inherits push from channel role
-  ///   ),
-  ///   SyncChannelType(
-  ///     topic: 'sync:tribe:$tribeId',
-  ///     role: ChannelRole.pull,
-  ///     tables: [SyncTable('exercises')],  // inherits pull from channel role
-  ///   ),
-  /// ]
-  /// ```
-  final List<SyncChannelType>? channels;
+  /// Interval for periodic background sync.
+  /// When set, a timer calls syncUnified() at this interval.
+  /// When null, sync is purely reactive (syncOnWrite + manual calls).
+  /// Defaults to null (disabled).
+  final Duration? periodicSyncInterval;
 
   /// Interval for periodic Merkle integrity verification.
   /// When set, the client will periodically verify data integrity
@@ -555,45 +487,21 @@ class SyncClientConfig {
   /// Defaults to null (disabled).
   final Duration? merkleVerifyInterval;
 
-  /// @Deprecated('Use channels instead')
-  /// Tables to verify on the pull channel during Merkle integrity checks.
-  final List<String>? merkleVerifyPullTables;
-
-  /// @Deprecated('Use channels instead')
-  /// Tables to verify on the broadcast/push channel during Merkle integrity checks.
-  final List<String>? merkleVerifyPushTables;
-
-  /// @Deprecated('Use channels instead')
-  /// If set, tables are verified on the default channel (pullChannel or broadcastChannel).
-  final List<String>? merkleVerifyTables;
-
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
     required this.clientId,
-    required this.initialChannels,
+    required this.channels,
     this.codec = SyncCodecType.json,
-    this.pushInterval = const Duration(seconds: 5),
     this.pushBatchSize = 100,
-    this.pullInterval,
     this.onConflict,
     this.metadata,
-    this.broadcastChannel,
-    this.pullChannel,
-    this.pullRemote = true,
-    this.pushLocal = true,
-    this.enablePeriodicSync = true,
     this.syncOnWrite = false,
     this.syncOnWriteDebounce = const Duration(milliseconds: 100),
     this.database,
-    this.autoSyncTables,
     this.autoSyncOnConnect = true,
-    this.useUnifiedSync = true,
-    this.channels,
+    this.periodicSyncInterval,
     this.merkleVerifyInterval,
-    this.merkleVerifyPullTables,
-    this.merkleVerifyPushTables,
-    this.merkleVerifyTables,
   });
 }
 
@@ -604,8 +512,7 @@ class SyncClient {
 
   late final WebSocketManager _ws;
   SynclibDatabase? _db;
-  Timer? _pushTimer;
-  Timer? _pullTimer;
+  MerkleComputer? _merkle;
   /// Merkle block size from server (received in hello response)
   int? _serverMerkleBlockSize;
   StreamSubscription? _messageSubscription;
@@ -616,49 +523,19 @@ class SyncClient {
   int _lastSyncedSeqnum = 0;
   final Set<int> _pendingAcks = {};
 
-  /// Get the push channel topic from channels config (fallback to broadcastChannel).
-  String? get _pushChannelTopic {
-    final channels = config.channels;
-    if (channels != null) {
-      final ch = channels.where((c) => c.role == ChannelRole.push || c.role == ChannelRole.bidirectional).firstOrNull;
-      if (ch != null) return ch.topic;
-    }
-    return config.broadcastChannel;
-  }
+  /// Get all sync table names from all channels.
+  List<String> get _allSyncTables =>
+      config.channels.expand((c) => c.allTableNames).toSet().toList();
 
-  /// Get the pull channel topic from channels config (fallback to pullChannel or broadcastChannel).
-  String? get _pullChannelTopic {
-    final channels = config.channels;
-    if (channels != null) {
-      final ch = channels.where((c) => c.role == ChannelRole.pull || c.role == ChannelRole.bidirectional).firstOrNull;
-      if (ch != null) return ch.topic;
-    }
-    return config.pullChannel ?? config.broadcastChannel;
-  }
+  /// Get channels by role.
+  Iterable<SyncChannel> get _pushChannels =>
+      config.channels.where((c) => c.role == ChannelRole.push || c.role == ChannelRole.bidirectional);
 
-  /// Get all sync table names from channels config (fallback to autoSyncTables).
-  List<String> get _allSyncTables {
-    final channels = config.channels;
-    if (channels != null) {
-      return channels.expand((c) => c.allTableNames).toSet().toList();
-    }
-    return config.autoSyncTables ?? [];
-  }
+  Iterable<SyncChannel> get _pullChannels =>
+      config.channels.where((c) => c.role == ChannelRole.pull || c.role == ChannelRole.bidirectional);
   /// Track pending changes by local seqnum so we can update server seqnum on ack.
   /// Key is local seqnum from _synclib_changes, value is (table, rowId).
   final Map<int, ({String table, String rowId})> _pendingChangeInfo = {};
-
-  // Store channel subscription params for reconnection
-  String? _token;
-  bool _joinWorld = false;
-  List<String>? _zones;
-  List<String>? _guilds;
-  List<String>? _parties;
-
-  // Control whether periodic sync pulls from remote (initialized from config)
-  late bool _pullRemoteEnabled;
-  // Control whether periodic sync pushes local changes (initialized from config)
-  late bool _pushLocalEnabled;
 
   // Stream controller for remote change notifications
   final StreamController<ChangeMessage> _remoteChangeController = StreamController<ChangeMessage>.broadcast();
@@ -735,11 +612,12 @@ class SyncClient {
   StreamSubscription? _localChangeSubscription;
   Timer? _syncOnWriteDebounceTimer;
 
+  // Periodic background sync timer
+  Timer? _periodicSyncTimer;
+
   SyncReadyState _readyState = SyncReadyState.waitingForHello;
 
   SyncClient(this.config) {
-    _pullRemoteEnabled = config.pullRemote;
-    _pushLocalEnabled = config.pushLocal;
     _ws = WebSocketManager(
       url: config.serverUrl,
       codec: SyncCodecFactory.create(config.codec),
@@ -763,6 +641,7 @@ class SyncClient {
       _db = await SynclibDatabase.open(config.dbPath);
       _logger.info('Database opened: ${config.dbPath}');
     }
+    _merkle = MerkleComputer(_SynclibMerkleDb(_db!));
 
     // Subscribe to WebSocket messages
     _messageSubscription = _ws.messages.listen(_handleMessage);
@@ -789,17 +668,30 @@ class SyncClient {
 
     // Start a new debounce timer
     _syncOnWriteDebounceTimer = Timer(config.syncOnWriteDebounce, () {
-      _logger.fine('syncOnWrite: pushing changes after debounce');
-      if (config.useUnifiedSync) {
-        // Use unified sync - handles push, pull, and cleanup in one call
-        syncUnified().catchError((e) {
-          _logger.warning('syncOnWrite: syncUnified failed: $e');
-        });
-      } else {
-        // Legacy: just push local changes
-        _pushLocalChanges();
-      }
+      _logger.fine('syncOnWrite: syncing after debounce');
+      syncUnified().catchError((e) {
+        _logger.warning('syncOnWrite: syncUnified failed: $e');
+      });
     });
+  }
+
+  /// Start periodic background sync timer if configured.
+  void _startPeriodicSync() {
+    _stopPeriodicSync();
+    final interval = config.periodicSyncInterval;
+    if (interval == null) return;
+    _logger.info('Starting periodic sync every $interval');
+    _periodicSyncTimer = Timer.periodic(interval, (_) {
+      syncUnified().catchError((e) {
+        _logger.warning('Periodic sync failed: $e');
+      });
+    });
+  }
+
+  /// Stop periodic background sync timer.
+  void _stopPeriodicSync() {
+    _periodicSyncTimer?.cancel();
+    _periodicSyncTimer = null;
   }
 
   /// Connect to sync server
@@ -827,13 +719,6 @@ class SyncClient {
       await disconnect();
     }
 
-    // Store connection params for reconnection
-    _token = token;
-    _joinWorld = joinWorld;
-    _zones = zones;
-    _guilds = guilds;
-    _parties = parties;
-
     await _ws.connect(
       params: {
         'token': token,
@@ -844,15 +729,15 @@ class SyncClient {
   }
 
   /// Join all configured channels
-  // todo use initial channels
   Future<void> _joinChannels() async {
     // Clear channel states for fresh connection
     _channelStates.clear();
 
     // Get per-table seqnums if auto-sync is configured
+    final syncTables = _allSyncTables;
     Map<String, int>? tableSeqnums;
-    if (config.autoSyncTables != null && config.autoSyncTables!.isNotEmpty) {
-      tableSeqnums = await _getPerTableSeqnums(config.autoSyncTables!);
+    if (syncTables.isNotEmpty) {
+      tableSeqnums = await _getPerTableSeqnums(syncTables);
       _logger.info('Sending table seqnums on join: $tableSeqnums');
     }
 
@@ -860,8 +745,8 @@ class SyncClient {
     // This prevents timeouts from one channel's sync blocking the next join
     final joinResponses = <String, Map<String, dynamic>>{};
 
-    for (final channel in config.initialChannels) {
-      final topic = 'sync:${channel.channelName}:${channel.channelId}';
+    for (final channel in config.channels) {
+      final topic = channel.topic;
       _logger.info('Joining channel: $topic');
 
       // Create channel state
@@ -883,11 +768,6 @@ class SyncClient {
 
     _logger.info('All channels joined successfully');
     _hasConnectedOnce = true;
-    // Only start periodic timers if NOT using unified sync
-    // Unified sync handles push/pull in a single call, no timers needed
-    if (config.enablePeriodicSync && !config.useUnifiedSync) {
-      startPeriodicSync(pullRemote: _pullRemoteEnabled, pushLocal: _pushLocalEnabled);
-    }
     await _sendHello();
 
     // Store join responses for potential later auto-sync
@@ -906,14 +786,17 @@ class SyncClient {
         channelState.autoSyncComplete = true;
       }
     }
+
+    // Start periodic background sync if configured
+    _startPeriodicSync();
   }
 
   /// Handle join response from server, including stale tables
   Future<void> _handleJoinResponse(Map<String, dynamic> response, String channelTopic) async {
     final channelState = _channelStates[channelTopic];
 
-    // Skip if auto-sync not configured - mark channel as ready
-    if (config.autoSyncTables == null || config.autoSyncTables!.isEmpty) {
+    // Skip if no sync tables configured - mark channel as ready
+    if (_allSyncTables.isEmpty) {
       if (channelState != null) {
         channelState.autoSyncComplete = true;
       }
@@ -1018,31 +901,6 @@ class SyncClient {
     }
   }
 
-  /// Fail the auto-sync operation for a specific channel
-  void _failAutoSync(String channelTopic, String error) {
-    final channelState = _channelStates[channelTopic];
-    if (channelState == null) {
-      _logger.warning('Cannot fail auto-sync: channel $channelTopic not found');
-      return;
-    }
-
-    channelState.autoSyncInProgress = false;
-    channelState.autoSyncComplete = false; // Failed, not complete
-
-    _autoSyncController.add(AutoSyncEvent(
-      state: AutoSyncState.failed,
-      staleTables: channelState.staleTables,
-      channelTopic: channelTopic,
-      error: error,
-    ));
-
-    if (channelState.completer != null && !channelState.completer!.isCompleted) {
-      channelState.completer!.completeError(Exception(error));
-    }
-
-    _logger.warning('Auto-sync failed for $channelTopic: $error');
-  }
-
   /// Manually trigger auto-sync for stale tables.
   /// Use this when [SyncClientConfig.autoSyncOnConnect] is false
   /// and you want to run auto-sync after other initialization steps.
@@ -1083,37 +941,35 @@ class SyncClient {
 
   /// Join an additional channel after initial connection
   ///
-  /// Optionally provide [autoSyncTables] to check and auto-sync specific tables.
+  /// Tables to sync are derived from the channel's configured tables.
   /// If stale tables are found, they are automatically synced and an
   /// [AutoSyncEvent] is emitted on [autoSyncEvents].
   ///
   /// Example:
   /// ```dart
   /// await syncClient.joinChannel(
-  ///   SyncClientChannel(
-  ///     channelName: 'user',
-  ///     channelId: userId,
+  ///   SyncChannel(
+  ///     topic: 'sync:user:$userId',
+  ///     role: ChannelRole.push,
+  ///     tables: [SyncTable('videos'), SyncTable('users')],
   ///   ),
-  ///   autoSyncTables: ['videos', 'users'],
   /// );
   /// ```
-  Future<void> joinChannel(
-    SyncClientChannel channel, {
-    List<String>? autoSyncTables,
-  }) async {
+  Future<void> joinChannel(SyncChannel channel) async {
     if (!_ws.isConnected) {
       throw StateError('Not connected. Call connect() first.');
     }
 
-    final topic = 'sync:${channel.channelName}:${channel.channelId}';
+    final topic = channel.topic;
     _logger.info('Joining additional channel: $topic');
 
     // Create channel state for this dynamic channel
     _channelStates[topic] = ChannelSyncState(topic: topic);
 
-    // Get per-table seqnums if auto-sync tables are specified
+    // Get per-table seqnums if channel has tables
+    final autoSyncTables = channel.allTableNames;
     Map<String, int>? tableSeqnums;
-    if (autoSyncTables != null && autoSyncTables.isNotEmpty) {
+    if (autoSyncTables.isNotEmpty) {
       tableSeqnums = await _getPerTableSeqnums(autoSyncTables);
       _logger.info('Sending table seqnums on join: $tableSeqnums');
     }
@@ -1129,7 +985,7 @@ class SyncClient {
     _logger.info('Successfully joined channel: $topic');
 
     // Handle stale tables from server response (auto-sync if tables specified)
-    await _handleJoinResponseDynamic(response, topic, autoSyncTables);
+    await _handleJoinResponseDynamic(response, topic, autoSyncTables.isEmpty ? null : autoSyncTables);
   }
 
   /// Handle join response for dynamically joined channels
@@ -1180,14 +1036,13 @@ class SyncClient {
   /// Example:
   /// ```dart
   /// if (syncClient.isChannelJoined(
-  ///   SyncClientChannel(channelName: 'user', channelId: userId),
+  ///   SyncChannel(topic: 'sync:user:$userId', role: ChannelRole.push),
   /// )) {
   ///   _logger.info('Already joined');
   /// }
   /// ```
-  bool isChannelJoined(SyncClientChannel channel) {
-    final topic = 'sync:${channel.channelName}:${channel.channelId}';
-    return _ws.isChannelJoined(topic);
+  bool isChannelJoined(SyncChannel channel) {
+    return _ws.isChannelJoined(channel.topic);
   }
 
   /// Get all currently joined channel topics
@@ -1198,17 +1053,13 @@ class SyncClient {
   /// Example:
   /// ```dart
   /// await syncClient.leaveChannel(
-  ///   SyncClientChannel(
-  ///     channelName: 'user',
-  ///     channelId: 'anon',
-  ///   ),
+  ///   SyncChannel(topic: 'sync:user:anon', role: ChannelRole.push),
   /// );
   /// ```
-  Future<void> leaveChannel(SyncClientChannel channel) async {
-    final topic = 'sync:${channel.channelName}:${channel.channelId}';
-    _logger.info('Leaving channel: $topic');
-    await _ws.leaveChannel(topic);
-    _logger.info('Left channel: $topic');
+  Future<void> leaveChannel(SyncChannel channel) async {
+    _logger.info('Leaving channel: ${channel.topic}');
+    await _ws.leaveChannel(channel.topic);
+    _logger.info('Left channel: ${channel.topic}');
   }
 
   /// Leave a channel by its topic ID (e.g., "sync:user:123")
@@ -1275,14 +1126,14 @@ class SyncClient {
 
     // Wait for connected state
     final completer = Completer<void>();
-    StreamSubscription<ConnectionState>? sub;
+    late final StreamSubscription<ConnectionState> sub;
 
     sub = _ws.stateChanges.listen((state) {
       if (state == ConnectionState.connected) {
-        sub?.cancel();
+        sub.cancel();
         if (!completer.isCompleted) completer.complete();
       } else if (state == ConnectionState.failed || state == ConnectionState.authFailed) {
-        sub?.cancel();
+        sub.cancel();
         if (!completer.isCompleted) {
           completer.completeError(Exception('Reconnection failed: $state'));
         }
@@ -1294,56 +1145,14 @@ class SyncClient {
         throw TimeoutException('Timed out waiting for reconnection', timeout);
       });
     } finally {
-      await sub?.cancel();
+      await sub.cancel();
     }
   }
 
-  Future<void> syncOverTable(String table) async {
-    await _pushLocalChanges();
-    await _pullRemoteChangesForTable(table);
-  }
-
-  /// Manually trigger a sync cycle
-  ///
-  /// When useUnifiedSync is enabled (default), this calls syncUnified() which
-  /// handles push, pull, schema, and stripped content in one request.
-  /// Otherwise falls back to the legacy syncSafe() push/pull flow.
+  /// Manually trigger a sync cycle.
+  /// Calls syncUnified() which handles push, pull, schema, and stripped content.
   Future<void> sync() async {
-    if (config.useUnifiedSync) {
-      await syncUnified();
-    } else {
-      await syncSafe();
-    }
-  }
-
-  /// Push local changes to server (public API)
-  ///
-  /// Use this when you want to ensure local changes are sent to the server
-  /// without pulling remote changes that might overwrite pending edits.
-  Future<void> push() async {
-    await _pushLocalChanges();
-  }
-
-  /// Safely sync by waiting for push acks before pulling
-  ///
-  /// This prevents race conditions where you might pull stale data
-  /// before your local changes have been processed by the server.
-  Future<void> syncSafe({Duration timeout = const Duration(seconds: 10)}) async {
-    await _pushLocalChanges();
-
-    // Wait for all pending acks before pulling
-    if (_pendingAcks.isNotEmpty) {
-      final startTime = DateTime.now();
-      while (_pendingAcks.isNotEmpty) {
-        if (DateTime.now().difference(startTime) > timeout) {
-          _logger.warning('syncSafe: Timeout waiting for acks, ${_pendingAcks.length} still pending');
-          break;
-        }
-        await Future.delayed(const Duration(milliseconds: 50));
-      }
-    }
-
-    await _pullRemoteChanges();
+    await syncUnified();
   }
 
   // ==========================================================================
@@ -1455,16 +1264,12 @@ class SyncClient {
   /// This is the simplified sync handshake that replaces the multi-step flow
   /// of sendHello(), requestSnapshots(), runAutoSync(), etc.
   ///
-  /// [tables] - Specific tables to sync (null = all configured in autoSyncTables)
   /// [forceRefresh] - Tables to force refresh (ignore seqnums)
   /// [includeStripped] - Auto-detect and refresh stripped rows (default: true)
-  /// [channelTopic] - Channel to sync on (default: broadcastChannel)
   /// [cleanupLegacyChanges] - Clean up old synced=1 records from legacy sync (default: true on first run)
   Future<void> syncUnified({
-    List<String>? tables,
     List<String>? forceRefresh,
     bool includeStripped = true,
-    String? channelTopic,
     bool? cleanupLegacyChanges,
   }) async {
     if (!_ws.isConnected) {
@@ -1489,7 +1294,7 @@ class SyncClient {
       }
 
       // Determine which tables to sync
-      final tablesToSync = tables ?? _allSyncTables;
+      final tablesToSync = _allSyncTables;
       if (tablesToSync.isEmpty) {
         _logger.warning('syncUnified: No tables configured for sync');
         _isSyncing = false;
@@ -1542,108 +1347,118 @@ class SyncClient {
         _logger.warning('syncUnified: Auto-forcing refresh for ${corruptedTables.length} corrupted tables');
       }
 
-      // 5. Determine channels for push and pull
-      // Push uses user channel (where user has write permission)
-      // Pull uses tribe channel (where shared data lives)
-      final pushChannel = _pushChannelTopic;
-      final pullChannel = channelTopic ?? _pullChannelTopic;
-
-      // 6. If we have pending changes, push them first on user channel
+      // 5. Push pending changes to push channels
       String? streamId;
       if (pendingChangeMessages.isNotEmpty) {
-        _logger.info('syncUnified: Pushing ${pendingChangeMessages.length} changes on $pushChannel');
-        final pushRequest = SyncRequestMessage(
+        for (final channel in _pushChannels) {
+          // Filter pending changes to this channel's tables
+          final channelTableSet = channel.allTableNames.toSet();
+          final channelChanges = pendingChangeMessages
+              .where((c) => channelTableSet.contains(c.table))
+              .toList();
+          if (channelChanges.isEmpty) continue;
+
+          _logger.info('syncUnified: Pushing ${channelChanges.length} changes on ${channel.topic}');
+          final pushRequest = SyncRequestMessage(
+            clientId: config.clientId,
+            schemaVersion: schemaVersion,
+            tableSeqnums: {},  // No pull in push request
+            tables: [],
+            pendingChanges: channelChanges,
+          );
+
+          final pushResponse = await _ws.sendRaw('sync', pushRequest.toMap(), channelTopic: channel.topic);
+
+          if (pushResponse['status'] == 'ok') {
+            streamId = pushResponse['stream_id'] as String?;
+            _logger.info('syncUnified: Push complete on ${channel.topic}, stream_id=$streamId');
+          } else if (pushResponse['status'] == 'error') {
+            throw StateError('Push failed on ${channel.topic}: ${pushResponse['error']}');
+          }
+
+          // Store pending changes for ack processing
+          if (streamId != null) {
+            _activeSyncPendingChanges[streamId] = pendingChanges;
+          }
+        }
+      }
+
+      // 6. Pull data from each channel (all channels may have data to pull)
+      for (final channel in config.channels) {
+        final channelTableNames = channel.allTableNames;
+        if (channelTableNames.isEmpty) continue;
+
+        // Build per-channel table seqnums and force refresh
+        final channelTableSet = channelTableNames.toSet();
+        final channelSeqnums = Map.fromEntries(
+          tableSeqnums.entries.where((e) => channelTableSet.contains(e.key))
+        );
+        final channelForceRefresh = effectiveForceRefresh
+            .where((t) => channelTableSet.contains(t))
+            .toList();
+        final channelStrippedRows = strippedRows
+            ?.where((r) => channelTableSet.contains(r.table))
+            .toList();
+
+        _logger.info('syncUnified: Pulling ${channelTableNames.join(', ')} on ${channel.topic} (schema v$schemaVersion)');
+        final pullRequest = SyncRequestMessage(
           clientId: config.clientId,
           schemaVersion: schemaVersion,
-          tableSeqnums: {},  // No pull in push request
-          tables: [],
-          pendingChanges: pendingChangeMessages,
+          tableSeqnums: channelSeqnums,
+          tables: channelTableNames,
+          forceRefreshTables: channelForceRefresh.isNotEmpty ? channelForceRefresh : null,
+          strippedRows: channelStrippedRows?.isNotEmpty == true ? channelStrippedRows : null,
+          pendingChanges: null,
         );
 
-        final pushResponse = await _ws.sendRaw('sync', pushRequest.toMap(), channelTopic: pushChannel);
+        final response = await _ws.sendRaw('sync', pullRequest.toMap(), channelTopic: channel.topic);
 
-        // Handle push response
-        if (pushResponse['status'] == 'ok') {
-          streamId = pushResponse['stream_id'] as String?;
-          _logger.info('syncUnified: Push complete, stream_id=$streamId');
-        } else if (pushResponse['status'] == 'error') {
-          throw StateError('Push failed: ${pushResponse['error']}');
+        // Check if schema upgrade is required
+        if (response['status'] == 'schema_upgrade_required') {
+          final targetVersion = response['target_version'] as int;
+          _logger.info('syncUnified: Schema upgrade required to v$targetVersion');
+          _emitSyncProgress(const SyncProgress(phase: 'migrating'));
+
+          await _applyMigrations({
+            'current_version': targetVersion,
+            'migrations': response['migrations'],
+          });
+
+          _logger.info('syncUnified: Schema upgraded to v$targetVersion, restarting sync');
+
+          _isSyncing = false;
+          return syncUnified(
+            forceRefresh: forceRefresh,
+            includeStripped: includeStripped,
+            cleanupLegacyChanges: false,
+          );
         }
 
-        // Store pending changes for ack processing
-        if (streamId != null) {
-          _activeSyncPendingChanges[streamId] = pendingChanges;
+        if (response['status'] == 'error') {
+          throw StateError('Sync error on ${channel.topic}: ${response['error']}');
         }
-      }
 
-      // 7. Pull data on tribe channel
-      _logger.info('syncUnified: Pulling on $pullChannel (schema v$schemaVersion)');
-      final pullRequest = SyncRequestMessage(
-        clientId: config.clientId,
-        schemaVersion: schemaVersion,
-        tableSeqnums: tableSeqnums,
-        tables: tablesToSync,
-        forceRefreshTables: effectiveForceRefresh.isNotEmpty ? effectiveForceRefresh : null,
-        strippedRows: strippedRows?.isNotEmpty == true ? strippedRows : null,
-        pendingChanges: null,  // No push in pull request
-      );
+        // Wait for this channel's pull stream to complete
+        final pullStreamId = response['stream_id'] as String?;
+        if (pullStreamId == null) {
+          throw StateError('Server did not return stream_id for ${channel.topic}');
+        }
 
-      final response = await _ws.sendRaw('sync', pullRequest.toMap(), channelTopic: pullChannel);
+        _logger.info('syncUnified: Got pull stream_id $pullStreamId for ${channel.topic}, waiting for data');
+        streamId = pullStreamId;
 
-      // 8. Check if schema upgrade is required FIRST
-      if (response['status'] == 'schema_upgrade_required') {
-        final targetVersion = response['target_version'] as int;
-        _logger.info('syncUnified: Schema upgrade required to v$targetVersion');
-        _emitSyncProgress(const SyncProgress(phase: 'migrating'));
+        final completer = Completer<void>();
+        _activeSyncCompleters[streamId] = completer;
 
-        // Apply migrations synchronously (this also sends schema_migrated confirmation)
-        await _applyMigrations({
-          'current_version': targetVersion,
-          'migrations': response['migrations'],
-        });
-
-        _logger.info('syncUnified: Schema upgraded to v$targetVersion, restarting sync');
-
-        // Recursively call sync with updated schema (don't cleanup again)
-        _isSyncing = false;
-        return syncUnified(
-          tables: tables,
-          forceRefresh: forceRefresh,
-          includeStripped: includeStripped,
-          channelTopic: channelTopic,
-          cleanupLegacyChanges: false,
+        await completer.future.timeout(
+          const Duration(minutes: 5),
+          onTimeout: () {
+            _activeSyncCompleters.remove(streamId);
+            _activeSyncPendingChanges.remove(streamId);
+            throw TimeoutException('Unified sync timed out on ${channel.topic}', const Duration(minutes: 5));
+          },
         );
       }
-
-      // 9. Handle error responses
-      if (response['status'] == 'error') {
-        throw StateError('Sync error: ${response['error']}');
-      }
-
-      // 10. Get stream_id from pull response and set up completer for streamed response
-      final pullStreamId = response['stream_id'] as String?;
-      if (pullStreamId == null) {
-        throw StateError('Server did not return stream_id');
-      }
-
-      _logger.info('syncUnified: Got pull stream_id $pullStreamId, waiting for streamed data');
-
-      // Use the pull stream_id for tracking (push acks come on their own stream if any)
-      streamId = pullStreamId;
-
-      // Create completer for this sync operation
-      final completer = Completer<void>();
-      _activeSyncCompleters[streamId] = completer;
-
-      // Wait for sync_complete message
-      await completer.future.timeout(
-        const Duration(minutes: 5),
-        onTimeout: () {
-          _activeSyncCompleters.remove(streamId);
-          _activeSyncPendingChanges.remove(streamId);
-          throw TimeoutException('Unified sync timed out', const Duration(minutes: 5));
-        },
-      );
 
       // Check if Merkle verification is needed (staleness check)
       // Run in background - don't block sync completion
@@ -1900,89 +1715,6 @@ class SyncClient {
   // END SIMPLIFIED SYNC HANDSHAKE
   // ==========================================================================
 
-  /// Push local changes to server
-  Future<void> _pushLocalChanges() async {
-    if (!_ws.isConnected) return;
-
-    try {
-      final changes = await _db!.getPendingChanges(limit: config.pushBatchSize);
-      if (changes.isEmpty) {
-        _logger.fine('No pending changes to push');
-        return;
-      }
-
-      _logger.info('Pushing ${changes.length} changes');
-
-      final messages = changes.map((c) => ChangeMessage.fromChange(c)).toList();
-      final batch = ChangesBatchMessage(
-        changes: messages,
-        fromSeqnum: changes.first.seqnum,
-        toSeqnum: changes.last.seqnum,
-      );
-
-      await _ws.send(batch, channelTopic: config.broadcastChannel);
-
-      // Track pending acks and change info for server seqnum updates
-      for (final change in changes) {
-        _pendingAcks.add(change.seqnum);
-        _pendingChangeInfo[change.seqnum] = (table: change.tableName, rowId: change.rowId);
-      }
-    } catch (e, stack) {
-      _logger.severe('Failed to push changes: $e', e, stack);
-    }
-  }
-
-  /// Request remote changes from server
-  Future<void> _pullRemoteChangesForTable(String table) async {
-    if (!_ws.isConnected) return;
-
-    // Don't pull until client is ready (hello received, migrations applied)
-    if (!isReady) {
-      _logger.fine('Skipping pull for $table - client not ready yet (state: $_readyState)');
-      return;
-    }
-
-    if (_lastSyncedSeqnum == 0) {
-      _lastSyncedSeqnum = await _getMaxSeqnumFromTable(table) ?? 0; // seqnum is global across all tables. we have anything under the max
-    }
-
-    try {
-      final request = RequestChangesMessage(
-        sinceSeqnum: _lastSyncedSeqnum,
-        table: table
-      );
-      // Use pullChannel if specified, otherwise fall back to broadcastChannel
-      final channelTopic = config.pullChannel ?? config.broadcastChannel;
-      await _ws.send(request, channelTopic: channelTopic);
-      _logger.fine('Requested remote changes since $_lastSyncedSeqnum on channel $channelTopic');
-    } catch (e) {
-      _logger.severe('Failed to request changes: $e');
-    }
-  }
-
-  /// Request remote changes from server
-  Future<void> _pullRemoteChanges() async {
-    if (!_ws.isConnected) return;
-
-    // Don't pull until client is ready (hello received, migrations applied)
-    if (!isReady) {
-      _logger.fine('Skipping pull - client not ready yet (state: $_readyState)');
-      return;
-    }
-
-    try {
-      final request = RequestChangesMessage(
-        sinceSeqnum: _lastSyncedSeqnum ?? 0,
-      );
-      // Use pullChannel if specified, otherwise fall back to broadcastChannel
-      final channelTopic = config.pullChannel ?? config.broadcastChannel;
-      await _ws.send(request, channelTopic: channelTopic);
-      _logger.fine('Requested remote changes since $_lastSyncedSeqnum on channel $channelTopic');
-    } catch (e) {
-      _logger.severe('Failed to request changes: $e');
-    }
-  }
-
   /// Send hello message to server
   Future<void> _sendHello() async {
     // Get current schema version from database
@@ -1994,7 +1726,7 @@ class SyncClient {
       schemaVersion: schemaVersion,
       metadata: config.metadata,
     );
-    await _ws.send(hello, channelTopic: config.broadcastChannel);
+    await _ws.send(hello, channelTopic: config.channels.first.topic);
     _logger.info('Sent hello message with schema version $schemaVersion');
   }
 
@@ -2459,7 +2191,7 @@ class SyncClient {
 
     // Confirm migration to server
     final confirm = SchemaConfirmMessage(version: currentVersion);
-    await _ws.send(confirm, channelTopic: config.broadcastChannel);
+    await _ws.send(confirm, channelTopic: config.channels.first.topic);
 
     _logger.info('Confirmed schema migration to server');
   }
@@ -2486,85 +2218,13 @@ class SyncClient {
         break;
       case ConnectionState.disconnected:
       case ConnectionState.failed:
-        _updateSyncState(SyncState.disconnected);
         _stopPeriodicSync();
+        _updateSyncState(SyncState.disconnected);
         break;
       case ConnectionState.authFailed:
         _updateSyncState(SyncState.error);
         break;
     }
-  }
-
-  /// Start periodic sync timers
-  ///
-  /// [pullRemote] - If false, only pushes local changes periodically (no pull).
-  /// Defaults to true.
-  /// [pushLocal] - If false, only pulls remote changes periodically (no push).
-  /// Defaults to true.
-  void startPeriodicSync({bool pullRemote = true, bool pushLocal = true}) {
-    _pullRemoteEnabled = pullRemote;
-    _pushLocalEnabled = pushLocal;
-
-    if (config.pushInterval != null && _pushLocalEnabled) {
-      _pushTimer?.cancel();
-      _pushTimer = Timer.periodic(config.pushInterval!, (_) => _pushLocalChanges());
-    } else if (!_pushLocalEnabled) {
-      _pushTimer?.cancel();
-      _pushTimer = null;
-    }
-
-    if (config.pullInterval != null && _pullRemoteEnabled) {
-      _pullTimer?.cancel();
-      _pullTimer = Timer.periodic(config.pullInterval!, (_) => _pullRemoteChanges());
-    } else if (!_pullRemoteEnabled) {
-      _pullTimer?.cancel();
-      _pullTimer = null;
-    }
-
-  }
-
-  /// Update whether periodic sync should pull from remote
-  ///
-  /// Can be called at any time to enable/disable remote pulling.
-  set pullRemoteEnabled(bool enabled) {
-    if (_pullRemoteEnabled == enabled) return;
-    _pullRemoteEnabled = enabled;
-
-    if (enabled && config.pullInterval != null) {
-      _pullTimer?.cancel();
-      _pullTimer = Timer.periodic(config.pullInterval!, (_) => _pullRemoteChanges());
-    } else if (!enabled) {
-      _pullTimer?.cancel();
-      _pullTimer = null;
-    }
-  }
-
-  bool get pullRemoteEnabled => _pullRemoteEnabled;
-
-  /// Update whether periodic sync should push local changes
-  ///
-  /// Can be called at any time to enable/disable local pushing.
-  set pushLocalEnabled(bool enabled) {
-    if (_pushLocalEnabled == enabled) return;
-    _pushLocalEnabled = enabled;
-
-    if (enabled && config.pushInterval != null) {
-      _pushTimer?.cancel();
-      _pushTimer = Timer.periodic(config.pushInterval!, (_) => _pushLocalChanges());
-    } else if (!enabled) {
-      _pushTimer?.cancel();
-      _pushTimer = null;
-    }
-  }
-
-  bool get pushLocalEnabled => _pushLocalEnabled;
-
-  /// Stop periodic sync timers
-  void _stopPeriodicSync() {
-    _pushTimer?.cancel();
-    _pushTimer = null;
-    _pullTimer?.cancel();
-    _pullTimer = null;
   }
 
   /// Generate SQL statement from change message
@@ -3013,13 +2673,9 @@ class SyncClient {
   /// Called at the end of syncUnified to run verification if interval has elapsed.
   Future<void> _checkMerkleVerification() async {
     // Determine if any tables are configured for verification
-    final hasChannels = config.channels?.any((c) => c.tables.isNotEmpty) ?? false;
-    final hasPullTables = config.merkleVerifyPullTables?.isNotEmpty ?? false;
-    final hasPushTables = config.merkleVerifyPushTables?.isNotEmpty ?? false;
-    final hasLegacyTables = config.merkleVerifyTables?.isNotEmpty ?? false;
+    final hasChannels = config.channels.any((c) => c.tables.isNotEmpty);
 
-    if (config.merkleVerifyInterval == null ||
-        (!hasChannels && !hasPullTables && !hasPushTables && !hasLegacyTables)) {
+    if (config.merkleVerifyInterval == null || !hasChannels) {
       return;
     }
 
@@ -3069,13 +2725,7 @@ class SyncClient {
       final blockSize = _serverMerkleBlockSize ?? _defaultMerkleBlockSize;
       final allRepairedTables = <String>[];
 
-      if (hasChannels) {
-        // New path: use channels config with per-table repair directions
-        await _merkleVerifyFromChannels(config.channels!, blockSize, allRepairedTables);
-      } else {
-        // Legacy path: use old broadcastChannel/pullChannel fields
-        await _merkleVerifyLegacy(blockSize, allRepairedTables);
-      }
+      await _merkleVerifyFromChannels(config.channels, blockSize, allRepairedTables);
 
       // Update last verified timestamp in metadata
       await _db!.exec(
@@ -3101,7 +2751,7 @@ class SyncClient {
   /// Merkle verification using the new channels config.
   /// Verifies all tables per channel, then dispatches repair by direction.
   Future<void> _merkleVerifyFromChannels(
-    List<SyncChannelType> channels,
+    List<SyncChannel> channels,
     int blockSize,
     List<String> allRepairedTables,
   ) async {
@@ -3150,46 +2800,6 @@ class SyncClient {
     }
   }
 
-  /// Legacy merkle verification using old config fields (backward compat).
-  Future<void> _merkleVerifyLegacy(
-    int blockSize,
-    List<String> allRepairedTables,
-  ) async {
-    // Verify pull channel tables (tribe tables)
-    final pullTables = config.merkleVerifyPullTables ?? config.merkleVerifyTables;
-    final pullChannel = config.pullChannel ?? config.broadcastChannel;
-    if (pullTables != null && pullTables.isNotEmpty && pullChannel != null) {
-      try {
-        _logger.fine('Merkle verification on pull channel: $pullChannel');
-        final repairedTables = await verifyIntegrity(
-          tables: pullTables,
-          blockSize: blockSize,
-          channelTopic: pullChannel,
-        );
-        allRepairedTables.addAll(repairedTables);
-      } catch (e) {
-        _logger.warning('Merkle verification failed on pull channel: $e');
-      }
-    }
-
-    // Verify push/broadcast channel tables (user tables)
-    final pushTables = config.merkleVerifyPushTables;
-    final pushChannel = config.broadcastChannel;
-    if (pushTables != null && pushTables.isNotEmpty && pushChannel != null && pushChannel != pullChannel) {
-      try {
-        _logger.fine('Merkle verification on push channel: $pushChannel');
-        final repairedTables = await verifyIntegrity(
-          tables: pushTables,
-          blockSize: blockSize,
-          channelTopic: pushChannel,
-        );
-        allRepairedTables.addAll(repairedTables);
-      } catch (e) {
-        _logger.warning('Merkle verification failed on push channel: $e');
-      }
-    }
-  }
-
   /// Verify data integrity using Merkle trees.
   ///
   /// Compares local Merkle roots against server and repairs any mismatched blocks.
@@ -3227,7 +2837,7 @@ class SyncClient {
     final tableHashes = <String, MerkleTableInfo>{};
     for (final table in tables) {
       try {
-        final merkleInfo = await _db!.merkleRoot(table, blockSize: blockSize);
+        final merkleInfo = await _merkle!.merkleRoot(table, blockSize: blockSize);
         tableHashes[table] = MerkleTableInfo(
           rootHash: merkleInfo.rootHash,
           blockCount: merkleInfo.blockCount,
@@ -3246,7 +2856,6 @@ class SyncClient {
     if (tableHashes.isEmpty) return [];
 
     // Send verification request to server
-    final channel = channelTopic ?? _pullChannelTopic;
     final payload = <String, dynamic>{
       'table_hashes': tableHashes.map((table, info) => MapEntry(table, {
         'root_hash': info.rootHash,
@@ -3256,7 +2865,7 @@ class SyncClient {
       'block_size': blockSize,
     };
 
-    final responseMap = await _ws.sendRaw('merkle_verify', payload, channelTopic: channel);
+    final responseMap = await _ws.sendRaw('merkle_verify', payload, channelTopic: channelTopic);
     final response = MerkleVerifyResponse.fromMap(responseMap);
 
     if (response.isOk) {
@@ -3288,7 +2897,7 @@ class SyncClient {
     final tableHashes = <String, MerkleTableInfo>{};
     for (final table in tablesToVerify) {
       try {
-        final merkleInfo = await _db!.merkleRoot(table, blockSize: blockSize);
+        final merkleInfo = await _merkle!.merkleRoot(table, blockSize: blockSize);
         tableHashes[table] = MerkleTableInfo(
           rootHash: merkleInfo.rootHash,
           blockCount: merkleInfo.blockCount,
@@ -3311,8 +2920,6 @@ class SyncClient {
     }
 
     // 2. Send verification request to server
-    final channel = channelTopic ?? _pullChannelTopic;
-
     // Build payload matching MerkleVerifyMessage structure
     final payload = <String, dynamic>{
       'table_hashes': tableHashes.map((table, info) => MapEntry(table, {
@@ -3324,7 +2931,7 @@ class SyncClient {
     };
 
     try {
-      final responseMap = await _ws.sendRaw('merkle_verify', payload, channelTopic: channel);
+      final responseMap = await _ws.sendRaw('merkle_verify', payload, channelTopic: channelTopic);
       _logger.fine('verifyIntegrity: Response received: $responseMap');
       final response = MerkleVerifyResponse.fromMap(responseMap);
 
@@ -3346,7 +2953,7 @@ class SyncClient {
         await _repairTablePull(
           mismatch.table,
           blockSize,
-          channelTopic: channel,
+          channelTopic: channelTopic,
         );
         repairedTables.add(mismatch.table);
       }
@@ -3367,7 +2974,7 @@ class SyncClient {
     String? channelTopic,
   }) async {
     // 1. Get block hashes
-    final blockHashes = await _db!.merkleBlockHashes(table, blockSize: blockSize);
+    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize);
     _logger.fine('verifyIntegrity: $table has ${blockHashes.length} blocks');
 
     // 2. Send block hashes to server to find differences
@@ -3420,7 +3027,7 @@ class SyncClient {
       final response = MerkleFetchBlocksResponse.fromMap(responseMap);
 
       // Get existing row IDs in this block to detect deletions
-      final existingRowIds = await _db!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
+      final existingRowIds = await _merkle!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
       final serverRowIds = response.rows.map((r) => r['id']?.toString() ?? '').toSet();
 
       // Use bulk operations for efficiency (no individual logging)
@@ -3489,7 +3096,7 @@ class SyncClient {
     String? channelTopic,
   }) async {
     // 1. Get block hashes and find differing blocks (same as pull)
-    final blockHashes = await _db!.merkleBlockHashes(table, blockSize: blockSize);
+    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize);
     _logger.fine('repairPush: $table has ${blockHashes.length} blocks');
 
     final payload = <String, dynamic>{
@@ -3531,7 +3138,7 @@ class SyncClient {
     String? channelTopic,
   }) async {
     // Read local row IDs for this block
-    final rowIds = await _db!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
+    final rowIds = await _merkle!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
 
     // Read full row data for each ID
     final rows = <Map<String, dynamic>>[];
@@ -3582,7 +3189,7 @@ class SyncClient {
     String? channelTopic,
   }) async {
     // 1. Get block hashes and find differing blocks (same as pull/push)
-    final blockHashes = await _db!.merkleBlockHashes(table, blockSize: blockSize);
+    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize);
     _logger.fine('repairLww: $table has ${blockHashes.length} blocks');
 
     final payload = <String, dynamic>{
@@ -3624,7 +3231,7 @@ class SyncClient {
     String? channelTopic,
   }) async {
     // Read local rows for this block
-    final rowIds = await _db!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
+    final rowIds = await _merkle!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
     final localRows = <Map<String, dynamic>>[];
     for (final rowId in rowIds) {
       final rowData = await _db!.read(

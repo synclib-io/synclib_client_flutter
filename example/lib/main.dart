@@ -55,10 +55,15 @@ class _MyAppState extends State<MyApp> {
         dbPath: dbPath,
         serverUrl: 'ws://localhost:4000/socket/websocket', // Your Elixir server
         clientId: 'client1',
-        userId: userId, // User-specific channel for scalability
+        channels: [
+          sync.SyncChannel(
+            topic: 'sync:user:$userId',
+            role: sync.ChannelRole.push,
+            tables: [sync.SyncTable('journal_entries')],
+          ),
+        ],
         codec: sync.SyncCodecType.messagepack, // Or sync.SyncCodecType.json
-        pushInterval: const Duration(seconds: 5),
-        pullInterval: null, // Reactive mode - server pushes changes
+        periodicSyncInterval: const Duration(seconds: 30),
         onConflict: _resolveConflict,
         metadata: {
           'device': 'mobile',
@@ -403,6 +408,7 @@ class _MyAppState extends State<MyApp> {
       case sync.ConnectionState.disconnected:
         return Colors.grey;
       case sync.ConnectionState.failed:
+      case sync.ConnectionState.authFailed:
         return Colors.red;
     }
   }
