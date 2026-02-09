@@ -1354,6 +1354,97 @@ class MerkleFetchBlocksResponse extends SyncMessage {
   }
 }
 
+/// Server response to merkle_push_blocks (client → server push repair).
+class MerklePushBlocksResponse extends SyncMessage {
+  final String table;
+  final int blockIndex;
+  final int applied;
+  final int rejected;
+  final int deleted;
+  final List<Map<String, dynamic>> errors;
+
+  const MerklePushBlocksResponse({
+    required this.table,
+    required this.blockIndex,
+    required this.applied,
+    required this.rejected,
+    required this.deleted,
+    this.errors = const [],
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'merkle_push_blocks_response',
+    'table': table,
+    'block_index': blockIndex,
+    'applied': applied,
+    'rejected': rejected,
+    'deleted': deleted,
+    'errors': errors,
+  };
+
+  factory MerklePushBlocksResponse.fromMap(Map<String, dynamic> map) {
+    final errorsRaw = map['errors'] as List? ?? [];
+    return MerklePushBlocksResponse(
+      table: map['table'] as String? ?? '',
+      blockIndex: map['block_index'] as int? ?? 0,
+      applied: map['applied'] as int? ?? 0,
+      rejected: map['rejected'] as int? ?? 0,
+      deleted: map['deleted'] as int? ?? 0,
+      errors: errorsRaw.map((e) => Map<String, dynamic>.from(e as Map)).toList(),
+    );
+  }
+}
+
+/// Server response to merkle_lww_blocks (last-write-wins resolution).
+class MerkleLwwBlocksResponse extends SyncMessage {
+  final String table;
+  final int blockIndex;
+
+  /// Row IDs where the client had a newer last_modified_ms and server accepted.
+  final List<String> clientWins;
+
+  /// Full row data for rows where the server had a newer last_modified_ms.
+  /// Client should overwrite local data with these.
+  final List<Map<String, dynamic>> serverWins;
+
+  final int appliedFromClient;
+  final int sentToClient;
+
+  const MerkleLwwBlocksResponse({
+    required this.table,
+    required this.blockIndex,
+    this.clientWins = const [],
+    this.serverWins = const [],
+    this.appliedFromClient = 0,
+    this.sentToClient = 0,
+  });
+
+  @override
+  Map<String, dynamic> toMap() => {
+    'type': 'merkle_lww_blocks_response',
+    'table': table,
+    'block_index': blockIndex,
+    'client_wins': clientWins,
+    'server_wins': serverWins,
+    'applied_from_client': appliedFromClient,
+    'sent_to_client': sentToClient,
+  };
+
+  factory MerkleLwwBlocksResponse.fromMap(Map<String, dynamic> map) {
+    final serverWinsRaw = map['server_wins'] as List? ?? [];
+    final clientWinsRaw = map['client_wins'] as List? ?? [];
+    return MerkleLwwBlocksResponse(
+      table: map['table'] as String? ?? '',
+      blockIndex: map['block_index'] as int? ?? 0,
+      clientWins: clientWinsRaw.map((e) => e.toString()).toList(),
+      serverWins: serverWinsRaw.map((r) => Map<String, dynamic>.from(r as Map)).toList(),
+      appliedFromClient: map['applied_from_client'] as int? ?? 0,
+      sentToClient: map['sent_to_client'] as int? ?? 0,
+    );
+  }
+}
+
 // ============================================================================
 // END MERKLE TREE INTEGRITY VERIFICATION PROTOCOL MESSAGES
 // ============================================================================

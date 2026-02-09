@@ -294,6 +294,114 @@ class SyncClientChannel {
   });
 }
 
+/// Direction of repair when data differs between client and server.
+/// Applies to both seqnum-based sync and merkle tree verification.
+enum RepairDirection {
+  /// Server is authoritative. Client overwrites local data with server data.
+  /// Use for: tribe/shared tables, read-only content.
+  pull,
+
+  /// Client is authoritative. Client sends its rows to server.
+  /// Use for: user-owned tables (journal entries, measurements, etc.)
+  push,
+
+  /// Last-write-wins. Compare last_modified_ms per row;
+  /// newer version overwrites in either direction.
+  /// Use for: tables where both client and server can modify rows.
+  lww,
+}
+
+/// Role of a channel in sync topology.
+enum ChannelRole {
+  /// Client pushes its own data on this channel (e.g., user channel).
+  push,
+
+  /// Client pulls shared data from this channel (e.g., tribe channel).
+  pull,
+
+  /// Channel supports both push and pull.
+  bidirectional,
+}
+
+/// A table associated with a sync channel.
+///
+/// [direction] overrides the channel's default repair direction (derived from
+/// [ChannelRole]) for this specific table. If null, the channel default is used.
+class SyncTable {
+  final String name;
+
+  /// Per-table repair direction override. When null, defaults to the channel
+  /// role's implied direction (push channel → push, pull channel → pull,
+  /// bidirectional → lww).
+  final RepairDirection? direction;
+
+  const SyncTable(this.name, {this.direction});
+  const SyncTable.pull(this.name) : direction = RepairDirection.pull;
+  const SyncTable.push(this.name) : direction = RepairDirection.push;
+  const SyncTable.lww(this.name) : direction = RepairDirection.lww;
+}
+
+/// Defines a sync channel: its topic, role, and associated tables.
+///
+/// Used for both seqnum-based sync (which tables to push/pull) and merkle
+/// tree verification (which tables to verify and how to repair).
+///
+/// Replaces the scattered broadcastChannel/pullChannel/merkleVerifyPullTables/
+/// merkleVerifyPushTables fields in [SyncClientConfig].
+///
+/// Example:
+/// ```dart
+/// SyncChannelType(
+///   topic: 'sync:tribe:$tribeId',
+///   role: ChannelRole.pull,
+///   tables: [
+///     SyncTable('exercises'),  // inherits pull from channel role
+///     SyncTable('workouts'),
+///   ],
+/// )
+/// ```
+class SyncChannelType {
+  /// The Phoenix channel topic (e.g., "sync:tribe:trainer123", "sync:user:user456")
+  final String topic;
+
+  /// Role of this channel in the sync topology.
+  final ChannelRole role;
+
+  /// Tables on this channel. Used for both seqnum sync and merkle verification.
+  /// Each table's repair direction defaults to the channel role if not overridden.
+  final List<SyncTable> tables;
+
+  const SyncChannelType({
+    required this.topic,
+    required this.role,
+    this.tables = const [],
+  });
+
+  /// Default repair direction implied by this channel's role.
+  RepairDirection get defaultDirection {
+    switch (role) {
+      case ChannelRole.push:
+        return RepairDirection.push;
+      case ChannelRole.pull:
+        return RepairDirection.pull;
+      case ChannelRole.bidirectional:
+        return RepairDirection.lww;
+    }
+  }
+
+  /// Get the effective repair direction for a table, using the table's
+  /// override if set, otherwise the channel's default.
+  RepairDirection directionFor(SyncTable table) =>
+      table.direction ?? defaultDirection;
+
+  /// Get table names for a specific repair direction (accounting for defaults).
+  List<String> tablesForDirection(RepairDirection d) =>
+      tables.where((t) => directionFor(t) == d).map((t) => t.name).toList();
+
+  /// Get all table names in this channel.
+  List<String> get allTableNames => tables.map((t) => t.name).toList();
+}
+
 /// Tracks the sync state of an individual channel
 class ChannelSyncState {
   final String topic;
@@ -418,21 +526,44 @@ class SyncClientConfig {
   /// Defaults to true for new clients.
   final bool useUnifiedSync;
 
+  /// Sync channel types with per-table merkle repair directions.
+  ///
+  /// This is the preferred way to configure channels. When set, it replaces
+  /// [broadcastChannel], [pullChannel], [merkleVerifyPullTables],
+  /// [merkleVerifyPushTables], and [autoSyncTables].
+  ///
+  /// Example:
+  /// ```dart
+  /// channels: [
+  ///   SyncChannelType(
+  ///     topic: 'sync:user:$userId',
+  ///     role: ChannelRole.push,
+  ///     tables: [SyncTable('journal_entries')],  // inherits push from channel role
+  ///   ),
+  ///   SyncChannelType(
+  ///     topic: 'sync:tribe:$tribeId',
+  ///     role: ChannelRole.pull,
+  ///     tables: [SyncTable('exercises')],  // inherits pull from channel role
+  ///   ),
+  /// ]
+  /// ```
+  final List<SyncChannelType>? channels;
+
   /// Interval for periodic Merkle integrity verification.
   /// When set, the client will periodically verify data integrity
   /// for the specified tables using Merkle tree comparison.
   /// Defaults to null (disabled).
   final Duration? merkleVerifyInterval;
 
+  /// @Deprecated('Use channels instead')
   /// Tables to verify on the pull channel during Merkle integrity checks.
-  /// These are typically "tribe" tables that the user pulls from a shared channel.
   final List<String>? merkleVerifyPullTables;
 
+  /// @Deprecated('Use channels instead')
   /// Tables to verify on the broadcast/push channel during Merkle integrity checks.
-  /// These are typically "user" tables that belong to the user's own channel.
   final List<String>? merkleVerifyPushTables;
 
-  /// @deprecated Use merkleVerifyPullTables and merkleVerifyPushTables instead.
+  /// @Deprecated('Use channels instead')
   /// If set, tables are verified on the default channel (pullChannel or broadcastChannel).
   final List<String>? merkleVerifyTables;
 
@@ -458,6 +589,7 @@ class SyncClientConfig {
     this.autoSyncTables,
     this.autoSyncOnConnect = true,
     this.useUnifiedSync = true,
+    this.channels,
     this.merkleVerifyInterval,
     this.merkleVerifyPullTables,
     this.merkleVerifyPushTables,
@@ -483,6 +615,35 @@ class SyncClient {
   bool _hasConnectedOnce = false;
   int _lastSyncedSeqnum = 0;
   final Set<int> _pendingAcks = {};
+
+  /// Get the push channel topic from channels config (fallback to broadcastChannel).
+  String? get _pushChannelTopic {
+    final channels = config.channels;
+    if (channels != null) {
+      final ch = channels.where((c) => c.role == ChannelRole.push || c.role == ChannelRole.bidirectional).firstOrNull;
+      if (ch != null) return ch.topic;
+    }
+    return config.broadcastChannel;
+  }
+
+  /// Get the pull channel topic from channels config (fallback to pullChannel or broadcastChannel).
+  String? get _pullChannelTopic {
+    final channels = config.channels;
+    if (channels != null) {
+      final ch = channels.where((c) => c.role == ChannelRole.pull || c.role == ChannelRole.bidirectional).firstOrNull;
+      if (ch != null) return ch.topic;
+    }
+    return config.pullChannel ?? config.broadcastChannel;
+  }
+
+  /// Get all sync table names from channels config (fallback to autoSyncTables).
+  List<String> get _allSyncTables {
+    final channels = config.channels;
+    if (channels != null) {
+      return channels.expand((c) => c.allTableNames).toSet().toList();
+    }
+    return config.autoSyncTables ?? [];
+  }
   /// Track pending changes by local seqnum so we can update server seqnum on ack.
   /// Key is local seqnum from _synclib_changes, value is (table, rowId).
   final Map<int, ({String table, String rowId})> _pendingChangeInfo = {};
@@ -1328,7 +1489,7 @@ class SyncClient {
       }
 
       // Determine which tables to sync
-      final tablesToSync = tables ?? config.autoSyncTables ?? [];
+      final tablesToSync = tables ?? _allSyncTables;
       if (tablesToSync.isEmpty) {
         _logger.warning('syncUnified: No tables configured for sync');
         _isSyncing = false;
@@ -1382,10 +1543,10 @@ class SyncClient {
       }
 
       // 5. Determine channels for push and pull
-      // Push uses broadcastChannel (user channel) - where user has write permission
-      // Pull uses pullChannel (tribe channel) - where tribe query builders exist
-      final pushChannel = config.broadcastChannel;
-      final pullChannel = channelTopic ?? config.pullChannel ?? config.broadcastChannel;
+      // Push uses user channel (where user has write permission)
+      // Pull uses tribe channel (where shared data lives)
+      final pushChannel = _pushChannelTopic;
+      final pullChannel = channelTopic ?? _pullChannelTopic;
 
       // 6. If we have pending changes, push them first on user channel
       String? streamId;
@@ -2851,12 +3012,14 @@ class SyncClient {
   /// Check if Merkle verification is needed based on staleness.
   /// Called at the end of syncUnified to run verification if interval has elapsed.
   Future<void> _checkMerkleVerification() async {
-    // Skip if not configured
+    // Determine if any tables are configured for verification
+    final hasChannels = config.channels?.any((c) => c.tables.isNotEmpty) ?? false;
     final hasPullTables = config.merkleVerifyPullTables?.isNotEmpty ?? false;
     final hasPushTables = config.merkleVerifyPushTables?.isNotEmpty ?? false;
     final hasLegacyTables = config.merkleVerifyTables?.isNotEmpty ?? false;
 
-    if (config.merkleVerifyInterval == null || (!hasPullTables && !hasPushTables && !hasLegacyTables)) {
+    if (config.merkleVerifyInterval == null ||
+        (!hasChannels && !hasPullTables && !hasPushTables && !hasLegacyTables)) {
       return;
     }
 
@@ -2903,43 +3066,15 @@ class SyncClient {
 
       _logger.info('Running Merkle verification (last: ${DateTime.fromMillisecondsSinceEpoch(lastVerified)})');
 
-      // Use server's block size if available, otherwise fall back to default
       final blockSize = _serverMerkleBlockSize ?? _defaultMerkleBlockSize;
-
       final allRepairedTables = <String>[];
 
-      // Verify pull channel tables (tribe tables)
-      final pullTables = config.merkleVerifyPullTables ?? config.merkleVerifyTables;
-      final pullChannel = config.pullChannel ?? config.broadcastChannel;
-      if (pullTables != null && pullTables.isNotEmpty && pullChannel != null) {
-        try {
-          _logger.fine('Merkle verification on pull channel: $pullChannel');
-          final repairedTables = await verifyIntegrity(
-            tables: pullTables,
-            blockSize: blockSize,
-            channelTopic: pullChannel,
-          );
-          allRepairedTables.addAll(repairedTables);
-        } catch (e) {
-          _logger.warning('Merkle verification failed on pull channel: $e');
-        }
-      }
-
-      // Verify push/broadcast channel tables (user tables)
-      final pushTables = config.merkleVerifyPushTables;
-      final pushChannel = config.broadcastChannel;
-      if (pushTables != null && pushTables.isNotEmpty && pushChannel != null && pushChannel != pullChannel) {
-        try {
-          _logger.fine('Merkle verification on push channel: $pushChannel');
-          final repairedTables = await verifyIntegrity(
-            tables: pushTables,
-            blockSize: blockSize,
-            channelTopic: pushChannel,
-          );
-          allRepairedTables.addAll(repairedTables);
-        } catch (e) {
-          _logger.warning('Merkle verification failed on push channel: $e');
-        }
+      if (hasChannels) {
+        // New path: use channels config with per-table repair directions
+        await _merkleVerifyFromChannels(config.channels!, blockSize, allRepairedTables);
+      } else {
+        // Legacy path: use old broadcastChannel/pullChannel fields
+        await _merkleVerifyLegacy(blockSize, allRepairedTables);
       }
 
       // Update last verified timestamp in metadata
@@ -2960,6 +3095,98 @@ class SyncClient {
     } catch (e) {
       _logger.warning('Merkle verification failed: $e');
       // Don't rethrow - verification failure shouldn't break sync
+    }
+  }
+
+  /// Merkle verification using the new channels config.
+  /// Verifies all tables per channel, then dispatches repair by direction.
+  Future<void> _merkleVerifyFromChannels(
+    List<SyncChannelType> channels,
+    int blockSize,
+    List<String> allRepairedTables,
+  ) async {
+    for (final channel in channels) {
+      if (channel.tables.isEmpty) continue;
+
+      final allTables = channel.allTableNames;
+      _logger.fine('Merkle verification on ${channel.topic}: ${allTables.join(', ')}');
+
+      try {
+        // 1. Verify all tables on this channel at once (root comparison)
+        final mismatches = await _verifyRoots(
+          tables: allTables,
+          blockSize: blockSize,
+          channelTopic: channel.topic,
+        );
+
+        // 2. For each mismatch, repair using the appropriate direction
+        for (final mismatch in mismatches) {
+          final tableName = mismatch.table;
+          final syncTable = channel.tables
+              .where((t) => t.name == tableName)
+              .firstOrNull;
+          final direction = syncTable != null
+              ? channel.directionFor(syncTable)
+              : channel.defaultDirection;
+
+          _logger.info('Merkle repair: $tableName on ${channel.topic} direction=${direction.name}');
+
+          switch (direction) {
+            case RepairDirection.pull:
+              await _repairTablePull(tableName, blockSize, channelTopic: channel.topic);
+              break;
+            case RepairDirection.push:
+              await _repairTablePush(tableName, blockSize, channelTopic: channel.topic);
+              break;
+            case RepairDirection.lww:
+              await _repairTableLww(tableName, blockSize, channelTopic: channel.topic);
+              break;
+          }
+          allRepairedTables.add(tableName);
+        }
+      } catch (e) {
+        _logger.warning('Merkle verification failed on ${channel.topic}: $e');
+      }
+    }
+  }
+
+  /// Legacy merkle verification using old config fields (backward compat).
+  Future<void> _merkleVerifyLegacy(
+    int blockSize,
+    List<String> allRepairedTables,
+  ) async {
+    // Verify pull channel tables (tribe tables)
+    final pullTables = config.merkleVerifyPullTables ?? config.merkleVerifyTables;
+    final pullChannel = config.pullChannel ?? config.broadcastChannel;
+    if (pullTables != null && pullTables.isNotEmpty && pullChannel != null) {
+      try {
+        _logger.fine('Merkle verification on pull channel: $pullChannel');
+        final repairedTables = await verifyIntegrity(
+          tables: pullTables,
+          blockSize: blockSize,
+          channelTopic: pullChannel,
+        );
+        allRepairedTables.addAll(repairedTables);
+      } catch (e) {
+        _logger.warning('Merkle verification failed on pull channel: $e');
+      }
+    }
+
+    // Verify push/broadcast channel tables (user tables)
+    final pushTables = config.merkleVerifyPushTables;
+    final pushChannel = config.broadcastChannel;
+    if (pushTables != null && pushTables.isNotEmpty && pushChannel != null && pushChannel != pullChannel) {
+      try {
+        _logger.fine('Merkle verification on push channel: $pushChannel');
+        final repairedTables = await verifyIntegrity(
+          tables: pushTables,
+          blockSize: blockSize,
+          channelTopic: pushChannel,
+        );
+        allRepairedTables.addAll(repairedTables);
+      } catch (e) {
+        _logger.warning('Merkle verification failed on push channel: $e');
+      }
     }
   }
 
@@ -2984,6 +3211,61 @@ class SyncClient {
   ///   print('Repaired tables: $repairedTables');
   /// }
   /// ```
+  /// Compare local Merkle roots against server and return mismatches.
+  /// This is the shared root-verification step used by both the new channels
+  /// config path and the legacy verifyIntegrity path.
+  Future<List<MerkleMismatch>> _verifyRoots({
+    required List<String> tables,
+    required int blockSize,
+    String? channelTopic,
+  }) async {
+    if (!_ws.isConnected) {
+      throw StateError('Not connected to server');
+    }
+
+    // Compute local Merkle roots
+    final tableHashes = <String, MerkleTableInfo>{};
+    for (final table in tables) {
+      try {
+        final merkleInfo = await _db!.merkleRoot(table, blockSize: blockSize);
+        tableHashes[table] = MerkleTableInfo(
+          rootHash: merkleInfo.rootHash,
+          blockCount: merkleInfo.blockCount,
+          rowCount: merkleInfo.rowCount,
+        );
+        final hashPreview = merkleInfo.rootHash.length >= 16
+            ? '${merkleInfo.rootHash.substring(0, 16)}...'
+            : merkleInfo.rootHash.isEmpty ? '(empty)' : merkleInfo.rootHash;
+        _logger.fine('verifyRoots: $table - root=$hashPreview, '
+            'blocks=${merkleInfo.blockCount}, rows=${merkleInfo.rowCount}');
+      } catch (e) {
+        _logger.warning('verifyRoots: Failed to compute Merkle root for $table: $e');
+      }
+    }
+
+    if (tableHashes.isEmpty) return [];
+
+    // Send verification request to server
+    final channel = channelTopic ?? _pullChannelTopic;
+    final payload = <String, dynamic>{
+      'table_hashes': tableHashes.map((table, info) => MapEntry(table, {
+        'root_hash': info.rootHash,
+        'block_count': info.blockCount,
+        'row_count': info.rowCount,
+      })),
+      'block_size': blockSize,
+    };
+
+    final responseMap = await _ws.sendRaw('merkle_verify', payload, channelTopic: channel);
+    final response = MerkleVerifyResponse.fromMap(responseMap);
+
+    if (response.isOk) {
+      return [];
+    }
+
+    return response.mismatches ?? [];
+  }
+
   Future<List<String>> verifyIntegrity({
     List<String>? tables,
     int blockSize = 100,
@@ -2994,7 +3276,7 @@ class SyncClient {
       throw StateError('Not connected to server');
     }
 
-    final tablesToVerify = tables ?? config.autoSyncTables ?? [];
+    final tablesToVerify = tables ?? _allSyncTables;
     if (tablesToVerify.isEmpty) {
       _logger.warning('verifyIntegrity: No tables specified');
       return [];
@@ -3029,7 +3311,7 @@ class SyncClient {
     }
 
     // 2. Send verification request to server
-    final channel = channelTopic ?? config.pullChannel ?? config.broadcastChannel;
+    final channel = channelTopic ?? _pullChannelTopic;
 
     // Build payload matching MerkleVerifyMessage structure
     final payload = <String, dynamic>{
@@ -3061,7 +3343,7 @@ class SyncClient {
         _logger.info('verifyIntegrity: Mismatch detected for ${mismatch.table} - '
             'local: $localPreview, server: $serverPreview');
 
-        await _repairTable(
+        await _repairTablePull(
           mismatch.table,
           blockSize,
           channelTopic: channel,
@@ -3078,8 +3360,8 @@ class SyncClient {
     }
   }
 
-  /// Repair a table by fetching differing blocks from server
-  Future<void> _repairTable(
+  /// Repair a table by fetching differing blocks from server (pull: server → client).
+  Future<void> _repairTablePull(
     String table,
     int blockSize, {
     String? channelTopic,
@@ -3193,6 +3475,210 @@ class SyncClient {
 
     } catch (e) {
       _logger.severe('verifyIntegrity: Failed to fetch block $blockIndex for $table: $e');
+      rethrow;
+    }
+  }
+
+  /// Repair a table by pushing local rows to server (push: client → server).
+  ///
+  /// Used for user-owned tables where the client is authoritative.
+  /// Server applies each row through its authorization checks.
+  Future<void> _repairTablePush(
+    String table,
+    int blockSize, {
+    String? channelTopic,
+  }) async {
+    // 1. Get block hashes and find differing blocks (same as pull)
+    final blockHashes = await _db!.merkleBlockHashes(table, blockSize: blockSize);
+    _logger.fine('repairPush: $table has ${blockHashes.length} blocks');
+
+    final payload = <String, dynamic>{
+      'table': table,
+      'block_hashes': blockHashes,
+      'block_size': blockSize,
+    };
+
+    try {
+      final responseMap = await _ws.sendRaw('merkle_block_hashes', payload, channelTopic: channelTopic);
+      final response = MerkleBlockHashesResponse.fromMap(responseMap);
+
+      if (response.differingBlocks.isEmpty) {
+        _logger.info('repairPush: $table - no differing blocks');
+        return;
+      }
+
+      _logger.info('repairPush: $table - ${response.differingBlocks.length} differing blocks: '
+          '${response.differingBlocks}');
+
+      // 2. For each differing block, read local rows and push to server
+      for (final blockIndex in response.differingBlocks) {
+        await _pushBlockToServer(table, blockIndex, blockSize, channelTopic: channelTopic);
+      }
+
+      _logger.info('repairPush: $table - push repair complete');
+
+    } catch (e) {
+      _logger.severe('repairPush: Failed to repair $table: $e');
+      rethrow;
+    }
+  }
+
+  /// Read local rows for a block and push them to the server.
+  Future<void> _pushBlockToServer(
+    String table,
+    int blockIndex,
+    int blockSize, {
+    String? channelTopic,
+  }) async {
+    // Read local row IDs for this block
+    final rowIds = await _db!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
+
+    // Read full row data for each ID
+    final rows = <Map<String, dynamic>>[];
+    for (final rowId in rowIds) {
+      final rowData = await _db!.read(
+        "SELECT * FROM $table WHERE id = '${_escapeSql(rowId)}'"
+      );
+      if (rowData.isNotEmpty) {
+        rows.add(rowData.first);
+      }
+    }
+
+    // Push to server
+    final payload = <String, dynamic>{
+      'table': table,
+      'block_index': blockIndex,
+      'block_size': blockSize,
+      'rows': rows,
+      'client_row_ids': rowIds,
+    };
+
+    try {
+      final responseMap = await _ws.sendRaw('merkle_push_blocks', payload, channelTopic: channelTopic);
+      final response = MerklePushBlocksResponse.fromMap(responseMap);
+
+      _logger.info('repairPush: $table block $blockIndex - '
+          'applied: ${response.applied}, rejected: ${response.rejected}, deleted: ${response.deleted}');
+
+      if (response.errors.isNotEmpty) {
+        for (final error in response.errors) {
+          _logger.warning('repairPush: $table block $blockIndex - error: $error');
+        }
+      }
+    } catch (e) {
+      _logger.severe('repairPush: Failed to push block $blockIndex for $table: $e');
+      rethrow;
+    }
+  }
+
+  /// Repair a table using last-write-wins (LWW) resolution.
+  ///
+  /// Sends local rows to server which compares last_modified_ms timestamps.
+  /// Server returns rows where it wins (client should overwrite local data),
+  /// and accepts rows where client wins.
+  Future<void> _repairTableLww(
+    String table,
+    int blockSize, {
+    String? channelTopic,
+  }) async {
+    // 1. Get block hashes and find differing blocks (same as pull/push)
+    final blockHashes = await _db!.merkleBlockHashes(table, blockSize: blockSize);
+    _logger.fine('repairLww: $table has ${blockHashes.length} blocks');
+
+    final payload = <String, dynamic>{
+      'table': table,
+      'block_hashes': blockHashes,
+      'block_size': blockSize,
+    };
+
+    try {
+      final responseMap = await _ws.sendRaw('merkle_block_hashes', payload, channelTopic: channelTopic);
+      final response = MerkleBlockHashesResponse.fromMap(responseMap);
+
+      if (response.differingBlocks.isEmpty) {
+        _logger.info('repairLww: $table - no differing blocks');
+        return;
+      }
+
+      _logger.info('repairLww: $table - ${response.differingBlocks.length} differing blocks: '
+          '${response.differingBlocks}');
+
+      // 2. For each differing block, resolve via LWW
+      for (final blockIndex in response.differingBlocks) {
+        await _lwwResolveBlock(table, blockIndex, blockSize, channelTopic: channelTopic);
+      }
+
+      _logger.info('repairLww: $table - lww repair complete');
+
+    } catch (e) {
+      _logger.severe('repairLww: Failed to repair $table: $e');
+      rethrow;
+    }
+  }
+
+  /// Resolve a single block using last-write-wins.
+  Future<void> _lwwResolveBlock(
+    String table,
+    int blockIndex,
+    int blockSize, {
+    String? channelTopic,
+  }) async {
+    // Read local rows for this block
+    final rowIds = await _db!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
+    final localRows = <Map<String, dynamic>>[];
+    for (final rowId in rowIds) {
+      final rowData = await _db!.read(
+        "SELECT * FROM $table WHERE id = '${_escapeSql(rowId)}'"
+      );
+      if (rowData.isNotEmpty) {
+        localRows.add(rowData.first);
+      }
+    }
+
+    // Send to server for LWW resolution
+    final payload = <String, dynamic>{
+      'table': table,
+      'block_index': blockIndex,
+      'block_size': blockSize,
+      'rows': localRows,
+      'client_row_ids': rowIds,
+    };
+
+    try {
+      final responseMap = await _ws.sendRaw('merkle_lww_blocks', payload, channelTopic: channelTopic);
+      final response = MerkleLwwBlocksResponse.fromMap(responseMap);
+
+      // Apply server-wins rows locally
+      if (response.serverWins.isNotEmpty) {
+        _db!.beginBulkRemote();
+        try {
+          for (final row in response.serverWins) {
+            final rowId = row['id']?.toString();
+            if (rowId == null) continue;
+
+            final existsLocally = rowIds.contains(rowId);
+            final change = ChangeMessage(
+              table: table,
+              operation: existsLocally ? 'update' : 'insert',
+              rowId: rowId,
+              data: row,
+            );
+            final sql = _generateSql(change);
+            _db!.execBulkRemote(sql);
+          }
+          await _db!.endBulkRemote();
+        } catch (e) {
+          await _db!.endBulkRemote(rollback: true);
+          rethrow;
+        }
+      }
+
+      _logger.info('repairLww: $table block $blockIndex - '
+          'client_wins: ${response.appliedFromClient}, '
+          'server_wins: ${response.serverWins.length}');
+
+    } catch (e) {
+      _logger.severe('repairLww: Failed to resolve block $blockIndex for $table: $e');
       rethrow;
     }
   }
