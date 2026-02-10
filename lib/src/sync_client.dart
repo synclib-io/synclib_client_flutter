@@ -333,10 +333,21 @@ class SyncTable {
   /// bidirectional → lww).
   final RepairDirection? direction;
 
-  const SyncTable(this.name, {this.direction});
-  const SyncTable.pull(this.name) : direction = RepairDirection.pull;
-  const SyncTable.push(this.name) : direction = RepairDirection.push;
-  const SyncTable.lww(this.name) : direction = RepairDirection.lww;
+  /// Columns to include in merkle hash computation (besides id which is always
+  /// included). When set, only these columns are hashed — skipping jsonb, array,
+  /// and other problematic column types entirely. The precomputed row_hash fast
+  /// path is bypassed since it includes all columns.
+  ///
+  /// When null, all columns are hashed (minus skipColumns/jsonbColumns).
+  ///
+  /// Example: `hashColumns: ['last_modified_ms']` — since last_modified_ms is
+  /// updated by a trigger on every write, this is sufficient to detect changes.
+  final List<String>? hashColumns;
+
+  const SyncTable(this.name, {this.direction, this.hashColumns});
+  const SyncTable.pull(this.name, {this.hashColumns}) : direction = RepairDirection.pull;
+  const SyncTable.push(this.name, {this.hashColumns}) : direction = RepairDirection.push;
+  const SyncTable.lww(this.name, {this.hashColumns}) : direction = RepairDirection.lww;
 }
 
 /// A sync channel: its topic, role, associated tables, and join params.
@@ -487,6 +498,11 @@ class SyncClientConfig {
   /// Defaults to null (disabled).
   final Duration? merkleVerifyInterval;
 
+  /// Columns to skip in Merkle hash computation (excluded from SELECT and hash).
+  /// Always includes 'row_hash'. Add array columns here that the server skips
+  /// via is_array_field? (e.g. triballeaders, subscribedto, participants).
+  final List<String> merkleSkipColumns;
+
   const SyncClientConfig({
     required this.dbPath,
     required this.serverUrl,
@@ -502,6 +518,7 @@ class SyncClientConfig {
     this.autoSyncOnConnect = true,
     this.periodicSyncInterval,
     this.merkleVerifyInterval,
+    this.merkleSkipColumns = const ['row_hash'],
   });
 }
 
@@ -641,7 +658,10 @@ class SyncClient {
       _db = await SynclibDatabase.open(config.dbPath);
       _logger.info('Database opened: ${config.dbPath}');
     }
-    _merkle = MerkleComputer(_SynclibMerkleDb(_db!));
+    _merkle = MerkleComputer(
+      _SynclibMerkleDb(_db!),
+      skipColumns: config.merkleSkipColumns,
+    );
 
     // Subscribe to WebSocket messages
     _messageSubscription = _ws.messages.listen(_handleMessage);
@@ -752,10 +772,19 @@ class SyncClient {
       // Create channel state
       _channelStates[topic] = ChannelSyncState(topic: topic);
 
+      // Build hash_columns map for tables that specify hashColumns
+      final hashColumnsMap = <String, List<String>>{};
+      for (final t in channel.tables) {
+        if (t.hashColumns != null) {
+          hashColumnsMap[t.name] = t.hashColumns!;
+        }
+      }
+
       final joinParams = {
         'client_id': config.clientId,
         ...?channel.params,
         if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
+        if (hashColumnsMap.isNotEmpty) 'hash_columns': hashColumnsMap,
       };
 
       final response = await _ws.joinChannel(topic, joinParams);
@@ -974,10 +1003,19 @@ class SyncClient {
       _logger.info('Sending table seqnums on join: $tableSeqnums');
     }
 
+    // Build hash_columns map for tables that specify hashColumns
+    final hashColumnsMap = <String, List<String>>{};
+    for (final t in channel.tables) {
+      if (t.hashColumns != null) {
+        hashColumnsMap[t.name] = t.hashColumns!;
+      }
+    }
+
     final response = await _ws.joinChannel(topic, {
       'client_id': config.clientId,
       ...?channel.params,
       if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
+      if (hashColumnsMap.isNotEmpty) 'hash_columns': hashColumnsMap,
     });
 
     // Mark channel as joined
@@ -1461,8 +1499,13 @@ class SyncClient {
       }
 
       // Check if Merkle verification is needed (staleness check)
-      // Run in background - don't block sync completion
-      _checkMerkleVerification();
+      // Must be awaited so it runs within the _isSyncing guard,
+      // preventing concurrent bulk mode with a subsequent syncUnified call.
+      await _checkMerkleVerification();
+
+      // Cancel any syncOnWrite debounce triggered by merkle repair writes —
+      // those are internal maintenance, not user changes needing a new sync.
+      _syncOnWriteDebounceTimer?.cancel();
 
       _updateSyncState(SyncState.ready);
       _logger.info('syncUnified: Complete');
@@ -1607,6 +1650,7 @@ class SyncClient {
           }
         }
         await _db!.endBulkRemote();
+        await _db!.backfillRowHashes(message.table);
         _logger.info('Applied sync batch for ${message.table}');
       } catch (e) {
         _logger.severe('Failed to apply sync batch for ${message.table}: $e');
@@ -1882,6 +1926,11 @@ class SyncClient {
           }
         }
         await _db!.endBulkRemote();
+        // Backfill row_hash for all tables touched in this batch
+        final touchedTables = changes.map((c) => c.table).toSet();
+        for (final table in touchedTables) {
+          await _db!.backfillRowHashes(table);
+        }
         if (deletedCount > 0) {
           _logger.info('Soft-deleted $deletedCount rows locally');
         }
@@ -2014,6 +2063,7 @@ class SyncClient {
         processedCount++;
       }
       await _db!.endBulkRemote();
+      await _db!.backfillRowHashes(batch.table);
 
       if (deletedCount > 0) {
         _logger.info('Soft-deleted $deletedCount rows from ${batch.table}');
@@ -2379,6 +2429,20 @@ class SyncClient {
   /// Escape single quotes in SQL strings
   String _escapeSql(String value) {
     return value.replaceAll("'", "''");
+  }
+
+  /// Build a SELECT clause for repair that wraps JSONB columns with json().
+  /// Avoids SELECT * which triggers binary-data warnings for JSONB columns.
+  Future<String> _buildRepairSelectSql(String table) async {
+    final pragmaResult = await _db!.read('PRAGMA table_info($table)');
+    if (pragmaResult.isEmpty) return 'SELECT * FROM $table';
+    final columns = pragmaResult.map((row) {
+      final colName = row['name'] as String;
+      if (colName == 'row_hash') return null;
+      if (colName == 'document') return 'json(document) as document';
+      return colName;
+    }).where((c) => c != null).join(', ');
+    return 'SELECT $columns FROM $table';
   }
 
   /// Stream snapshot of tables from server
@@ -2761,12 +2825,19 @@ class SyncClient {
       final allTables = channel.allTableNames;
       _logger.fine('Merkle verification on ${channel.topic}: ${allTables.join(', ')}');
 
+      // Build per-table hashColumns map from channel's SyncTable config
+      final tableHashCols = <String, List<String>?>{};
+      for (final t in channel.tables) {
+        tableHashCols[t.name] = t.hashColumns;
+      }
+
       try {
         // 1. Verify all tables on this channel at once (root comparison)
         final mismatches = await _verifyRoots(
           tables: allTables,
           blockSize: blockSize,
           channelTopic: channel.topic,
+          tableHashColumns: tableHashCols,
         );
 
         // 2. For each mismatch, repair using the appropriate direction
@@ -2778,18 +2849,19 @@ class SyncClient {
           final direction = syncTable != null
               ? channel.directionFor(syncTable)
               : channel.defaultDirection;
+          final hashCols = syncTable?.hashColumns;
 
           _logger.info('Merkle repair: $tableName on ${channel.topic} direction=${direction.name}');
 
           switch (direction) {
             case RepairDirection.pull:
-              await _repairTablePull(tableName, blockSize, channelTopic: channel.topic);
+              await _repairTablePull(tableName, blockSize, channelTopic: channel.topic, hashColumns: hashCols);
               break;
             case RepairDirection.push:
-              await _repairTablePush(tableName, blockSize, channelTopic: channel.topic);
+              await _repairTablePush(tableName, blockSize, channelTopic: channel.topic, hashColumns: hashCols);
               break;
             case RepairDirection.lww:
-              await _repairTableLww(tableName, blockSize, channelTopic: channel.topic);
+              await _repairTableLww(tableName, blockSize, channelTopic: channel.topic, hashColumns: hashCols);
               break;
           }
           allRepairedTables.add(tableName);
@@ -2828,6 +2900,7 @@ class SyncClient {
     required List<String> tables,
     required int blockSize,
     String? channelTopic,
+    Map<String, List<String>?>? tableHashColumns,
   }) async {
     if (!_ws.isConnected) {
       throw StateError('Not connected to server');
@@ -2837,7 +2910,8 @@ class SyncClient {
     final tableHashes = <String, MerkleTableInfo>{};
     for (final table in tables) {
       try {
-        final merkleInfo = await _merkle!.merkleRoot(table, blockSize: blockSize);
+        final hashCols = tableHashColumns?[table];
+        final merkleInfo = await _merkle!.merkleRoot(table, blockSize: blockSize, hashColumns: hashCols);
         tableHashes[table] = MerkleTableInfo(
           rootHash: merkleInfo.rootHash,
           blockCount: merkleInfo.blockCount,
@@ -2972,9 +3046,10 @@ class SyncClient {
     String table,
     int blockSize, {
     String? channelTopic,
+    List<String>? hashColumns,
   }) async {
     // 1. Get block hashes
-    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize);
+    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize, hashColumns: hashColumns);
     _logger.fine('verifyIntegrity: $table has ${blockHashes.length} blocks');
 
     // 2. Send block hashes to server to find differences
@@ -3073,6 +3148,15 @@ class SyncClient {
         }
 
         await _db!.endBulkRemote();
+
+        // Recompute row_hash for modified rows so the fast path stays current
+        for (final row in response.rows) {
+          final rowId = row['id']?.toString();
+          if (rowId != null) {
+            await _db!.updateRowHash(table, rowId);
+          }
+        }
+
         _logger.info('verifyIntegrity: $table block $blockIndex - applied ${response.rows.length} rows '
             '(updated: $updatedCount, inserted: $insertedCount, deleted: $deletedCount)');
       } catch (e) {
@@ -3094,9 +3178,10 @@ class SyncClient {
     String table,
     int blockSize, {
     String? channelTopic,
+    List<String>? hashColumns,
   }) async {
     // 1. Get block hashes and find differing blocks (same as pull)
-    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize);
+    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize, hashColumns: hashColumns);
     _logger.fine('repairPush: $table has ${blockHashes.length} blocks');
 
     final payload = <String, dynamic>{
@@ -3140,14 +3225,23 @@ class SyncClient {
     // Read local row IDs for this block
     final rowIds = await _merkle!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
 
-    // Read full row data for each ID
+    // Build SELECT with json() for JSONB columns to avoid binary warnings
+    final selectSql = await _buildRepairSelectSql(table);
+
+    // Read full row data for each ID, skipping stripped rows (document IS NULL)
     final rows = <Map<String, dynamic>>[];
     for (final rowId in rowIds) {
       final rowData = await _db!.read(
-        "SELECT * FROM $table WHERE id = '${_escapeSql(rowId)}'"
+        "$selectSql WHERE id = '${_escapeSql(rowId)}'"
       );
       if (rowData.isNotEmpty) {
-        rows.add(rowData.first);
+        final row = rowData.first;
+        // Skip stripped rows — client doesn't have the real content
+        if (row.containsKey('document') && row['document'] == null) {
+          _logger.fine('repairPush: skipping stripped row $table:$rowId');
+          continue;
+        }
+        rows.add(row);
       }
     }
 
@@ -3187,9 +3281,10 @@ class SyncClient {
     String table,
     int blockSize, {
     String? channelTopic,
+    List<String>? hashColumns,
   }) async {
     // 1. Get block hashes and find differing blocks (same as pull/push)
-    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize);
+    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize, hashColumns: hashColumns);
     _logger.fine('repairLww: $table has ${blockHashes.length} blocks');
 
     final payload = <String, dynamic>{
@@ -3232,13 +3327,20 @@ class SyncClient {
   }) async {
     // Read local rows for this block
     final rowIds = await _merkle!.getBlockRowIds(table, blockIndex, blockSize: blockSize);
+    final selectSql = await _buildRepairSelectSql(table);
     final localRows = <Map<String, dynamic>>[];
     for (final rowId in rowIds) {
       final rowData = await _db!.read(
-        "SELECT * FROM $table WHERE id = '${_escapeSql(rowId)}'"
+        "$selectSql WHERE id = '${_escapeSql(rowId)}'"
       );
       if (rowData.isNotEmpty) {
-        localRows.add(rowData.first);
+        final row = rowData.first;
+        // Skip stripped rows — client doesn't have the real content
+        if (row.containsKey('document') && row['document'] == null) {
+          _logger.fine('repairLww: skipping stripped row $table:$rowId');
+          continue;
+        }
+        localRows.add(row);
       }
     }
 
@@ -3274,6 +3376,14 @@ class SyncClient {
             _db!.execBulkRemote(sql);
           }
           await _db!.endBulkRemote();
+
+          // Recompute row_hash for modified rows so the fast path stays current
+          for (final row in response.serverWins) {
+            final rowId = row['id']?.toString();
+            if (rowId != null) {
+              await _db!.updateRowHash(table, rowId);
+            }
+          }
         } catch (e) {
           await _db!.endBulkRemote(rollback: true);
           rethrow;
