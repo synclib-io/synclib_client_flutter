@@ -1159,11 +1159,17 @@ class MerkleMismatch {
   final int serverBlockCount;
   final int serverRowCount;
 
+  /// Server's scoped row IDs for this table on this channel.
+  /// The client should use these to filter its merkle computation
+  /// to the same set of rows the server sees.
+  final List<String>? rowIds;
+
   const MerkleMismatch({
     required this.table,
     required this.serverRootHash,
     required this.serverBlockCount,
     required this.serverRowCount,
+    this.rowIds,
   });
 
   factory MerkleMismatch.fromMap(Map<String, dynamic> map) => MerkleMismatch(
@@ -1171,6 +1177,7 @@ class MerkleMismatch {
     serverRootHash: map['server_root_hash'] as String,
     serverBlockCount: map['server_block_count'] as int,
     serverRowCount: map['server_row_count'] as int,
+    rowIds: (map['row_ids'] as List?)?.cast<String>(),
   );
 }
 
