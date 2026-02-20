@@ -2221,6 +2221,13 @@ class SyncClient {
       if (_readyState == SyncReadyState.waitingForHello) {
         _updateReadyState(SyncReadyState.ready);
       }
+    } else if (response['status'] == 'error') {
+      final error = response['error'] ?? 'unknown';
+      _logger.severe('Hello error from server: $error '
+          '(server_version: ${response['server_version']}, '
+          'client_version: ${response['client_version']})');
+      // Don't throw — syncUnified will also detect schema mismatch and throw
+      // a catchable StateError. Logging here ensures the hello error is visible.
     }
   }
 
