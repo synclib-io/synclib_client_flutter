@@ -40,6 +40,8 @@ abstract class SyncMessage {
         return SchemaUpdateMessage.fromMap(map);
       case 'livestream:started':
       case 'livestream:stopped':
+      case 'webrtc:stream_started':
+      case 'webrtc:stream_stopped':
       case 'grid:created':
       case 'grid:stopped':
       case 'grid:participant_change':
@@ -556,6 +558,8 @@ class LivestreamMessage extends SyncMessage {
 
   bool get isStarted => event == 'livestream:started';
   bool get isStopped => event == 'livestream:stopped';
+  bool get isWebrtcStarted => event == 'webrtc:stream_started';
+  bool get isWebrtcStopped => event == 'webrtc:stream_stopped';
   bool get isGridCreated => event == 'grid:created';
   bool get isGridStopped => event == 'grid:stopped';
   bool get isGridParticipantChange => event == 'grid:participant_change';
