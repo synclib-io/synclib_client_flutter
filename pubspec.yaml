@@ -1,0 +1,29 @@
+name: synclib_sync
+description: "Sync client for bidirectional database synchronization over Phoenix channels."
+version: 0.0.1
+homepage:
+
+environment:
+  sdk: ^3.9.2
+  flutter: ">=1.17.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  synclib_flutter:
+    git:
+      url: git@github.com:paperview/synclib_flutter.git
+      ref: master
+  web_socket_channel: ^3.0.0
+  msgpack_dart: ^1.0.1
+  collection: ^1.17.0
+  logging: ^1.2.0
+  phoenix_socket: ^0.8.0
+  synchronized: ^3.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  mockito: ^5.4.0
+  build_runner: ^2.4.0
