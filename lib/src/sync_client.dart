@@ -1378,9 +1378,10 @@ class SyncClient {
           final pushRequest = SyncRequestMessage(
             clientId: config.clientId,
             schemaVersion: schemaVersion,
-            tableSeqnums: {},  // No pull in push request
+            tableSeqnums: {},
             tables: [],
             pendingChanges: channelChanges,
+            role: channel.role.name,
           );
 
           final pushResponse = await _ws.sendRaw('sync', pushRequest.toMap(), channelTopic: channel.topic);
@@ -1425,6 +1426,7 @@ class SyncClient {
           forceRefreshTables: channelForceRefresh.isNotEmpty ? channelForceRefresh : null,
           strippedRows: channelStrippedRows?.isNotEmpty == true ? channelStrippedRows : null,
           pendingChanges: null,
+          role: channel.role.name,
         );
 
         final response = await _ws.sendRaw('sync', pullRequest.toMap(), channelTopic: channel.topic);
