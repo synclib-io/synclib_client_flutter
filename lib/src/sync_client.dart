@@ -1397,9 +1397,10 @@ class SyncClient {
           final pushRequest = SyncRequestMessage(
             clientId: config.clientId,
             schemaVersion: schemaVersion,
-            tableSeqnums: {},  // No pull in push request
+            tableSeqnums: {},
             tables: [],
             pendingChanges: channelChanges,
+            role: channel.role.name,
           );
 
           final pushResponse = await _ws.sendRaw('sync', pushRequest.toMap(), channelTopic: channel.topic);
@@ -1444,6 +1445,7 @@ class SyncClient {
           forceRefreshTables: channelForceRefresh.isNotEmpty ? channelForceRefresh : null,
           strippedRows: channelStrippedRows?.isNotEmpty == true ? channelStrippedRows : null,
           pendingChanges: null,
+          role: channel.role.name,
         );
 
         final response = await _ws.sendRaw('sync', pullRequest.toMap(), channelTopic: channel.topic);
@@ -1486,11 +1488,11 @@ class SyncClient {
         _activeSyncCompleters[streamId] = completer;
 
         await completer.future.timeout(
-          const Duration(minutes: 5),
+          const Duration(seconds: 60),
           onTimeout: () {
             _activeSyncCompleters.remove(streamId);
             _activeSyncPendingChanges.remove(streamId);
-            throw TimeoutException('Unified sync timed out on ${channel.topic}', const Duration(minutes: 5));
+            throw TimeoutException('Unified sync timed out on ${channel.topic}', const Duration(seconds: 60));
           },
         );
       }
@@ -2306,6 +2308,20 @@ class SyncClient {
       case ConnectionState.disconnected:
       case ConnectionState.failed:
         _stopPeriodicSync();
+        // Fail any pending sync completers so syncUnified() doesn't hang
+        // waiting for a sync_complete that will never arrive on the dead connection
+        if (_activeSyncCompleters.isNotEmpty) {
+          _logger.warning('Connection lost with ${_activeSyncCompleters.length} pending sync completers — failing them');
+          for (final entry in _activeSyncCompleters.entries) {
+            if (!entry.value.isCompleted) {
+              entry.value.completeError(
+                StateError('WebSocket disconnected during sync (stream ${entry.key})'),
+              );
+            }
+          }
+          _activeSyncCompleters.clear();
+          _activeSyncPendingChanges.clear();
+        }
         _updateSyncState(SyncState.disconnected);
         break;
       case ConnectionState.authFailed:

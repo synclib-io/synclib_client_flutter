@@ -893,6 +893,10 @@ class SyncRequestMessage extends SyncMessage {
   /// Local changes to push to server
   final List<PendingChange>? pendingChanges;
 
+  /// Channel role: "push", "pull", or "bidirectional".
+  /// Tells the server whether to send data back, accept changes, or both.
+  final String? role;
+
   const SyncRequestMessage({
     required this.clientId,
     required this.schemaVersion,
@@ -901,6 +905,7 @@ class SyncRequestMessage extends SyncMessage {
     this.forceRefreshTables,
     this.strippedRows,
     this.pendingChanges,
+    this.role,
   });
 
   @override
@@ -913,6 +918,7 @@ class SyncRequestMessage extends SyncMessage {
     if (forceRefreshTables != null) 'force_refresh_tables': forceRefreshTables,
     if (strippedRows != null) 'stripped_rows': strippedRows!.map((r) => r.toMap()).toList(),
     if (pendingChanges != null) 'pending_changes': pendingChanges!.map((c) => c.toMap()).toList(),
+    if (role != null) 'role': role,
   };
 
   factory SyncRequestMessage.fromMap(Map<String, dynamic> map) {
@@ -928,6 +934,7 @@ class SyncRequestMessage extends SyncMessage {
       forceRefreshTables: (map['force_refresh_tables'] as List?)?.cast<String>(),
       strippedRows: strippedRowsRaw?.map((r) => RowRef.fromMap(r as Map<String, dynamic>)).toList(),
       pendingChanges: pendingChangesRaw?.map((c) => PendingChange.fromMap(c as Map<String, dynamic>)).toList(),
+      role: map['role'] as String?,
     );
   }
 }
