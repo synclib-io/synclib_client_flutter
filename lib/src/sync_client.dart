@@ -537,6 +537,9 @@ class SyncClient {
   StreamSubscription? _messageSubscription;
   StreamSubscription? _stateSubscription;
 
+  /// Message processing lock — ensures messages are handled one at a time.
+  Future<void> _messageLock = Future.value();
+
   bool _isInitialized = false;
   bool _hasConnectedOnce = false;
   int _lastSyncedSeqnum = 0;
@@ -646,8 +649,8 @@ class SyncClient {
       skipColumns: config.merkleSkipColumns,
     );
 
-    // Subscribe to WebSocket messages
-    _messageSubscription = _ws.messages.listen(_handleMessage);
+    // Subscribe to WebSocket messages (serialized via message lock)
+    _messageSubscription = _ws.messages.listen(_enqueueMessage);
     _stateSubscription = _ws.stateChanges.listen(_handleStateChange);
 
     // Subscribe to local changes for syncOnWrite
@@ -1183,28 +1186,28 @@ class SyncClient {
     for (final table in tables) {
       try {
         // First check how many rows exist in the table
-        final countResult = await _db!.read('SELECT COUNT(*) as cnt FROM $table');
+        final countResult = await _db!.read('SELECT COUNT(*) as cnt FROM ${_quoteId(table)}');
         final totalRows = countResult.isNotEmpty ? countResult.first['cnt'] as int : 0;
 
         // Check for NULL documents specifically
         // Note: JSONB columns store null as binary bytes, not SQL NULL
         // So we check both SQL NULL and json(document) = 'null'
         final nullDocResult = await _db!.read('''
-          SELECT COUNT(*) as cnt FROM $table
-          WHERE document IS NULL
-             OR json(document) IS NULL
-             OR json(document) = 'null'
+          SELECT COUNT(*) as cnt FROM ${_quoteId(table)}
+          WHERE "document" IS NULL
+             OR json("document") IS NULL
+             OR json("document") = 'null'
         ''');
         final nullDocCount = nullDocResult.isNotEmpty ? nullDocResult.first['cnt'] as int : 0;
 
         // Stripped content has NULL/null document OR _stripped flag in document
         final result = await _db!.read('''
-          SELECT id FROM $table
-          WHERE document IS NULL
-             OR json(document) IS NULL
-             OR json(document) = 'null'
-             OR json_extract(document, '\$._stripped') = 1
-             OR json_extract(document, '\$._stripped') = true
+          SELECT "id" FROM ${_quoteId(table)}
+          WHERE "document" IS NULL
+             OR json("document") IS NULL
+             OR json("document") = 'null'
+             OR json_extract("document", '\$._stripped') = 1
+             OR json_extract("document", '\$._stripped') = true
         ''');
 
         for (final row in result) {
@@ -1236,9 +1239,9 @@ class SyncClient {
         // Check if any documents are stored as TEXT instead of BLOB
         // Proper JSONB is stored as BLOB, corrupted data is stored as TEXT
         final result = await _db!.read('''
-          SELECT COUNT(*) as cnt FROM $table
-          WHERE document IS NOT NULL
-            AND typeof(document) = 'text'
+          SELECT COUNT(*) as cnt FROM ${_quoteId(table)}
+          WHERE "document" IS NOT NULL
+            AND typeof("document") = 'text'
         ''');
 
         final corruptedCount = result.isNotEmpty ? result.first['cnt'] as int : 0;
@@ -1604,33 +1607,38 @@ class SyncClient {
 
       // Apply batch
       await _db!.beginBulkRemote();
+      int skippedCount = 0;
       try {
         for (final row in message.rows) {
-          final deletedAt = row['deleted_at'];
+          try {
+            final deletedAt = row['deleted_at'];
 
-          if (deletedAt != null) {
-            // Soft-deleted row - delete locally
-            final rowId = row['id'] as String;
-            final deleteSql = "DELETE FROM ${message.table} WHERE id = '${_escapeSql(rowId)}'";
-            await _db!.execBulkRemote(deleteSql);
-          } else {
-            // Normal row - insert/replace
-            final change = ChangeMessage(
-              table: message.table,
-              operation: 'insert',
-              rowId: row['id'] as String,
-              data: row,
-            );
-            final sql = _generateSql(change);
-            // DEBUG: Log first row SQL to verify column names are lowercase
-            if (message.table == 'posts') {
-              _logger.warning('DEBUG _handleSyncDataBatch: SQL for posts: $sql');
+            if (deletedAt != null) {
+              // Soft-deleted row - delete locally
+              final rowId = row['id'] as String;
+              final deleteSql = "DELETE FROM ${_quoteId(message.table)} WHERE \"id\" = '${_escapeSql(rowId)}'";
+              await _db!.execBulkRemote(deleteSql);
+            } else {
+              // Normal row - insert/replace
+              final change = ChangeMessage(
+                table: message.table,
+                operation: 'insert',
+                rowId: row['id'] as String,
+                data: row,
+              );
+              final sql = _generateSql(change);
+              await _db!.execBulkRemote(sql);
             }
-            await _db!.execBulkRemote(sql);
+          } catch (rowErr) {
+            skippedCount++;
+            _logger.severe('Skipping bad row in ${message.table} (id=${row['id']}): $rowErr');
           }
         }
         await _db!.endBulkRemote();
         await _db!.backfillRowHashes(message.table);
+        if (skippedCount > 0) {
+          _logger.warning('Skipped $skippedCount bad rows in ${message.table}');
+        }
         _logger.info('Applied sync batch for ${message.table}');
       } catch (e) {
         _logger.severe('Failed to apply sync batch for ${message.table}: $e');
@@ -1788,6 +1796,12 @@ class SyncClient {
     _logger.info('Sent hello message with schema version $schemaVersion');
   }
 
+  /// Enqueue a message for serialized processing.
+  /// Prevents interleaving when multiple async messages arrive rapidly.
+  void _enqueueMessage(SyncMessage message) {
+    _messageLock = _messageLock.then((_) => _handleMessage(message));
+  }
+
   /// Handle incoming message from server
   Future<void> _handleMessage(SyncMessage message) async {
     try {
@@ -1796,7 +1810,7 @@ class SyncClient {
       } else if (message is ChangesBatchMessage) {
         await _applyRemoteChanges(message.changes);
       } else if (message is AckMessage) {
-        _handleAck(message);
+        await _handleAck(message);
       } else if (message is PhoenixReplyMessage) {
         await _handlePhoenixReply(message);
       } else if (message is ErrorMessage) {
@@ -1830,7 +1844,7 @@ class SyncClient {
     try {
       // Check if this is a soft-deleted row - delete locally instead of inserting
       if (change.data?['deleted_at'] != null) {
-        final deleteSql = "DELETE FROM ${change.table} WHERE id = '${_escapeSql(change.rowId)}'";
+        final deleteSql = "DELETE FROM ${_quoteId(change.table)} WHERE \"id\" = '${_escapeSql(change.rowId)}'";
         await _db!.applyRemote(
           tableName: change.table,
           rowId: change.rowId,
@@ -1915,16 +1929,22 @@ class SyncClient {
       // Use bulk mode for efficiency
       await _db!.beginBulkRemote();
       int deletedCount = 0;
+      int skippedCount = 0;
       try {
         for (final change in changes) {
-          // Check if this is a soft-deleted row - delete locally instead of inserting
-          if (change.data?['deleted_at'] != null) {
-            final deleteSql = "DELETE FROM ${change.table} WHERE id = '${_escapeSql(change.rowId)}'";
-            await _db!.execBulkRemote(deleteSql);
-            deletedCount++;
-          } else {
-            final sql = _generateSql(change);
-            await _db!.execBulkRemote(sql);
+          try {
+            // Check if this is a soft-deleted row - delete locally instead of inserting
+            if (change.data?['deleted_at'] != null) {
+              final deleteSql = "DELETE FROM ${_quoteId(change.table)} WHERE \"id\" = '${_escapeSql(change.rowId)}'";
+              await _db!.execBulkRemote(deleteSql);
+              deletedCount++;
+            } else {
+              final sql = _generateSql(change);
+              await _db!.execBulkRemote(sql);
+            }
+          } catch (rowErr) {
+            skippedCount++;
+            _logger.severe('Skipping bad row in ${change.table} (id=${change.rowId}): $rowErr');
           }
         }
         await _db!.endBulkRemote();
@@ -1934,6 +1954,9 @@ class SyncClient {
         }
         if (deletedCount > 0) {
           _logger.info('Soft-deleted $deletedCount rows locally');
+        }
+        if (skippedCount > 0) {
+          _logger.warning('Skipped $skippedCount bad rows in changes batch');
         }
         _logger.info('Successfully applied ${changes.length} changes');
 
@@ -1949,7 +1972,7 @@ class SyncClient {
   }
 
   /// Handle acknowledgment from server
-  void _handleAck(AckMessage ack) {
+  Future<void> _handleAck(AckMessage ack) async {
     _logger.fine('Received ack for seqnum ${ack.seqnum}: ${ack.success}, server_seqnum: ${ack.serverSeqnum}');
 
     if (ack.success) {
@@ -1959,27 +1982,22 @@ class SyncClient {
       final changeInfo = _pendingChangeInfo.remove(ack.seqnum);
 
       // Mark as synced in local database
-      _db!.markSynced(ack.seqnum).catchError((e) {
-        _logger.severe('Failed to mark synced: $e');
-      });
+      await _db!.markSynced(ack.seqnum);
 
       // Update the local row's seqnum column with the server-assigned seqnum
       if (ack.serverSeqnum != null && changeInfo != null) {
-        _updateLocalSeqnum(changeInfo.table, changeInfo.rowId, ack.serverSeqnum!).catchError((e) {
-          _logger.warning('Failed to update local seqnum for ${changeInfo.table}:${changeInfo.rowId}: $e');
-        });
+        await _updateLocalSeqnum(changeInfo.table, changeInfo.rowId, ack.serverSeqnum!);
       }
     } else {
       _logger.warning('Change ${ack.seqnum} failed: ${ack.error}');
       _pendingChangeInfo.remove(ack.seqnum);
-      // TODO: Implement retry logic
     }
   }
 
   /// Update the seqnum column on a local row after server assigns it
   Future<void> _updateLocalSeqnum(String table, String rowId, int serverSeqnum) async {
     try {
-      final sql = "UPDATE $table SET seqnum = $serverSeqnum WHERE id = '${rowId.replaceAll("'", "''")}'";
+      final sql = "UPDATE ${_quoteId(table)} SET \"seqnum\" = $serverSeqnum WHERE \"id\" = '${rowId.replaceAll("'", "''")}'";
       await _db!.exec(sql);
       _logger.fine('Updated local seqnum for $table:$rowId to $serverSeqnum');
     } catch (e) {
@@ -2042,7 +2060,7 @@ class SyncClient {
         if (deletedAt != null) {
           // Soft-deleted row - delete locally
           final rowId = row['id'] as String;
-          final deleteSql = "DELETE FROM ${batch.table} WHERE id = '${_escapeSql(rowId)}'";
+          final deleteSql = "DELETE FROM ${_quoteId(batch.table)} WHERE \"id\" = '${_escapeSql(rowId)}'";
           await _db!.execBulkRemote(deleteSql);
           deletedCount++;
         } else {
@@ -2189,6 +2207,7 @@ class SyncClient {
 
       _logger.info('Applying migration v$version: $description');
 
+      await _db!.exec('BEGIN TRANSACTION');
       try {
         // Execute each SQL statement
         for (final sql in sqlStatements) {
@@ -2198,8 +2217,10 @@ class SyncClient {
 
         // Update schema version
         await _db!.setSchemaVersion(version);
+        await _db!.exec('COMMIT');
         _logger.info('Successfully applied migration v$version');
       } catch (e, stack) {
+        await _db!.exec('ROLLBACK');
         _logger.severe('Failed to apply migration v$version: $e', e, stack);
         rethrow;
       }
@@ -2279,29 +2300,31 @@ class SyncClient {
       }
     }
 
+    final qt = _quoteId(change.table);
+
     switch (change.operation) {
       case 'insert':
         // Use INSERT ON CONFLICT DO UPDATE to only update provided columns.
         // INSERT OR REPLACE wipes all non-provided columns to NULL which
         // destroys data like last_modified_ms when broadcasts send partial rows.
-        final columns = ['id', ...filteredData.keys].join(', ');
+        final columns = ['"id"', ...filteredData.keys.map((k) => _quoteId(k))].join(', ');
         final values = ['\'${_escapeSql(change.rowId)}\'', ...filteredData.values.map((v) => _formatSqlValue(v))].join(', ');
         final updates = filteredData.entries
-          .map((e) => '${e.key} = ${_formatSqlValue(e.value)}')
+          .map((e) => '${_quoteId(e.key)} = ${_formatSqlValue(e.value)}')
           .join(', ');
         if (filteredData.isEmpty) {
-          return 'INSERT OR IGNORE INTO ${change.table} (id) VALUES (\'${_escapeSql(change.rowId)}\')';
+          return 'INSERT OR IGNORE INTO $qt ("id") VALUES (\'${_escapeSql(change.rowId)}\')';
         }
-        return 'INSERT INTO ${change.table} ($columns) VALUES ($values) '
-            'ON CONFLICT(id) DO UPDATE SET $updates';
+        return 'INSERT INTO $qt ($columns) VALUES ($values) '
+            'ON CONFLICT("id") DO UPDATE SET $updates';
       case 'update':
         final sets = filteredData.entries
-          .map((e) => '${e.key} = ${_formatSqlValue(e.value)}')
+          .map((e) => '${_quoteId(e.key)} = ${_formatSqlValue(e.value)}')
           .join(', ');
-        return 'UPDATE ${change.table} SET $sets WHERE id = \'${_escapeSql(change.rowId)}\'';
+        return 'UPDATE $qt SET $sets WHERE "id" = \'${_escapeSql(change.rowId)}\'';
 
       case 'delete':
-        return 'DELETE FROM ${change.table} WHERE id = \'${_escapeSql(change.rowId)}\'';
+        return 'DELETE FROM $qt WHERE "id" = \'${_escapeSql(change.rowId)}\'';
 
       default:
         throw ArgumentError('Unknown operation: ${change.operation}');
@@ -2329,10 +2352,12 @@ class SyncClient {
       filteredData[key.toLowerCase()] = value;
     }
 
+    final qt = _quoteId(change.table);
+
     switch (change.operation) {
       case 'insert':
       case 'upsert':
-        final columns = ['id', ...filteredData.keys].join(', ');
+        final columns = ['"id"', ...filteredData.keys.map((k) => _quoteId(k))].join(', ');
 
         // Build placeholders - use jsonb(?) for Map/List values, ? for others
         final placeholderList = <String>['?']; // id is always a simple value
@@ -2361,42 +2386,42 @@ class SyncClient {
         // INSERT OR REPLACE wipes all non-provided columns to NULL which
         // destroys data like last_modified_ms when broadcasts send partial rows.
         if (filteredData.isEmpty) {
-          final insertSql = 'INSERT OR IGNORE INTO ${change.table} (id) VALUES (?)';
+          final insertSql = 'INSERT OR IGNORE INTO $qt ("id") VALUES (?)';
           return (sql: insertSql, params: [change.rowId]);
         }
         final updateClauses = <String>[];
         for (final entry in filteredData.entries) {
           if (entry.value is Map || entry.value is List) {
-            updateClauses.add('${entry.key} = jsonb(?)');
+            updateClauses.add('${_quoteId(entry.key)} = jsonb(?)');
             params.add(jsonEncode(entry.value));
           } else if (entry.value is bool) {
-            updateClauses.add('${entry.key} = ?');
+            updateClauses.add('${_quoteId(entry.key)} = ?');
             params.add(entry.value ? '1' : '0');
           } else {
-            updateClauses.add('${entry.key} = ?');
+            updateClauses.add('${_quoteId(entry.key)} = ?');
             params.add(entry.value?.toString());
           }
         }
-        final insertSql = 'INSERT INTO ${change.table} ($columns) VALUES ($placeholders) '
-            'ON CONFLICT(id) DO UPDATE SET ${updateClauses.join(', ')}';
+        final insertSql = 'INSERT INTO $qt ($columns) VALUES ($placeholders) '
+            'ON CONFLICT("id") DO UPDATE SET ${updateClauses.join(', ')}';
         return (sql: insertSql, params: params);
 
       case 'update':
         final setClauses = <String>[];
         for (final entry in filteredData.entries) {
           if (entry.value is Map || entry.value is List) {
-            setClauses.add('${entry.key} = jsonb(?)');
+            setClauses.add('${_quoteId(entry.key)} = jsonb(?)');
             params.add(jsonEncode(entry.value));
           } else if (entry.value is bool) {
-            setClauses.add('${entry.key} = ?');
+            setClauses.add('${_quoteId(entry.key)} = ?');
             params.add(entry.value ? '1' : '0');
           } else {
-            setClauses.add('${entry.key} = ?');
+            setClauses.add('${_quoteId(entry.key)} = ?');
             params.add(entry.value?.toString());
           }
         }
 
-        final updateSql = 'UPDATE ${change.table} SET ${setClauses.join(', ')} WHERE id = ?';
+        final updateSql = 'UPDATE $qt SET ${setClauses.join(', ')} WHERE "id" = ?';
         params.add(change.rowId);
         return (sql: updateSql, params: params);
 
@@ -2431,6 +2456,9 @@ class SyncClient {
     }
   }
 
+  /// Quote a SQL identifier (table or column name) to prevent SQL injection.
+  String _quoteId(String name) => '"${name.replaceAll('"', '""')}"';
+
   /// Escape single quotes in SQL strings
   String _escapeSql(String value) {
     return value.replaceAll("'", "''");
@@ -2439,19 +2467,21 @@ class SyncClient {
   /// Build a SELECT clause for repair that wraps JSONB/BLOB columns with json().
   /// Avoids SELECT * which triggers binary-data warnings for BLOB columns.
   Future<String> _buildRepairSelectSql(String table) async {
-    final pragmaResult = await _db!.read('PRAGMA table_info($table)');
-    if (pragmaResult.isEmpty) return 'SELECT * FROM $table';
+    final qt = _quoteId(table);
+    final pragmaResult = await _db!.read('PRAGMA table_info($qt)');
+    if (pragmaResult.isEmpty) return 'SELECT * FROM $qt';
     final columns = pragmaResult.map((row) {
       final colName = row['name'] as String;
       final colType = (row['type'] as String? ?? '').toUpperCase();
       if (colName == 'row_hash') return null;
+      final qc = _quoteId(colName);
       // Wrap BLOB/JSONB columns with json() to avoid binary data warnings
       if (colType.contains('BLOB') || colType.contains('JSONB')) {
-        return 'json($colName) as $colName';
+        return 'json($qc) as $qc';
       }
-      return colName;
+      return qc;
     }).where((c) => c != null).join(', ');
-    return 'SELECT $columns FROM $table';
+    return 'SELECT $columns FROM $qt';
   }
 
   /// Stream snapshot of tables from server
@@ -2527,7 +2557,7 @@ class SyncClient {
   /// Query the max seqnum from a local SQLite table
   Future<int> _getMaxSeqnumFromTable(String table) async {
     try {
-      final result = await _db!.read('SELECT MAX(seqnum) as max_seqnum FROM $table');
+      final result = await _db!.read('SELECT MAX("seqnum") as max_seqnum FROM ${_quoteId(table)}');
 
       if (result.isEmpty) {
         return 0;
