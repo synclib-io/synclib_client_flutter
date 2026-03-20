@@ -272,7 +272,7 @@ class WebSocketManager {
       PhoenixChannel? channel = _channels.values.first;
       if (channelTopic != null) {
         final existingChannelKey = _channels.keys.firstWhereOrNull((k) =>
-            k.contains(channelTopic));
+            k == channelTopic);
         channel = existingChannelKey != null
             ? _channels[existingChannelKey]
             : _channels.values.first;
@@ -304,7 +304,7 @@ class WebSocketManager {
       PhoenixChannel? channel = _channels.values.first;
       if (channelTopic != null) {
         final existingChannelKey = _channels.keys.firstWhereOrNull((k) =>
-            k.contains(channelTopic));
+            k == channelTopic);
         channel = existingChannelKey != null
             ? _channels[existingChannelKey]
             : _channels.values.first;

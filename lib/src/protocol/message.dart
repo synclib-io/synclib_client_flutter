@@ -270,12 +270,16 @@ class AckMessage extends SyncMessage {
   /// Server-assigned seqnum for the row (set by Postgres trigger).
   /// Client should update the local row's seqnum column with this value.
   final int? serverSeqnum;
+  /// Server-computed row_hash (set by Postgres trigger).
+  /// Client should store this value locally — never compute row_hash on client.
+  final String? rowHash;
 
   const AckMessage({
     required this.seqnum,
     required this.success,
     this.error,
     this.serverSeqnum,
+    this.rowHash,
   });
 
   @override
@@ -285,6 +289,7 @@ class AckMessage extends SyncMessage {
     'success': success,
     if (error != null) 'error': error,
     if (serverSeqnum != null) 'server_seqnum': serverSeqnum,
+    if (rowHash != null) 'row_hash': rowHash,
   };
 
   factory AckMessage.fromMap(Map<String, dynamic> map) => AckMessage(
@@ -292,6 +297,7 @@ class AckMessage extends SyncMessage {
     success: map['success'] as bool,
     error: map['error'] as String?,
     serverSeqnum: map['server_seqnum'] as int?,
+    rowHash: map['row_hash'] as String?,
   );
 }
 
@@ -977,12 +983,15 @@ class ChangeAck {
   final bool success;
   final int? serverSeqnum;
   final String? error;
+  /// Server-computed row_hash (set by Postgres trigger).
+  final String? rowHash;
 
   const ChangeAck({
     required this.localSeqnum,
     required this.success,
     this.serverSeqnum,
     this.error,
+    this.rowHash,
   });
 
   Map<String, dynamic> toMap() => {
@@ -990,6 +999,7 @@ class ChangeAck {
     'success': success,
     if (serverSeqnum != null) 'server_seqnum': serverSeqnum,
     if (error != null) 'error': error,
+    if (rowHash != null) 'row_hash': rowHash,
   };
 
   factory ChangeAck.fromMap(Map<String, dynamic> map) => ChangeAck(
@@ -997,6 +1007,7 @@ class ChangeAck {
     success: map['success'] as bool,
     serverSeqnum: map['server_seqnum'] as int?,
     error: map['error'] as String?,
+    rowHash: map['row_hash'] as String?,
   );
 }
 
