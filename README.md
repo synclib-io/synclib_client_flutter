@@ -189,7 +189,11 @@ No client-side migration code is needed — the server is the single source of t
 
 ## Merkle tree verification
 
-When `merkleVerifyInterval` is set, the client periodically computes SHA256-based Merkle trees over its local data and compares them with the server. If blocks differ, only the mismatched rows are fetched and repaired.
+When `merkleVerifyInterval` is set, the client periodically builds SHA256-based Merkle trees from stored `row_hash` values and compares them with the server. If blocks differ, only the mismatched rows are fetched and repaired.
+
+The server is the single source of truth for `row_hash` — computed by a Postgres trigger at write time. Clients receive and store these values during sync, snapshots, ACK responses, and merkle repair. No local hash computation is needed for sync to work.
+
+For optional client-side data integrity (e.g., detecting local corruption), the `synclib_hash` library is available on all platforms but is not required.
 
 ```dart
 SyncClientConfig(
