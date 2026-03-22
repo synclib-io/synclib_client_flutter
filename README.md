@@ -276,7 +276,7 @@ dependencies:
 
 ## Integration Tests
 
-There are 17 integration tests in `example/integration_test/` that verify the Dart sync client against the synclib server. They mirror the 17 Playwright tests in the JS test harness.
+There are 22 integration tests in `example/integration_test/` that verify the Dart sync client against the synclib server.
 
 ### Prerequisites
 
@@ -299,6 +299,8 @@ flutter test integration_test/general_sync_test.dart -d macos
 flutter test integration_test/server_authoritative_hash_test.dart -d macos
 flutter test integration_test/reconnect_sync_test.dart -d macos
 flutter test integration_test/merkle_soft_delete_test.dart -d macos
+flutter test integration_test/merkle_push_no_delete_test.dart -d macos
+flutter test integration_test/merkle_repair_test.dart -d macos
 ```
 
 **Note:** Running all files at once (`flutter test integration_test/ -d macos`) may fail due to a macOS Flutter integration test runner limitation where the app can't reliably restart between test files.
@@ -311,6 +313,8 @@ flutter test integration_test/merkle_soft_delete_test.dart -d macos
 | `server_authoritative_hash_test.dart` | 5 | Push gets row_hash, pull gets row_hash, merkle verification (no spurious mismatches), no null hashes after full cycle, update changes hash |
 | `reconnect_sync_test.dart` | 1 | Reconnect auto-syncs and receives items added while offline |
 | `merkle_soft_delete_test.dart` | 1 | Soft-deleted items sync correctly, merkle verification stays stable (no spurious repairs) |
+| `merkle_push_no_delete_test.dart` | 1 | Both clients add items, multiple sync+merkle cycles, no items spuriously deleted |
+| `merkle_repair_test.dart` | 4 | Complex multi-client operations stability (add+update+delete+merkle), multi-cycle stability, post-update stability, empty table handling |
 
 ### Test Helpers
 
