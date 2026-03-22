@@ -644,6 +644,9 @@ class SyncClient {
       _db = await SynclibDatabase.open(config.dbPath);
       _logger.info('Database opened: ${config.dbPath}');
     }
+    // Skip local hash computation — server computes authoritative row_hash
+    await _db!.skipLocalHash(true);
+
     _merkle = MerkleComputer(
       _SynclibMerkleDb(_db!),
       skipColumns: config.merkleSkipColumns,
@@ -1373,6 +1376,7 @@ class SyncClient {
 
       // 5. Push pending changes to push channels
       String? streamId;
+      final pushStreamIds = <String>[];
       if (pendingChangeMessages.isNotEmpty) {
         for (final channel in _pushChannels) {
           // Filter pending changes to this channel's tables
@@ -1394,17 +1398,40 @@ class SyncClient {
 
           final pushResponse = await _ws.sendRaw('sync', pushRequest.toMap(), channelTopic: channel.topic);
 
-          if (pushResponse['status'] == 'ok') {
-            streamId = pushResponse['stream_id'] as String?;
-            _logger.info('syncUnified: Push complete on ${channel.topic}, stream_id=$streamId');
-          } else if (pushResponse['status'] == 'error') {
-            throw StateError('Push failed on ${channel.topic}: ${pushResponse['error']}');
-          }
+          // sendRaw() already checks isOk and unwraps the response payload,
+          // so pushResponse is {stream_id: "..."}, not {status: "ok", response: {...}}
+          streamId = pushResponse['stream_id'] as String?;
+          _logger.info('syncUnified: Push complete on ${channel.topic}, stream_id=$streamId');
 
-          // Store pending changes for ack processing
+          // Store pending changes for ack processing, and register a
+          // completer so the push stream_id is recognized in
+          // _handleSyncComplete (preventing the fallback else-branch
+          // from clearing _activeSyncPendingChanges before ACKs arrive).
           if (streamId != null) {
             _activeSyncPendingChanges[streamId] = pendingChanges;
+            _activeSyncCompleters[streamId] = Completer<void>();
+            pushStreamIds.add(streamId);
           }
+        }
+      }
+
+      // 5b. Wait for all push streams to complete (ACKs processed, row_hash stored)
+      // before starting pull. This ensures:
+      //   - Push ACKs with row_hash are applied before pull data could overwrite them
+      //   - The pull sees all just-pushed items on the server
+      //   - Table seqnums are properly updated from the pull
+      for (final pushSid in pushStreamIds) {
+        final pushCompleter = _activeSyncCompleters[pushSid];
+        if (pushCompleter != null && !pushCompleter.isCompleted) {
+          _logger.info('syncUnified: Waiting for push stream $pushSid to complete');
+          await pushCompleter.future.timeout(
+            const Duration(seconds: 30),
+            onTimeout: () {
+              _logger.warning('syncUnified: Push stream $pushSid timed out');
+              _activeSyncCompleters.remove(pushSid);
+              _activeSyncPendingChanges.remove(pushSid);
+            },
+          );
         }
       }
 
@@ -1545,7 +1572,7 @@ class SyncClient {
 
   /// Handle change acknowledgments from unified sync
   Future<void> _handleSyncChangeAcks(ChangeAcksMessage message) async {
-    _logger.info('syncUnified: Received ${message.acks.length} change acknowledgments');
+    _logger.info('syncUnified: Received ${message.acks.length} change acknowledgments (stream=${message.streamId})');
 
     _emitSyncProgress(SyncProgress(
       phase: 'pushing',
@@ -1565,14 +1592,14 @@ class SyncClient {
           _logger.warning('Failed to delete change ${ack.localSeqnum}: $e');
         }
 
-        // Update local row seqnum if provided
-        if (ack.serverSeqnum != null) {
-          // Look up the change info in pending changes
+        // Look up the change info in pending changes
+        if (ack.serverSeqnum != null || ack.rowHash != null) {
           for (final pending in _activeSyncPendingChanges.values) {
             final change = pending.where((c) => c.seqnum == ack.localSeqnum).firstOrNull;
             if (change != null) {
-              await _updateLocalSeqnum(change.tableName, change.rowId, ack.serverSeqnum!);
-              // Store server-computed row_hash locally
+              if (ack.serverSeqnum != null) {
+                await _updateLocalSeqnum(change.tableName, change.rowId, ack.serverSeqnum!);
+              }
               if (ack.rowHash != null) {
                 await _updateLocalRowHash(change.tableName, change.rowId, ack.rowHash!);
               }

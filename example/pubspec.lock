@@ -471,11 +471,9 @@ packages:
   synclib_flutter:
     dependency: "direct main"
     description:
-      path: "."
-      ref: main
-      resolved-ref: c292b0b936abe719deecd16dff5ccbc58e39bded
-      url: "git@github.com:synclib-io/synclib_flutter.git"
-    source: git
+      path: "../../../synclib_flutter"
+      relative: true
+    source: path
     version: "0.0.1"
   synclib_sync:
     dependency: "direct main"

@@ -13,9 +13,7 @@ dependencies:
   synclib_sync:
     path: ../
   synclib_flutter:
-    git:
-      url: git@github.com:synclib-io/synclib_flutter.git
-      ref: main
+    path: ../../../synclib_flutter
   path_provider: ^2.1.0
   cupertino_icons: ^1.0.8
   logging: ^1.2.0
@@ -31,9 +29,7 @@ dev_dependencies:
 
 dependency_overrides:
   synclib_flutter:
-    git:
-      url: git@github.com:synclib-io/synclib_flutter.git
-      ref: main
+    path: ../../../synclib_flutter
 
 flutter:
   uses-material-design: true

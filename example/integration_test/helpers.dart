@@ -64,7 +64,7 @@ Future<TestClient> createTestClient(
         topic: 'sync:room:$roomId',
         role: ChannelRole.bidirectional,
         tables: [
-          SyncTable.lww('items', hashColumns: ['last_modified_ms']),
+          SyncTable.lww('items'),
         ],
       ),
     ],
@@ -117,7 +117,7 @@ Future<TestClient> reconnectClient(TestClient old) async {
         topic: 'sync:room:${old.roomId}',
         role: ChannelRole.bidirectional,
         tables: [
-          SyncTable.lww('items', hashColumns: ['last_modified_ms']),
+          SyncTable.lww('items'),
         ],
       ),
     ],
@@ -149,6 +149,47 @@ Future<void> resetServer() async {
   if (response.statusCode >= 300) {
     // ignore: avoid_print
     print('resetServer returned ${response.statusCode}: ${response.body}');
+  }
+}
+
+/// Update an item directly on the server, bypassing sync.
+/// This creates data drift that merkle verification should detect.
+Future<void> updateItemOnServer(String id, Map<String, dynamic> fields) async {
+  final response = await http.put(
+    Uri.parse('http://localhost:4444/api/test/items/$id'),
+    headers: {'Content-Type': 'application/json'},
+    body: jsonEncode(fields),
+  );
+  if (response.statusCode >= 300) {
+    throw Exception(
+        'updateItemOnServer failed: ${response.statusCode} ${response.body}');
+  }
+}
+
+/// Get an item directly from the server (raw Postgres data).
+Future<Map<String, dynamic>?> getItemOnServer(String id) async {
+  final response = await http.get(
+    Uri.parse('http://localhost:4444/api/test/items/$id'),
+  );
+  if (response.statusCode == 404) return null;
+  if (response.statusCode >= 300) {
+    throw Exception(
+        'getItemOnServer failed: ${response.statusCode} ${response.body}');
+  }
+  final body = jsonDecode(response.body) as Map<String, dynamic>;
+  return body['item'] as Map<String, dynamic>?;
+}
+
+/// Delete an item directly on the server, bypassing sync and triggers.
+/// The row is hard-deleted. Since triggers are disabled, seqnum doesn't
+/// change — only merkle verification can detect the missing row.
+Future<void> deleteItemOnServer(String id) async {
+  final response = await http.delete(
+    Uri.parse('http://localhost:4444/api/test/items/$id'),
+  );
+  if (response.statusCode >= 300) {
+    throw Exception(
+        'deleteItemOnServer failed: ${response.statusCode} ${response.body}');
   }
 }
 
