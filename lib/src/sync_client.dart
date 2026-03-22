@@ -671,6 +671,9 @@ class SyncClient {
       skipColumns: config.merkleSkipColumns,
     );
 
+    // Skip local hash computation — server computes authoritative row_hash
+    await _db!.skipLocalHash(true);
+
     // One-time migration: switch to server-authoritative row_hash.
     // Set all local row_hash to '' (sentinel) so merkle detects mismatch
     // and triggers repair from server.
@@ -1431,6 +1434,7 @@ class SyncClient {
 
       // 5. Push pending changes to push channels
       String? streamId;
+      final pushStreamIds = <String>[];
       if (pendingChangeMessages.isNotEmpty) {
         for (final channel in _pushChannels) {
           // Filter pending changes to this channel's tables
@@ -1452,17 +1456,40 @@ class SyncClient {
 
           final pushResponse = await _ws.sendRaw('sync', pushRequest.toMap(), channelTopic: channel.topic);
 
-          if (pushResponse['status'] == 'ok') {
-            streamId = pushResponse['stream_id'] as String?;
-            _logger.info('syncUnified: Push complete on ${channel.topic}, stream_id=$streamId');
-          } else if (pushResponse['status'] == 'error') {
-            throw StateError('Push failed on ${channel.topic}: ${pushResponse['error']}');
-          }
+          // sendRaw() already checks isOk and unwraps the response payload,
+          // so pushResponse is {stream_id: "..."}, not {status: "ok", response: {...}}
+          streamId = pushResponse['stream_id'] as String?;
+          _logger.info('syncUnified: Push complete on ${channel.topic}, stream_id=$streamId');
 
-          // Store pending changes for ack processing
+          // Store pending changes for ack processing, and register a
+          // completer so the push stream_id is recognized in
+          // _handleSyncComplete (preventing the fallback else-branch
+          // from clearing _activeSyncPendingChanges before ACKs arrive).
           if (streamId != null) {
             _activeSyncPendingChanges[streamId] = pendingChanges;
+            _activeSyncCompleters[streamId] = Completer<void>();
+            pushStreamIds.add(streamId);
           }
+        }
+      }
+
+      // 5b. Wait for all push streams to complete (ACKs processed, row_hash stored)
+      // before starting pull. This ensures:
+      //   - Push ACKs with row_hash are applied before pull data could overwrite them
+      //   - The pull sees all just-pushed items on the server
+      //   - Table seqnums are properly updated from the pull
+      for (final pushSid in pushStreamIds) {
+        final pushCompleter = _activeSyncCompleters[pushSid];
+        if (pushCompleter != null && !pushCompleter.isCompleted) {
+          _logger.info('syncUnified: Waiting for push stream $pushSid to complete');
+          await pushCompleter.future.timeout(
+            const Duration(seconds: 30),
+            onTimeout: () {
+              _logger.warning('syncUnified: Push stream $pushSid timed out');
+              _activeSyncCompleters.remove(pushSid);
+              _activeSyncPendingChanges.remove(pushSid);
+            },
+          );
         }
       }
 
@@ -1623,14 +1650,14 @@ class SyncClient {
           _logger.warning('Failed to delete change ${ack.localSeqnum}: $e');
         }
 
-        // Update local row seqnum if provided
-        if (ack.serverSeqnum != null) {
-          // Look up the change info in pending changes
+        // Look up the change info in pending changes to apply server seqnum and row_hash
+        if (ack.serverSeqnum != null || ack.rowHash != null) {
           for (final pending in _activeSyncPendingChanges.values) {
             final change = pending.where((c) => c.seqnum == ack.localSeqnum).firstOrNull;
             if (change != null) {
-              await _updateLocalSeqnum(change.tableName, change.rowId, ack.serverSeqnum!);
-              // Store server-computed row_hash locally
+              if (ack.serverSeqnum != null) {
+                await _updateLocalSeqnum(change.tableName, change.rowId, ack.serverSeqnum!);
+              }
               if (ack.rowHash != null) {
                 await _updateLocalRowHash(change.tableName, change.rowId, ack.rowHash!);
               }
@@ -1824,22 +1851,23 @@ class SyncClient {
     }
   }
 
-  /// Configure synclibc with server-driven hash columns for precomputed row_hash.
-  /// Calls setHashColumns() for each synced table, which persists config and
-  /// invalidates row_hash if the column set changed. Then backfills any invalidated rows.
+  /// Configure synclibc with hash column metadata from the server.
+  ///
+  /// Note: With server-authoritative row_hash (the default), calling
+  /// setHashColumns() on the native library is no longer needed — the server
+  /// computes row_hash via Postgres triggers and sends it in ACK messages and
+  /// row data. The row_hash column is created by server-sent DDL migrations.
+  ///
+  /// The native setHashColumns() is only useful if you want optional client-side
+  /// hash generation (e.g., for local data integrity checks without a server).
+  /// It is intentionally not called here to avoid conflicts with server-managed
+  /// schema (duplicate column errors).
+  ///
+  /// _serverHashColumns is still used by merkle repair to tell the server which
+  /// columns to hash when computing comparison trees.
   Future<void> _configureHashColumns() async {
-    if (_serverHashColumns == null || _db == null) return;
-
-    final columnsJson = jsonEncode(_serverHashColumns);
-    for (final tableName in _allSyncTables) {
-      try {
-        await _db!.setHashColumns(tableName, columnsJson);
-      } catch (e) {
-        _logger.warning('setHashColumns failed for $tableName: $e');
-      }
-    }
-
-    // row_hash is now server-authoritative — no local backfill needed
+    // _serverHashColumns is extracted from the join response and used by merkle
+    // repair — no native-side configuration needed for server-authoritative mode.
   }
 
   Future<void> _sendHello() async {
@@ -2354,7 +2382,17 @@ class SyncClient {
         // Execute each SQL statement
         for (final sql in sqlStatements) {
           _logger.info('Executing: $sql');
-          await _db!.exec(sql as String);
+          try {
+            await _db!.exec(sql as String);
+          } catch (e) {
+            // Handle idempotent DDL operations (e.g., duplicate column from prior partial migration)
+            final msg = e.toString().toLowerCase();
+            if (msg.contains('duplicate column') || msg.contains('already exists')) {
+              _logger.info('Skipping already-applied DDL: $sql');
+            } else {
+              rethrow;
+            }
+          }
         }
 
         // Update schema version
