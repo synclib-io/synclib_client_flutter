@@ -13,7 +13,7 @@ dependencies:
   synclib_flutter:
     git:
       url: git@github.com:synclib-io/synclib_flutter.git
-      ref: master
+      ref: main
   web_socket_channel: ^3.0.0
   msgpack_dart: ^1.0.1
   collection: ^1.17.0

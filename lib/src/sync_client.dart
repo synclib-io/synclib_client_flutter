@@ -649,6 +649,11 @@ class SyncClient {
       skipColumns: config.merkleSkipColumns,
     );
 
+    // One-time migration: switch to server-authoritative row_hash.
+    // Set all local row_hash to '' (sentinel) so merkle detects mismatch
+    // and triggers repair from server.
+    await _migrateToServerAuthoritativeRowHash();
+
     // Subscribe to WebSocket messages (serialized via message lock)
     _messageSubscription = _ws.messages.listen(_enqueueMessage);
     _stateSubscription = _ws.stateChanges.listen(_handleStateChange);
@@ -1567,6 +1572,10 @@ class SyncClient {
             final change = pending.where((c) => c.seqnum == ack.localSeqnum).firstOrNull;
             if (change != null) {
               await _updateLocalSeqnum(change.tableName, change.rowId, ack.serverSeqnum!);
+              // Store server-computed row_hash locally
+              if (ack.rowHash != null) {
+                await _updateLocalRowHash(change.tableName, change.rowId, ack.rowHash!);
+              }
               break;
             }
           }
@@ -1635,7 +1644,7 @@ class SyncClient {
           }
         }
         await _db!.endBulkRemote();
-        await _db!.backfillRowHashes(message.table);
+        // row_hash is now server-authoritative — included in row data from server
         if (skippedCount > 0) {
           _logger.warning('Skipped $skippedCount bad rows in ${message.table}');
         }
@@ -1757,29 +1766,72 @@ class SyncClient {
     }
   }
 
-  /// Configure synclibc with server-driven hash columns for precomputed row_hash.
-  /// Calls setHashColumns() for each synced table, which persists config and
-  /// invalidates row_hash if the column set changed. Then backfills any invalidated rows.
+  /// One-time migration: switch to server-authoritative row_hash.
+  /// Sets all local row_hash values to '' (sentinel) so merkle comparison
+  /// detects mismatch and triggers repair from server.
+  Future<void> _migrateToServerAuthoritativeRowHash() async {
+    try {
+      await _db!.exec('''
+        CREATE TABLE IF NOT EXISTS _synclib_metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      ''');
+
+      final results = await _db!.read(
+        "SELECT value FROM _synclib_metadata WHERE key = 'server_authoritative_row_hash'"
+      );
+      if (results.isNotEmpty) return; // Already migrated
+
+      _logger.info('Migrating to server-authoritative row_hash');
+      for (final tableName in _allSyncTables) {
+        try {
+          await _db!.exec("UPDATE \"$tableName\" SET row_hash = ''");
+          _logger.info('Reset row_hash to sentinel for $tableName');
+        } catch (e) {
+          _logger.fine('Could not reset row_hash for $tableName: $e');
+        }
+      }
+
+      await _db!.exec(
+        "INSERT OR REPLACE INTO _synclib_metadata (key, value) VALUES ('server_authoritative_row_hash', '1')"
+      );
+      _logger.info('Server-authoritative row_hash migration complete');
+    } catch (e) {
+      _logger.warning('Failed to migrate row_hash: $e');
+    }
+  }
+
+  /// Update the row_hash column on a local row with the server-computed value
+  Future<void> _updateLocalRowHash(String table, String rowId, String rowHash) async {
+    try {
+      final escapedRowId = rowId.replaceAll("'", "''");
+      final escapedHash = rowHash.replaceAll("'", "''");
+      final sql = "UPDATE ${_quoteId(table)} SET \"row_hash\" = '$escapedHash' WHERE \"id\" = '$escapedRowId'";
+      await _db!.exec(sql);
+      _logger.fine('Updated local row_hash for $table:$rowId');
+    } catch (e) {
+      _logger.fine('Could not update row_hash for $table:$rowId: $e');
+    }
+  }
+
+  /// Configure synclibc with hash column metadata from the server.
+  ///
+  /// Note: With server-authoritative row_hash (the default), calling
+  /// setHashColumns() on the native library is no longer needed — the server
+  /// computes row_hash via Postgres triggers and sends it in ACK messages and
+  /// row data. The row_hash column is created by server-sent DDL migrations.
+  ///
+  /// The native setHashColumns() is only useful if you want optional client-side
+  /// hash generation (e.g., for local data integrity checks without a server).
+  /// It is intentionally not called here to avoid conflicts with server-managed
+  /// schema (duplicate column errors).
+  ///
+  /// _serverHashColumns is still used by merkle repair to tell the server which
+  /// columns to hash when computing comparison trees.
   Future<void> _configureHashColumns() async {
-    if (_serverHashColumns == null || _db == null) return;
-
-    final columnsJson = jsonEncode(_serverHashColumns);
-    for (final tableName in _allSyncTables) {
-      try {
-        await _db!.setHashColumns(tableName, columnsJson);
-      } catch (e) {
-        _logger.warning('setHashColumns failed for $tableName: $e');
-      }
-    }
-
-    // Backfill any rows that had their row_hash invalidated by config change
-    for (final tableName in _allSyncTables) {
-      try {
-        await _db!.backfillRowHashes(tableName);
-      } catch (e) {
-        _logger.warning('backfillRowHashes failed for $tableName: $e');
-      }
-    }
+    // _serverHashColumns is extracted from the join response and used by merkle
+    // repair — no native-side configuration needed for server-authoritative mode.
   }
 
   Future<void> _sendHello() async {
@@ -1948,10 +2000,7 @@ class SyncClient {
           }
         }
         await _db!.endBulkRemote();
-        final touchedTables = changes.map((c) => c.table).toSet();
-        for (final table in touchedTables) {
-          await _db!.backfillRowHashes(table);
-        }
+        // row_hash is now server-authoritative — included in row data from server
         if (deletedCount > 0) {
           _logger.info('Soft-deleted $deletedCount rows locally');
         }
@@ -1987,6 +2036,10 @@ class SyncClient {
       // Update the local row's seqnum column with the server-assigned seqnum
       if (ack.serverSeqnum != null && changeInfo != null) {
         await _updateLocalSeqnum(changeInfo.table, changeInfo.rowId, ack.serverSeqnum!);
+      }
+      // Store server-computed row_hash locally
+      if (ack.rowHash != null && changeInfo != null) {
+        await _updateLocalRowHash(changeInfo.table, changeInfo.rowId, ack.rowHash!);
       }
     } else {
       _logger.warning('Change ${ack.seqnum} failed: ${ack.error}');
@@ -2082,7 +2135,7 @@ class SyncClient {
         processedCount++;
       }
       await _db!.endBulkRemote();
-      await _db!.backfillRowHashes(batch.table);
+      // row_hash is now server-authoritative — included in row data from server
 
       if (deletedCount > 0) {
         _logger.info('Soft-deleted $deletedCount rows from ${batch.table}');
@@ -2212,7 +2265,17 @@ class SyncClient {
         // Execute each SQL statement
         for (final sql in sqlStatements) {
           _logger.info('Executing: $sql');
-          await _db!.exec(sql as String);
+          try {
+            await _db!.exec(sql as String);
+          } catch (e) {
+            // Handle idempotent DDL operations (e.g., duplicate column from prior partial migration)
+            final msg = e.toString().toLowerCase();
+            if (msg.contains('duplicate column') || msg.contains('already exists')) {
+              _logger.info('Skipping already-applied DDL: $sql');
+            } else {
+              rethrow;
+            }
+          }
         }
 
         // Update schema version
@@ -3148,13 +3211,7 @@ class SyncClient {
 
         await _db!.endBulkRemote();
 
-        // Recompute row_hash for modified rows so the fast path stays current
-        for (final row in response.rows) {
-          final rowId = row['id']?.toString();
-          if (rowId != null) {
-            await _db!.updateRowHash(table, rowId);
-          }
-        }
+        // row_hash is now server-authoritative — included in row data from server via _generateSql
 
         _logger.info('verifyIntegrity: $table block $blockIndex - applied ${response.rows.length} rows '
             '(updated: $updatedCount, inserted: $insertedCount, deleted: $deletedCount)');
@@ -3379,14 +3436,7 @@ class SyncClient {
             _db!.execBulkRemote(sql);
           }
           await _db!.endBulkRemote();
-
-          // Recompute row_hash for modified rows so the fast path stays current
-          for (final row in response.serverWins) {
-            final rowId = row['id']?.toString();
-            if (rowId != null) {
-              await _db!.updateRowHash(table, rowId);
-            }
-          }
+          // row_hash is now server-authoritative — included in row data from server via _generateSql
         } catch (e) {
           await _db!.endBulkRemote(rollback: true);
           rethrow;

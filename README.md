@@ -274,6 +274,60 @@ dependencies:
       ref: main
 ```
 
+## Integration Tests
+
+There are 17 integration tests in `example/integration_test/` that verify the Dart sync client against the synclib server. They mirror the 17 Playwright tests in the JS test harness.
+
+### Prerequisites
+
+1. Start the org server with the test JWT secret:
+
+```bash
+cd /path/to/synclib_server
+JWT_SECRET=synclib_test_secret mix phx.server
+```
+
+2. The server must be running on `localhost:4444`.
+
+### Running Tests
+
+Run each test file individually from the example directory (macOS desktop):
+
+```bash
+cd example
+flutter test integration_test/general_sync_test.dart -d macos
+flutter test integration_test/server_authoritative_hash_test.dart -d macos
+flutter test integration_test/reconnect_sync_test.dart -d macos
+flutter test integration_test/merkle_soft_delete_test.dart -d macos
+```
+
+**Note:** Running all files at once (`flutter test integration_test/ -d macos`) may fail due to a macOS Flutter integration test runner limitation where the app can't reliably restart between test files.
+
+### Test Files
+
+| File | Tests | What it covers |
+|------|-------|----------------|
+| `general_sync_test.dart` | 10 | Two-client sync, delete sync, update sync, concurrent adds, room scoping, reconnect persistence, delete/re-add, large batch (20 items), sync state transitions, pending changes cleared |
+| `server_authoritative_hash_test.dart` | 5 | Push gets row_hash, pull gets row_hash, merkle verification (no spurious mismatches), no null hashes after full cycle, update changes hash |
+| `reconnect_sync_test.dart` | 1 | Reconnect auto-syncs and receives items added while offline |
+| `merkle_soft_delete_test.dart` | 1 | Soft-deleted items sync correctly, merkle verification stays stable (no spurious repairs) |
+
+### Test Helpers
+
+`helpers.dart` provides the test infrastructure:
+
+- `createTestClient(userId, roomId)` — Opens a temp DB, creates a `SyncClient`, connects with an HS256 JWT, and syncs
+- `reconnectClient(old)` — Creates a fresh `SyncClient` reusing the same DB file (simulates reconnection)
+- `addItem / deleteItem / updateItem` — CRUD via `db.writeWithParams()` on the `items` table
+- `getItems / getItemCount` — Query non-deleted items filtered by room_id
+- `waitForItemCount(client, n)` — Polls until count >= n or timeout
+- `getRowHashStats / getRowHashes` — Inspect server-computed `row_hash` values
+- `resetServer()` — HTTP DELETE to `/api/test/items`
+
+## Example
+
+See [example/main.dart](example/lib/main.dart) for a complete working example app.
+
 ## License
 
 MIT

@@ -1,0 +1,39 @@
+name: example
+description: "Synclib Sync example app with integration tests."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  synclib_sync:
+    path: ../
+  synclib_flutter:
+    git:
+      url: git@github.com:synclib-io/synclib_flutter.git
+      ref: main
+  path_provider: ^2.1.0
+  cupertino_icons: ^1.0.8
+  logging: ^1.2.0
+  dart_jsonwebtoken: ^3.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  http: ^1.2.0
+  flutter_lints: ^5.0.0
+
+dependency_overrides:
+  synclib_flutter:
+    git:
+      url: git@github.com:synclib-io/synclib_flutter.git
+      ref: main
+
+flutter:
+  uses-material-design: true
