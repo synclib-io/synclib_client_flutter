@@ -10,12 +10,12 @@ Connects a local SQLite database (via [synclib_flutter](https://github.com/syncl
 Local SQLite                          synclib server (Postgres)
 ┌───────────┐    WebSocket / Phoenix   ┌──────────────────┐
 │ your app   │◄═══════════════════════►│ sync channel      │
-│            │                         │                    │
+│            │                         │                   │
 │ push ─────►│── pending changes ────► │ apply + broadcast │
-│            │                         │                    │
-│ ◄── pull ──│◄── newer rows ──────── │ seqnum triggers   │
-│            │                         │                    │
-│ verify ───►│◄── merkle compare ───► │ hash triggers     │
+│            │                         │                   │
+│ ◄── pull ──│◄── newer rows ────────  │ seqnum triggers   │
+│            │                         │                   │
+│ verify ───►│◄── merkle compare ───►  │ hash triggers     │
 └───────────┘                          └──────────────────┘
 ```
 
