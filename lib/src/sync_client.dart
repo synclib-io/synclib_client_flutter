@@ -1244,10 +1244,54 @@ class SyncClient {
   // SIMPLIFIED SYNC HANDSHAKE - New unified sync implementation
   // ==========================================================================
 
+  /// Ensure the stripped-row tracking table exists.
+  Future<void> _ensureStrippedAckTable() async {
+    await _db!.exec('''
+      CREATE TABLE IF NOT EXISTS _synclib_stripped_ack (
+        "table" TEXT NOT NULL,
+        row_id TEXT NOT NULL,
+        acked_at INTEGER NOT NULL,
+        PRIMARY KEY ("table", row_id)
+      )
+    ''');
+  }
+
+  /// Record rows that came back still stripped after a refresh request.
+  /// These won't be re-requested until access changes (purchase, etc.).
+  Future<void> _ackStrippedRows(String table, List<String> rowIds) async {
+    if (rowIds.isEmpty) return;
+    await _ensureStrippedAckTable();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final rowId in rowIds) {
+      await _db!.exec(
+        "INSERT OR REPLACE INTO _synclib_stripped_ack (\"table\", row_id, acked_at) "
+        "VALUES ('${_escapeSql(table)}', '${_escapeSql(rowId)}', $now)"
+      );
+    }
+    _logger.info('Acked ${rowIds.length} still-stripped rows in $table (will skip on next sync)');
+  }
+
+  /// Clear stripped-ack records for given tables so they get re-requested.
+  /// Call this after a purchase or access change.
+  Future<void> clearStrippedAck([List<String>? tables]) async {
+    await _ensureStrippedAckTable();
+    if (tables == null || tables.isEmpty) {
+      await _db!.exec('DELETE FROM _synclib_stripped_ack');
+      _logger.info('Cleared all stripped-ack records');
+    } else {
+      for (final table in tables) {
+        await _db!.exec("DELETE FROM _synclib_stripped_ack WHERE \"table\" = '${_escapeSql(table)}'");
+      }
+      _logger.info('Cleared stripped-ack records for: ${tables.join(', ')}');
+    }
+  }
+
   /// Find all rows that have _stripped=true in their document
-  /// These rows need to be refreshed to get full content
+  /// These rows need to be refreshed to get full content.
+  /// Excludes rows that were already refreshed and came back still stripped.
   Future<List<RowRef>> _findStrippedRows(List<String> tables) async {
     final rows = <RowRef>[];
+    await _ensureStrippedAckTable();
 
     for (final table in tables) {
       try {
@@ -1267,13 +1311,19 @@ class SyncClient {
         final nullDocCount = nullDocResult.isNotEmpty ? nullDocResult.first['cnt'] as int : 0;
 
         // Stripped content has NULL/null document OR _stripped flag in document
+        // Exclude rows already acked as intentionally stripped
         final result = await _db!.read('''
-          SELECT "id" FROM ${_quoteId(table)}
-          WHERE "document" IS NULL
-             OR json("document") IS NULL
-             OR json("document") = 'null'
-             OR json_extract("document", '\$._stripped') = 1
-             OR json_extract("document", '\$._stripped') = true
+          SELECT t."id" FROM ${_quoteId(table)} t
+          LEFT JOIN _synclib_stripped_ack sa
+            ON sa."table" = '${_escapeSql(table)}' AND sa.row_id = t."id"
+          WHERE sa.row_id IS NULL
+            AND (
+              t."document" IS NULL
+              OR json(t."document") IS NULL
+              OR json(t."document") = 'null'
+              OR json_extract(t."document", '\$._stripped') = 1
+              OR json_extract(t."document", '\$._stripped') = true
+            )
         ''');
 
         for (final row in result) {
@@ -1702,6 +1752,9 @@ class SyncClient {
       // Apply batch
       await _db!.beginBulkRemote();
       int skippedCount = 0;
+      // Track rows that came back still stripped after a refresh request
+      final stillStrippedIds = <String>[];
+
       try {
         for (final row in message.rows) {
           try {
@@ -1722,6 +1775,16 @@ class SyncClient {
               );
               final sql = _generateSql(change);
               await _db!.execBulkRemote(sql);
+
+              // If this was a stripped refresh and the row is still stripped,
+              // track it so we don't re-request it next sync
+              if (message.isStrippedRefresh) {
+                final doc = row['document'];
+                final isStillStripped = doc is Map && doc['_stripped'] == true;
+                if (isStillStripped) {
+                  stillStrippedIds.add(row['id'] as String);
+                }
+              }
             }
           } catch (rowErr) {
             skippedCount++;
@@ -1734,6 +1797,11 @@ class SyncClient {
           _logger.warning('Skipped $skippedCount bad rows in ${message.table}');
         }
         _logger.info('Applied sync batch for ${message.table}');
+
+        // Ack rows that are confirmed still stripped (user has no access)
+        if (stillStrippedIds.isNotEmpty) {
+          await _ackStrippedRows(message.table, stillStrippedIds);
+        }
       } catch (e) {
         _logger.severe('Failed to apply sync batch for ${message.table}: $e');
         await _db!.endBulkRemote(rollback: true);
@@ -3044,27 +3112,47 @@ class SyncClient {
       final allTables = channel.allTableNames;
       _logger.fine('Merkle verification on ${channel.topic}: ${allTables.join(', ')}');
 
+      // 1. Verify root hashes — wrap in timeout so a slow server response
+      //    doesn't block the entire sync for 10s+.
+      List<MerkleMismatch> mismatches;
       try {
-        // 1. Verify all tables on this channel at once (root comparison)
-        final mismatches = await _verifyRoots(
+        mismatches = await _verifyRoots(
           tables: allTables,
           blockSize: blockSize,
           channelTopic: channel.topic,
           hashColumns: _serverHashColumns,
-        );
+        ).timeout(const Duration(seconds: 8), onTimeout: () {
+          _logger.warning('Merkle root verification timed out on ${channel.topic} — skipping');
+          return <MerkleMismatch>[];
+        });
+      } catch (e) {
+        _logger.warning('Merkle root verification failed on ${channel.topic}: $e');
+        continue;
+      }
 
-        // 2. For each mismatch, repair using the appropriate direction
-        for (final mismatch in mismatches) {
-          final tableName = mismatch.table;
-          final syncTable = channel.tables
-              .where((t) => t.name == tableName)
-              .firstOrNull;
-          final direction = syncTable != null
-              ? channel.directionFor(syncTable)
-              : channel.defaultDirection;
+      // 2. For each mismatch, repair using the appropriate direction.
+      //    Each table repair is independently try-caught so one failure
+      //    doesn't skip the rest. However, if the channel enters errored
+      //    state (e.g. from a timeout), bail out — all subsequent pushes
+      //    will fail immediately.
+      for (final mismatch in mismatches) {
+        // Check connection health before attempting repair
+        if (!_ws.isConnected) {
+          _logger.warning('Merkle repair: connection lost, skipping remaining repairs on ${channel.topic}');
+          break;
+        }
 
-          _logger.info('Merkle repair: $tableName on ${channel.topic} direction=${direction.name}');
+        final tableName = mismatch.table;
+        final syncTable = channel.tables
+            .where((t) => t.name == tableName)
+            .firstOrNull;
+        final direction = syncTable != null
+            ? channel.directionFor(syncTable)
+            : channel.defaultDirection;
 
+        _logger.info('Merkle repair: $tableName on ${channel.topic} direction=${direction.name}');
+
+        try {
           switch (direction) {
             case RepairDirection.pull:
               await _repairTablePull(tableName, blockSize, channelTopic: channel.topic, hashColumns: _serverHashColumns, scopedRowIds: mismatch.rowIds);
@@ -3077,9 +3165,14 @@ class SyncClient {
               break;
           }
           allRepairedTables.add(tableName);
+        } catch (e) {
+          final msg = e.toString();
+          if (msg.contains('errored channel') || msg.contains('ChannelTimeout')) {
+            _logger.warning('Merkle repair: channel errored on $tableName, skipping remaining repairs on ${channel.topic}');
+            break;
+          }
+          _logger.warning('Merkle repair failed for $tableName on ${channel.topic}: $e — skipping');
         }
-      } catch (e) {
-        _logger.warning('Merkle verification failed on ${channel.topic}: $e');
       }
     }
   }
@@ -3301,17 +3394,47 @@ class SyncClient {
       final responseMap = await _ws.sendRaw('merkle_block_hashes', payload, channelTopic: channelTopic);
       final response = MerkleBlockHashesResponse.fromMap(responseMap);
 
-      if (response.differingBlocks.isEmpty) {
+      if (response.differingBlocks.isEmpty && scopedRowIds == null) {
         _logger.info('verifyIntegrity: $table - no differing blocks (hash collision resolved)');
         return;
       }
 
-      _logger.info('verifyIntegrity: $table - ${response.differingBlocks.length} differing blocks: '
-          '${response.differingBlocks}');
+      if (response.differingBlocks.isNotEmpty) {
+        _logger.info('verifyIntegrity: $table - ${response.differingBlocks.length} differing blocks: '
+            '${response.differingBlocks}');
 
-      // 3. Fetch and apply each differing block
-      for (final blockIndex in response.differingBlocks) {
-        await _fetchAndApplyBlock(table, blockIndex, blockSize, channelTopic: channelTopic);
+        // 3. Fetch and apply each differing block
+        for (final blockIndex in response.differingBlocks) {
+          await _fetchAndApplyBlock(table, blockIndex, blockSize, channelTopic: channelTopic);
+        }
+      }
+
+      // 4. Delete local rows that are outside server's scope.
+      //    This handles the case where server has fewer rows than client
+      //    (e.g. rolling time window filters out old posts).
+      if (scopedRowIds != null) {
+        final allLocalIds = await _merkle!.getAllRowIds(table);
+        final scopedSet = scopedRowIds.toSet();
+        final outOfScope = allLocalIds.where((id) => !scopedSet.contains(id)).toList();
+        if (outOfScope.isNotEmpty) {
+          _logger.info('verifyIntegrity: $table - deleting ${outOfScope.length} out-of-scope rows');
+          _db!.beginBulkRemote();
+          try {
+            for (final rowId in outOfScope) {
+              final change = ChangeMessage(
+                table: table,
+                operation: 'delete',
+                rowId: rowId,
+              );
+              final sql = _generateSql(change);
+              _db!.execBulkRemote(sql);
+            }
+            await _db!.endBulkRemote();
+          } catch (e) {
+            await _db!.endBulkRemote(rollback: true);
+            rethrow;
+          }
+        }
       }
 
       _logger.info('verifyIntegrity: $table - repair complete');
@@ -3414,7 +3537,10 @@ class SyncClient {
     List<String>? scopedRowIds,
   }) async {
     // 1. Get block hashes and find differing blocks (same as pull)
-    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize, hashColumns: hashColumns, scopedRowIds: scopedRowIds);
+    // When scopedRowIds is empty (server has 0 rows), compute over ALL local
+    // rows so the server can identify which blocks the client needs to push.
+    final effectiveScope = (scopedRowIds != null && scopedRowIds.isEmpty) ? null : scopedRowIds;
+    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize, hashColumns: hashColumns, scopedRowIds: effectiveScope);
     _logger.fine('repairPush: $table has ${blockHashes.length} blocks');
 
     final payload = <String, dynamic>{
@@ -3519,7 +3645,10 @@ class SyncClient {
     List<String>? scopedRowIds,
   }) async {
     // 1. Get block hashes and find differing blocks (same as pull/push)
-    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize, hashColumns: hashColumns, scopedRowIds: scopedRowIds);
+    // When scopedRowIds is empty (server has 0 rows), compute over ALL local
+    // rows so the server can identify which blocks differ.
+    final effectiveScope = (scopedRowIds != null && scopedRowIds.isEmpty) ? null : scopedRowIds;
+    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize, hashColumns: hashColumns, scopedRowIds: effectiveScope);
     _logger.fine('repairLww: $table has ${blockHashes.length} blocks');
 
     final payload = <String, dynamic>{

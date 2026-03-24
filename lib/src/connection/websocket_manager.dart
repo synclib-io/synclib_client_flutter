@@ -105,7 +105,7 @@ class WebSocketManager {
       _socket = PhoenixSocket(
         url,
         socketOptions: PhoenixSocketOptions(
-          timeout: const Duration(seconds: 10),
+          timeout: const Duration(seconds: 30),
           params: stringParams,
         ),
       );
