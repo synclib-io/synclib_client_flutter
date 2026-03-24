@@ -11,10 +11,10 @@ dependencies:
   flutter:
     sdk: flutter
   synclib_flutter:
-   path: ../synclib_flutter
-    # git:
-    #   url: git@github.com:paperview/synclib_flutter.git
-    #   ref: master
+  #  path: ../synclib_flutter
+    git:
+      url: git@github.com:paperview/synclib_flutter.git
+      ref: master
   web_socket_channel: ^3.0.0
   msgpack_dart: ^1.0.1
   logging: ^1.2.0
