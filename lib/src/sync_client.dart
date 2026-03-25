@@ -1186,86 +1186,21 @@ class SyncClient {
   // SIMPLIFIED SYNC HANDSHAKE - New unified sync implementation
   // ==========================================================================
 
-  /// Ensure the stripped-row tracking table exists.
-  Future<void> _ensureStrippedAckTable() async {
-    await _db!.exec('''
-      CREATE TABLE IF NOT EXISTS _synclib_stripped_ack (
-        "table" TEXT NOT NULL,
-        row_id TEXT NOT NULL,
-        acked_at INTEGER NOT NULL,
-        PRIMARY KEY ("table", row_id)
-      )
-    ''');
-  }
-
-  /// Record rows that came back still stripped after a refresh request.
-  /// These won't be re-requested until access changes (purchase, etc.).
-  Future<void> _ackStrippedRows(String table, List<String> rowIds) async {
-    if (rowIds.isEmpty) return;
-    await _ensureStrippedAckTable();
-    final now = DateTime.now().millisecondsSinceEpoch;
-    for (final rowId in rowIds) {
-      await _db!.exec(
-        "INSERT OR REPLACE INTO _synclib_stripped_ack (\"table\", row_id, acked_at) "
-        "VALUES ('${_escapeSql(table)}', '${_escapeSql(rowId)}', $now)"
-      );
-    }
-    _logger.info('Acked ${rowIds.length} still-stripped rows in $table (will skip on next sync)');
-  }
-
-  /// Clear stripped-ack records for given tables so they get re-requested.
-  /// Call this after a purchase or access change.
-  Future<void> clearStrippedAck([List<String>? tables]) async {
-    await _ensureStrippedAckTable();
-    if (tables == null || tables.isEmpty) {
-      await _db!.exec('DELETE FROM _synclib_stripped_ack');
-      _logger.info('Cleared all stripped-ack records');
-    } else {
-      for (final table in tables) {
-        await _db!.exec("DELETE FROM _synclib_stripped_ack WHERE \"table\" = '${_escapeSql(table)}'");
-      }
-      _logger.info('Cleared stripped-ack records for: ${tables.join(', ')}');
-    }
-  }
-
-  /// Find all rows that have _stripped=true in their document.
+  /// Find all rows that have stripped/null documents.
   /// These rows need to be refreshed to get full content.
-  /// Excludes rows that were already refreshed and came back still stripped.
   Future<List<RowRef>> _findStrippedRows(List<String> tables) async {
-    await _ensureStrippedAckTable();
     final rows = <RowRef>[];
 
     for (final table in tables) {
       try {
-        // First check how many rows exist in the table
-        final countResult = await _db!.read('SELECT COUNT(*) as cnt FROM ${_quoteId(table)}');
-        final totalRows = countResult.isNotEmpty ? countResult.first['cnt'] as int : 0;
-
-        // Check for NULL documents specifically
-        // Note: JSONB columns store null as binary bytes, not SQL NULL
-        // So we check both SQL NULL and json(document) = 'null'
-        final nullDocResult = await _db!.read('''
-          SELECT COUNT(*) as cnt FROM ${_quoteId(table)}
+        // Stripped content has NULL/null document OR _stripped flag in document
+        final result = await _db!.read('''
+          SELECT "id" FROM ${_quoteId(table)}
           WHERE "document" IS NULL
              OR json("document") IS NULL
              OR json("document") = 'null'
-        ''');
-        final nullDocCount = nullDocResult.isNotEmpty ? nullDocResult.first['cnt'] as int : 0;
-
-        // Stripped content has NULL/null document OR _stripped flag in document.
-        // Exclude rows already acked as intentionally stripped (user lacks access).
-        final result = await _db!.read('''
-          SELECT t."id" FROM ${_quoteId(table)} t
-          LEFT JOIN _synclib_stripped_ack sa
-            ON sa."table" = '${_escapeSql(table)}' AND sa.row_id = t."id"
-          WHERE sa.row_id IS NULL
-            AND (
-              t."document" IS NULL
-              OR json(t."document") IS NULL
-              OR json(t."document") = 'null'
-              OR json_extract(t."document", '\$._stripped') = 1
-              OR json_extract(t."document", '\$._stripped') = true
-            )
+             OR json_extract("document", '\$._stripped') = 1
+             OR json_extract("document", '\$._stripped') = true
         ''');
 
         for (final row in result) {
@@ -1273,12 +1208,9 @@ class SyncClient {
         }
 
         if (result.isNotEmpty) {
-          _logger.info('Found ${result.length} stripped rows in $table (total rows: $totalRows)');
-        } else if (nullDocCount > 0) {
-          _logger.warning('$table has $nullDocCount rows with NULL document but query returned 0 stripped rows!');
+          _logger.info('Found ${result.length} stripped rows in $table');
         }
       } catch (e, stack) {
-        // Log at warning level so we can see errors
         _logger.warning('Could not check stripped rows in $table: $e');
         _logger.fine('Stack trace: $stack');
       }
@@ -1692,9 +1624,6 @@ class SyncClient {
       }
 
       // Apply batch
-      // Track rows that came back still stripped after a refresh request
-      final stillStrippedIds = <String>[];
-
       await _db!.beginBulkRemote();
       int skippedCount = 0;
       try {
@@ -1718,15 +1647,6 @@ class SyncClient {
               final sql = _generateSql(change);
               await _db!.execBulkRemote(sql);
 
-              // If this was a stripped refresh and the row is still stripped,
-              // track it so we don't re-request it next sync
-              if (message.isStrippedRefresh) {
-                final doc = row['document'];
-                final isStillStripped = doc is Map && doc['_stripped'] == true;
-                if (isStillStripped) {
-                  stillStrippedIds.add(row['id'] as String);
-                }
-              }
             }
           } catch (rowErr) {
             skippedCount++;
@@ -1737,11 +1657,6 @@ class SyncClient {
         // row_hash is now server-authoritative — included in row data from server
         if (skippedCount > 0) {
           _logger.warning('Skipped $skippedCount bad rows in ${message.table}');
-        }
-
-        // Ack rows that are confirmed still stripped (user has no access)
-        if (stillStrippedIds.isNotEmpty) {
-          await _ackStrippedRows(message.table, stillStrippedIds);
         }
 
         _logger.info('Applied sync batch for ${message.table}');
