@@ -2392,10 +2392,18 @@ class SyncClient {
         return 'INSERT INTO $qt ($columns) VALUES ($values) '
             'ON CONFLICT("id") DO UPDATE SET $updates';
       case 'update':
-        final sets = filteredData.entries
+        // Use UPSERT so that rows the client hasn't seen yet are created
+        // (e.g., server broadcasts an update for a row inserted before the client connected)
+        final updateColumns = ['"id"', ...filteredData.keys.map((k) => _quoteId(k))].join(', ');
+        final updateValues = ['\'${_escapeSql(change.rowId)}\'', ...filteredData.values.map((v) => _formatSqlValue(v))].join(', ');
+        final updates = filteredData.entries
           .map((e) => '${_quoteId(e.key)} = ${_formatSqlValue(e.value)}')
           .join(', ');
-        return 'UPDATE $qt SET $sets WHERE "id" = \'${_escapeSql(change.rowId)}\'';
+        if (filteredData.isEmpty) {
+          return 'INSERT OR IGNORE INTO $qt ("id") VALUES (\'${_escapeSql(change.rowId)}\')';
+        }
+        return 'INSERT INTO $qt ($updateColumns) VALUES ($updateValues) '
+            'ON CONFLICT("id") DO UPDATE SET $updates';
 
       case 'delete':
         return 'DELETE FROM $qt WHERE "id" = \'${_escapeSql(change.rowId)}\'';
@@ -2481,23 +2489,54 @@ class SyncClient {
         return (sql: insertSql, params: params);
 
       case 'update':
-        final setClauses = <String>[];
+        // Use UPSERT so that rows the client hasn't seen yet are created
+        // (e.g., server broadcasts an update for a row inserted before the client connected)
+        final updateColumns = ['"id"', ...filteredData.keys.map((k) => _quoteId(k))].join(', ');
+
+        final updatePlaceholderList = <String>['?']; // id
+        for (final value in filteredData.values) {
+          if (value is Map || value is List) {
+            updatePlaceholderList.add('jsonb(?)');
+          } else {
+            updatePlaceholderList.add('?');
+          }
+        }
+        final updatePlaceholders = updatePlaceholderList.join(', ');
+
+        // INSERT values params
+        params.add(change.rowId);
+        for (final value in filteredData.values) {
+          if (value is Map || value is List) {
+            params.add(jsonEncode(value));
+          } else if (value is bool) {
+            params.add(value ? '1' : '0');
+          } else {
+            params.add(value?.toString());
+          }
+        }
+
+        // ON CONFLICT UPDATE params
+        final updateSetClauses = <String>[];
         for (final entry in filteredData.entries) {
           if (entry.value is Map || entry.value is List) {
-            setClauses.add('${_quoteId(entry.key)} = jsonb(?)');
+            updateSetClauses.add('${_quoteId(entry.key)} = jsonb(?)');
             params.add(jsonEncode(entry.value));
           } else if (entry.value is bool) {
-            setClauses.add('${_quoteId(entry.key)} = ?');
+            updateSetClauses.add('${_quoteId(entry.key)} = ?');
             params.add(entry.value ? '1' : '0');
           } else {
-            setClauses.add('${_quoteId(entry.key)} = ?');
+            updateSetClauses.add('${_quoteId(entry.key)} = ?');
             params.add(entry.value?.toString());
           }
         }
 
-        final updateSql = 'UPDATE $qt SET ${setClauses.join(', ')} WHERE "id" = ?';
-        params.add(change.rowId);
-        return (sql: updateSql, params: params);
+        if (filteredData.isEmpty) {
+          final ignoreSql = 'INSERT OR IGNORE INTO $qt ("id") VALUES (?)';
+          return (sql: ignoreSql, params: [change.rowId]);
+        }
+        final upsertSql = 'INSERT INTO $qt ($updateColumns) VALUES ($updatePlaceholders) '
+            'ON CONFLICT("id") DO UPDATE SET ${updateSetClauses.join(', ')}';
+        return (sql: upsertSql, params: params);
 
       default:
         throw ArgumentError('Unsupported operation for parameterized query: ${change.operation}');
