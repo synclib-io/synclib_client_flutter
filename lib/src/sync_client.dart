@@ -1870,11 +1870,12 @@ class SyncClient {
     // Create a gate so connect() doesn't return until the server reply
     // (which may trigger migrations) is fully processed
     _helloHandshakeCompleter = Completer<void>();
+    final helloFuture = _helloHandshakeCompleter!.future;
 
     await _ws.send(hello, channelTopic: config.channels.first.topic);
     _logger.info('Sent hello message with schema version $schemaVersion');
 
-    await _helloHandshakeCompleter!.future;
+    await helloFuture;
   }
 
   /// Enqueue a message for serialized processing.
