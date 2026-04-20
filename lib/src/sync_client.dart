@@ -1234,6 +1234,33 @@ class SyncClient {
     }
   }
 
+  /// Wait for both socket connection and at least one channel to be joined.
+  /// Triggers reconnect if needed, then waits for channels to rejoin.
+  Future<void> _waitForConnectionAndChannels({Duration timeout = const Duration(seconds: 30)}) async {
+    await _waitForConnection(timeout: timeout);
+
+    // After socket connects, channels may still be rejoining
+    if (_ws.hasJoinedChannel) return;
+
+    _logger.info('Socket connected but no joined channels, waiting for channel rejoin...');
+    final completer = Completer<void>();
+    // Poll briefly — _handleStateChange calls _joinChannels on reconnect
+    final timer = Timer.periodic(const Duration(milliseconds: 200), (t) {
+      if (_ws.hasJoinedChannel) {
+        t.cancel();
+        if (!completer.isCompleted) completer.complete();
+      }
+    });
+
+    try {
+      await completer.future.timeout(timeout, onTimeout: () {
+        throw TimeoutException('Timed out waiting for channel rejoin', timeout);
+      });
+    } finally {
+      timer.cancel();
+    }
+  }
+
   /// Manually trigger a sync cycle.
   /// Calls syncUnified() which handles push, pull, schema, and stripped content.
   Future<void> sync() async {
@@ -2810,10 +2837,10 @@ class SyncClient {
     Map<String, dynamic> payload,
     {String? channelTopic, bool waitForReconnect = true}
   ) async {
-    if (!_ws.isConnected) {
+    if (!_ws.isConnected || !_ws.hasJoinedChannel) {
       if (waitForReconnect) {
-        _logger.info('sendMessage: Not connected, waiting for reconnection...');
-        await _waitForConnection();
+        _logger.info('sendMessage: Not connected or channel not joined, waiting for reconnection...');
+        await _waitForConnectionAndChannels();
       } else {
         throw Exception('Not connected to server');
       }
@@ -2825,6 +2852,13 @@ class SyncClient {
       final response = await _ws.sendRaw(event, payload, channelTopic: channelTopic);
       return response;
     } catch (e) {
+      // If channel was closed (e.g. network switch), reconnect and retry once
+      if (waitForReconnect && e is StateError && e.message.contains('not joined')) {
+        _logger.info('sendMessage: Channel closed, reconnecting and retrying $event...');
+        await _waitForConnectionAndChannels();
+        final response = await _ws.sendRaw(event, payload, channelTopic: channelTopic);
+        return response;
+      }
       _logger.severe('Failed to send message: $e');
       rethrow;
     }

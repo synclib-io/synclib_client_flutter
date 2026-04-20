@@ -105,7 +105,7 @@ class WebSocketManager {
       _socket = PhoenixSocket(
         url,
         socketOptions: PhoenixSocketOptions(
-          timeout: const Duration(seconds: 30),
+          timeout: const Duration(seconds: 60),
           params: stringParams,
         ),
       );
@@ -278,7 +278,11 @@ class WebSocketManager {
             : _channels.values.first;
       }
 
-      final push = channel!.push(event, map);
+      if (channel!.state != PhoenixChannelState.joined) {
+        throw StateError('Channel is ${channel.state}, not joined');
+      }
+
+      final push = channel.push(event, map);
       await push.future;
 
       _logger.fine('Sent message: $event');
@@ -287,6 +291,11 @@ class WebSocketManager {
       rethrow;
     }
   }
+
+  /// Whether at least one channel is in the joined state
+  bool get hasJoinedChannel => _channels.values.any(
+    (ch) => ch.state == PhoenixChannelState.joined,
+  );
 
   /// Send a raw message with custom event and payload, returns server response
   Future<Map<String, dynamic>> sendRaw(
@@ -310,7 +319,11 @@ class WebSocketManager {
             : _channels.values.first;
       }
 
-      final push = channel!.push(event, payload);
+      if (channel!.state != PhoenixChannelState.joined) {
+        throw StateError('Channel is ${channel.state}, not joined');
+      }
+
+      final push = channel.push(event, payload);
       final response = await push.future;
 
       _logger.fine('Sent on channel ${channelTopic ?? 'default'} raw message: $event, received response');
