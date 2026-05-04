@@ -28,6 +28,9 @@ class WebSocketManager {
   ConnectionState _state = ConnectionState.disconnected;
   StreamController<SyncMessage>? _messageController;
   StreamController<ConnectionState>? _stateController;
+  StreamSubscription? _closeSub;
+  StreamSubscription? _errorSub;
+  StreamSubscription? _openSub;
   int _reconnectAttempts = 0;
   Map<String, dynamic>? _connectionParams;
   DateTime? _connectStartTime;
@@ -76,6 +79,13 @@ class WebSocketManager {
     // This ensures we don't have stale channel objects with _joinedOnce = true
     if (_socket != null) {
       _logger.info('Cleaning up existing socket before reconnect');
+      // Cancel stream subscriptions first to prevent stale callbacks
+      _closeSub?.cancel();
+      _errorSub?.cancel();
+      _openSub?.cancel();
+      _closeSub = null;
+      _errorSub = null;
+      _openSub = null;
       for (final channel in _channels.values) {
         try {
           channel.leave();
@@ -111,25 +121,29 @@ class WebSocketManager {
       );
 
       // Set up listeners before connecting
-      _socket!.closeStream.listen((event) {
+      _closeSub = _socket!.closeStream.listen((event) {
         _logger.warning('Socket closed');
         _onDone();
         // Complete with error if we're still waiting for connection
         if (!connectionCompleter.isCompleted) {
           connectionCompleter.completeError(StateError('Socket closed before connection established'));
         }
+      }, onError: (e) {
+        _logger.warning('Close stream error: $e');
       });
 
-      _socket!.errorStream.listen((error) {
+      _errorSub = _socket!.errorStream.listen((error) {
         _logger.severe('Socket error: $error');
         _onError(error);
         // Complete with error if we're still waiting for connection
         if (!connectionCompleter.isCompleted) {
           connectionCompleter.completeError(error);
         }
+      }, onError: (e) {
+        _logger.warning('Error stream error: $e');
       });
 
-      _socket!.openStream.listen((event) {
+      _openSub = _socket!.openStream.listen((event) {
         _logger.info('Socket opened');
         _updateState(ConnectionState.connected);
         _reconnectAttempts = 0;
@@ -138,6 +152,8 @@ class WebSocketManager {
         if (!connectionCompleter.isCompleted) {
           connectionCompleter.complete();
         }
+      }, onError: (e) {
+        _logger.warning('Open stream error: $e');
       });
 
       // Connect socket
@@ -243,6 +259,14 @@ class WebSocketManager {
 
     // Mark as intentional to prevent auto-reconnect
     _intentionalDisconnect = true;
+
+    // Cancel stream subscriptions to prevent stale callbacks
+    _closeSub?.cancel();
+    _errorSub?.cancel();
+    _openSub?.cancel();
+    _closeSub = null;
+    _errorSub = null;
+    _openSub = null;
 
     // Leave all channels
     for (final channel in _channels.values) {
