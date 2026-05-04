@@ -1902,18 +1902,7 @@ class SyncClient {
     await _ws.send(hello, channelTopic: config.channels.first.topic);
     _logger.info('Sent hello message with schema version $schemaVersion');
 
-    await helloFuture.timeout(
-      const Duration(seconds: 30),
-      onTimeout: () {
-        _logger.severe('Hello handshake timed out after 30s');
-        if (_helloHandshakeCompleter != null && !_helloHandshakeCompleter!.isCompleted) {
-          _helloHandshakeCompleter!.completeError(
-            TimeoutException('Hello handshake timed out', const Duration(seconds: 30)),
-          );
-          _helloHandshakeCompleter = null;
-        }
-      },
-    );
+    await helloFuture;
   }
 
   /// Enqueue a message for serialized processing.
@@ -2343,35 +2332,33 @@ class SyncClient {
     }
 
     // Check if this is a hello response with migrations
-    try {
-      if (response['status'] == 'upgrade_needed') {
-        _logger.info('Schema upgrade needed');
-        _updateReadyState(SyncReadyState.applyingMigrations);
-        await _applyMigrations(response);
+    if (response['status'] == 'upgrade_needed') {
+      _logger.info('Schema upgrade needed');
+      _updateReadyState(SyncReadyState.applyingMigrations);
+      await _applyMigrations(response);
+      _updateReadyState(SyncReadyState.ready);
+    } else if (response['status'] == 'up_to_date') {
+      _logger.info('Schema is up to date');
+      _updateReadyState(SyncReadyState.ready);
+    } else if (response['status'] == 'ok') {
+      _logger.fine('Received OK response');
+      // If we were waiting for hello, mark as ready
+      if (_readyState == SyncReadyState.waitingForHello) {
         _updateReadyState(SyncReadyState.ready);
-      } else if (response['status'] == 'up_to_date') {
-        _logger.info('Schema is up to date');
-        _updateReadyState(SyncReadyState.ready);
-      } else if (response['status'] == 'ok') {
-        _logger.fine('Received OK response');
-        // If we were waiting for hello, mark as ready
-        if (_readyState == SyncReadyState.waitingForHello) {
-          _updateReadyState(SyncReadyState.ready);
-        }
-      } else if (response['status'] == 'error') {
-        final error = response['error'] ?? 'unknown';
-        _logger.severe('Hello error from server: $error '
-            '(server_version: ${response['server_version']}, '
-            'client_version: ${response['client_version']})');
-        // Don't throw — syncUnified will also detect schema mismatch and throw
-        // a catchable StateError. Logging here ensures the hello error is visible.
       }
-    } finally {
-      // Always resolve the hello handshake gate so connect() doesn't hang forever
-      if (_helloHandshakeCompleter != null && !_helloHandshakeCompleter!.isCompleted) {
-        _helloHandshakeCompleter!.complete();
-        _helloHandshakeCompleter = null;
-      }
+    } else if (response['status'] == 'error') {
+      final error = response['error'] ?? 'unknown';
+      _logger.severe('Hello error from server: $error '
+          '(server_version: ${response['server_version']}, '
+          'client_version: ${response['client_version']})');
+      // Don't throw — syncUnified will also detect schema mismatch and throw
+      // a catchable StateError. Logging here ensures the hello error is visible.
+    }
+
+    // Resolve the hello handshake gate so connect() can proceed
+    if (_helloHandshakeCompleter != null && !_helloHandshakeCompleter!.isCompleted) {
+      _helloHandshakeCompleter!.complete();
+      _helloHandshakeCompleter = null;
     }
   }
 
@@ -2433,15 +2420,11 @@ class SyncClient {
       }
     }
 
-    // Best-effort confirm — don't fail if connection dropped after local migrations succeeded.
-    // On reconnect, client will send fresh hello with correct schema version.
-    try {
-      final confirm = SchemaConfirmMessage(version: currentVersion);
-      await _ws.send(confirm, channelTopic: config.channels.first.topic);
-      _logger.info('Confirmed schema migration to server');
-    } catch (e) {
-      _logger.warning('Could not confirm schema migration to server (will re-sync on reconnect): $e');
-    }
+    // Confirm migration to server
+    final confirm = SchemaConfirmMessage(version: currentVersion);
+    await _ws.send(confirm, channelTopic: config.channels.first.topic);
+
+    _logger.info('Confirmed schema migration to server');
   }
 
   /// Handle connection state changes
@@ -2467,14 +2450,6 @@ class SyncClient {
       case ConnectionState.disconnected:
       case ConnectionState.failed:
         _stopPeriodicSync();
-        // Fail hello handshake completer if pending (prevents hang on flaky connections)
-        if (_helloHandshakeCompleter != null && !_helloHandshakeCompleter!.isCompleted) {
-          _logger.warning('Connection lost during hello handshake — failing completer');
-          _helloHandshakeCompleter!.completeError(
-            StateError('WebSocket disconnected during hello handshake'),
-          );
-          _helloHandshakeCompleter = null;
-        }
         // Fail any pending sync completers so syncUnified() doesn't hang
         // waiting for a sync_complete that will never arrive on the dead connection
         if (_activeSyncCompleters.isNotEmpty) {
