@@ -544,6 +544,7 @@ class SyncClient {
   bool _hasConnectedOnce = false;
   int _lastSyncedSeqnum = 0;
   final Set<int> _pendingAcks = {};
+  final Set<String> _syncedScopes = {};
 
   /// Get all sync table names from all channels.
   List<String> get _allSyncTables =>
@@ -2757,6 +2758,9 @@ class SyncClient {
   ///
   /// // With custom ordering (newest first)
   /// await syncClient.streamSnapshot(['videos'], orderBy: 'created_at', orderDesc: true);
+  ///
+  /// // With scope filtering (demand-driven sync)
+  /// await syncClient.streamSnapshot(['stages_weeks'], scope: 'program', scopeId: 'abc123');
   /// ```
   Future<void> streamSnapshot(
     List<String> tables, {
@@ -2765,6 +2769,8 @@ class SyncClient {
     bool waitForReconnect = true,
     String? orderBy,       // Column name like 'created_at', 'last_modified_ms', 'seqnum'
     bool orderDesc = true, // true = DESC, false = ASC (default descending)
+    String? scope,         // Scope name for demand-driven sync (e.g., 'browse', 'program')
+    String? scopeId,       // Parameter for parameterized scopes (e.g., programId)
   }) async {
     if (!_ws.isConnected) {
       if (waitForReconnect) {
@@ -2795,9 +2801,55 @@ class SyncClient {
       if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
       if (orderBy != null) 'order_by': orderBy,
       if (orderBy != null) 'order_desc': orderDesc,
+      if (scope != null) 'scope': scope,
+      if (scopeId != null) 'scope_id': scopeId,
     };
 
     await _ws.sendRaw('stream_snapshot', payload, channelTopic: channelTopic);
+  }
+
+  /// Sync a specific scope on demand.
+  ///
+  /// Deduplicates by scope key — calling this multiple times with the same
+  /// scope/parameter will only trigger the sync once.
+  ///
+  /// Example:
+  /// ```dart
+  /// // Sync browse scope
+  /// await syncClient.syncScope(SyncScopes.browse);
+  ///
+  /// // Sync parameterized scope
+  /// await syncClient.syncScope(SyncScopes.program('abc123'));
+  /// ```
+  Future<void> syncScope({
+    required String name,
+    required List<String> tables,
+    String? parameter,
+    String? parameterKey,
+    String? channelTopic,
+  }) async {
+    final scopeKey = parameter != null ? '$name:$parameter' : name;
+
+    if (_syncedScopes.contains(scopeKey)) {
+      _logger.info('Scope "$scopeKey" already synced, skipping');
+      return;
+    }
+
+    _syncedScopes.add(scopeKey);
+    _logger.info('Syncing scope "$scopeKey" with tables: $tables');
+
+    await streamSnapshot(
+      tables,
+      incremental: true,
+      scope: name,
+      scopeId: parameter,
+      channelTopic: channelTopic,
+    );
+  }
+
+  /// Reset synced scope tracking (e.g. on reconnection).
+  void resetSyncedScopes() {
+    _syncedScopes.clear();
   }
 
   /// Get the max seqnum for each table separately
