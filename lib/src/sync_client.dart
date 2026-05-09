@@ -2414,9 +2414,10 @@ class SyncClient {
             await _db!.exec(sql as String);
           } catch (e) {
             // Handle idempotent DDL operations (e.g., duplicate column from prior partial migration)
+            // Also handle ALTER on missing tables — v1 will recreate them from introspection
             final msg = e.toString().toLowerCase();
-            if (msg.contains('duplicate column') || msg.contains('already exists')) {
-              _logger.info('Skipping already-applied DDL: $sql');
+            if (msg.contains('duplicate column') || msg.contains('already exists') || msg.contains('no such table')) {
+              _logger.info('Skipping non-fatal DDL error: $sql ($e)');
             } else {
               rethrow;
             }
