@@ -696,8 +696,7 @@ class SyncClient {
   }
 
   /// One-time migration: switch to server-authoritative row_hash.
-  /// Sets all local row_hash values to '' (sentinel) so merkle comparison
-  /// detects mismatch and triggers repair from server.
+  /// Sets the flag so the client knows server sends authoritative hashes.
   Future<void> _migrateToServerAuthoritativeRowHash() async {
     try {
       await _db!.exec('''
@@ -713,14 +712,6 @@ class SyncClient {
       if (results.isNotEmpty) return; // Already migrated
 
       _logger.info('Migrating to server-authoritative row_hash');
-      for (final tableName in _allSyncTables) {
-        try {
-          await _db!.exec("UPDATE \"$tableName\" SET row_hash = ''");
-          _logger.info('Reset row_hash to sentinel for $tableName');
-        } catch (e) {
-          _logger.fine('Could not reset row_hash for $tableName: $e');
-        }
-      }
 
       await _db!.exec(
         "INSERT OR REPLACE INTO _synclib_metadata (key, value) VALUES ('server_authoritative_row_hash', '1')"
@@ -1366,6 +1357,7 @@ class SyncClient {
     List<String>? forceRefresh,
     bool includeStripped = true,
     bool? cleanupLegacyChanges,
+    bool skipMerkle = false,
   }) async {
     if (!_ws.isConnected) {
       _logger.warning('syncUnified: Not connected, waiting for connection...');
@@ -1582,13 +1574,13 @@ class SyncClient {
       }
 
       // Check if Merkle verification is needed (staleness check)
-      // Must be awaited so it runs within the _isSyncing guard,
-      // preventing concurrent bulk mode with a subsequent syncUnified call.
-      await _checkMerkleVerification();
+      if (!skipMerkle) {
+        await _checkMerkleVerification();
 
-      // Cancel any syncOnWrite debounce triggered by merkle repair writes —
-      // those are internal maintenance, not user changes needing a new sync.
-      _syncOnWriteDebounceTimer?.cancel();
+        // Cancel any syncOnWrite debounce triggered by merkle repair writes —
+        // those are internal maintenance, not user changes needing a new sync.
+        _syncOnWriteDebounceTimer?.cancel();
+      }
 
       _updateSyncState(SyncState.ready);
       _logger.info('syncUnified: Complete');
@@ -1597,6 +1589,27 @@ class SyncClient {
       _logger.severe('syncUnified: Error - $e', e, stack);
       _updateSyncState(SyncState.error);
       rethrow;
+    } finally {
+      _isSyncing = false;
+    }
+  }
+
+  /// Run merkle verification independently of syncUnified().
+  /// Safe to call at any time — skips if sync is in progress or disconnected.
+  Future<void> runMerkleVerification() async {
+    if (_isSyncing) {
+      _logger.info('runMerkleVerification: Sync in progress, skipping');
+      return;
+    }
+    if (!_ws.isConnected) {
+      _logger.info('runMerkleVerification: Not connected, skipping');
+      return;
+    }
+
+    _isSyncing = true;
+    try {
+      await _checkMerkleVerification();
+      _syncOnWriteDebounceTimer?.cancel();
     } finally {
       _isSyncing = false;
     }
@@ -3326,6 +3339,13 @@ class SyncClient {
     // only the server's scoped row_ids — if they now match, it's a false alarm.
     final realMismatches = <MerkleMismatch>[];
     for (final mismatch in response.mismatches ?? []) {
+      if (mismatch.rowIds != null && mismatch.rowIds!.isEmpty) {
+        // Server has 0 rows in scope for this table on this channel.
+        // Client data is from another channel — not a real mismatch.
+        _logger.info('verifyRoots: ${mismatch.table} - server has 0 scoped rows, '
+            'client data is from another channel (false alarm)');
+        continue;
+      }
       if (mismatch.rowIds != null && mismatch.rowIds!.isNotEmpty) {
         try {
           final scopedInfo = await _merkle!.merkleRoot(
