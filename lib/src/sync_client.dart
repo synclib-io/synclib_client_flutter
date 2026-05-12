@@ -3184,15 +3184,28 @@ class SyncClient {
 
   /// Merkle verification using the new channels config.
   /// Verifies all tables per channel, then dispatches repair by direction.
+  ///
+  /// Tables that appear on multiple channels are only verified on the first
+  /// channel (typically the tribe/pull channel with the widest server scope).
+  /// This avoids false mismatches where the client has rows from a wider
+  /// channel that don't exist in the narrower channel's server scope.
   Future<void> _merkleVerifyFromChannels(
     List<SyncChannel> channels,
     int blockSize,
     List<String> allRepairedTables,
   ) async {
+    final verifiedTables = <String>{};
+
     for (final channel in channels) {
       if (channel.tables.isEmpty) continue;
 
-      final allTables = channel.allTableNames;
+      // Skip tables already verified on a previous (wider-scope) channel.
+      final allTables = channel.allTableNames
+          .where((t) => !verifiedTables.contains(t))
+          .toList();
+      if (allTables.isEmpty) continue;
+      verifiedTables.addAll(allTables);
+
       _logger.fine('Merkle verification on ${channel.topic}: ${allTables.join(', ')}');
 
       // 1. Verify root hashes — wrap in timeout so a slow server response
