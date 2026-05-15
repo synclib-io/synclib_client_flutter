@@ -761,11 +761,15 @@ class SyncClient {
   /// Connect to sync server
   ///
   /// [token] - Authentication token (JWT) required by the server
+  /// [extra] - Optional extra Phoenix socket connect params. Used by
+  ///   app_builder scaffolds to send `slug` and `env` so the server can
+  ///   route to the right per-app Postgres schema ({slug}_dev or {slug}_prod).
   ///
   /// Optionally provide additional channels to subscribe to:
   // should connect to what is passed in to config for possible channels
   Future<void> connect({
     required String token,
+    Map<String, String>? extra,
     bool joinWorld = false,
     List<String>? zones,
     List<String>? guilds,
@@ -783,12 +787,13 @@ class SyncClient {
       await disconnect();
     }
 
-    await _ws.connect(
-      params: {
-        'token': token,
-        'client_id': config.clientId,
-      },
-    );
+    final params = <String, String>{
+      'token': token,
+      'client_id': config.clientId,
+    };
+    if (extra != null) params.addAll(extra);
+
+    await _ws.connect(params: params);
     await _joinChannels();
   }
 
