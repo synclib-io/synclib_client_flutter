@@ -344,25 +344,10 @@ class SyncTable {
   /// updated by a trigger on every write, this is sufficient to detect changes.
   final List<String>? hashColumns;
 
-  /// When non-null, pending writes to this table are coalesced per `row_id`
-  /// at push time. Multiple journaled changes for the same row get merged
-  /// into a single push (data deltas overlay each other; later wins).
-  ///
-  /// The Duration is reserved for future per-table debounce tuning; v1 reuses
-  /// the global `syncOnWriteDebounce` window — the value here just acts as
-  /// an opt-in flag (any non-null Duration enables coalescing for the table).
-  ///
-  /// Use when a single row is updated by multiple independent code paths in
-  /// rapid succession (e.g. a `users` row touched by points + streak + totals
-  /// during workout save). Without coalescing, each journal entry produces an
-  /// independent server push and broadcast, creating races where in-flight
-  /// updates can be clobbered by stale echoes.
-  final Duration? coalesce;
-
-  const SyncTable(this.name, {this.direction, this.hashColumns, this.coalesce});
-  const SyncTable.pull(this.name, {this.hashColumns, this.coalesce}) : direction = RepairDirection.pull;
-  const SyncTable.push(this.name, {this.hashColumns, this.coalesce}) : direction = RepairDirection.push;
-  const SyncTable.lww(this.name, {this.hashColumns, this.coalesce}) : direction = RepairDirection.lww;
+  const SyncTable(this.name, {this.direction, this.hashColumns});
+  const SyncTable.pull(this.name, {this.hashColumns}) : direction = RepairDirection.pull;
+  const SyncTable.push(this.name, {this.hashColumns}) : direction = RepairDirection.push;
+  const SyncTable.lww(this.name, {this.hashColumns}) : direction = RepairDirection.lww;
 }
 
 /// A sync channel: its topic, role, associated tables, and join params.
@@ -565,14 +550,6 @@ class SyncClient {
   List<String> get _allSyncTables =>
       config.channels.expand((c) => c.allTableNames).toSet().toList();
 
-  /// Names of tables flagged for per-row coalescing on push. Computed from
-  /// `SyncTable.coalesce != null` across all channels' table lists.
-  Set<String> get _coalesceTableNames => {
-    for (final ch in config.channels)
-      for (final t in ch.tables)
-        if (t.coalesce != null) t.name,
-  };
-
   /// Get channels by role.
   Iterable<SyncChannel> get _pushChannels =>
       config.channels.where((c) => c.role == ChannelRole.push || c.role == ChannelRole.bidirectional);
@@ -653,12 +630,6 @@ class SyncClient {
   // Unified sync: track active sync operations by stream_id
   final Map<String, Completer<void>> _activeSyncCompleters = {};
   final Map<String, List<Change>> _activeSyncPendingChanges = {};
-
-  // Coalescing: when a push contains a coalesced change (multiple journaled
-  // changes merged into one), the surviving change's seqnum maps to the list
-  // of absorbed (table, rowId, localSeqnum) entries. On ack, the absorbed
-  // journal entries are also deleted from _synclib_changes.
-  final Map<int, List<int>> _absorbedSeqnums = {};
 
   // syncOnWrite: subscription to local changes and debounce timer
   StreamSubscription? _localChangeSubscription;
@@ -1428,19 +1399,8 @@ class SyncClient {
 
       // 2. Get pending local changes to push
       _emitSyncProgress(const SyncProgress(phase: 'pushing'));
-      var pendingChanges = await _db!.getPendingChanges(limit: config.pushBatchSize);
+      final pendingChanges = await _db!.getPendingChanges(limit: config.pushBatchSize);
       _logger.info('syncUnified: ${pendingChanges.length} pending changes to push');
-
-      // 2a. Coalesce per-row for tables that opted in via SyncTable.coalesce.
-      // For these tables, multiple journaled changes to the same (table, rowId)
-      // are merged into a single change (data deep-merged; later wins). The
-      // absorbed seqnums are tracked so they're deleted from the journal on
-      // ack alongside the surviving seqnum.
-      final coalesceTables = _coalesceTableNames;
-      _logger.info('syncUnified: coalesce-enabled tables: $coalesceTables');
-      if (coalesceTables.isNotEmpty && pendingChanges.isNotEmpty) {
-        pendingChanges = _coalescePendingChanges(pendingChanges, coalesceTables);
-      }
 
       // Convert to PendingChange format
       final pendingChangeMessages = pendingChanges.map((c) => PendingChange(
@@ -1718,20 +1678,6 @@ class SyncClient {
           _logger.warning('Failed to delete change ${ack.localSeqnum}: $e');
         }
 
-        // If this ack was for a coalesced (merged) change, also delete the
-        // absorbed journal entries that were folded into it.
-        final absorbed = _absorbedSeqnums.remove(ack.localSeqnum);
-        if (absorbed != null) {
-          for (final absorbedSeqnum in absorbed) {
-            try {
-              await _db!.deleteChange(absorbedSeqnum);
-              _logger.fine('Deleted absorbed change: $absorbedSeqnum (merged into ${ack.localSeqnum})');
-            } catch (e) {
-              _logger.warning('Failed to delete absorbed change $absorbedSeqnum: $e');
-            }
-          }
-        }
-
         // Look up the change info in pending changes to apply server seqnum and row_hash
         if (ack.serverSeqnum != null || ack.rowHash != null) {
           for (final pending in _activeSyncPendingChanges.values) {
@@ -1749,11 +1695,6 @@ class SyncClient {
         }
       } else {
         _logger.warning('Change ${ack.localSeqnum} failed: ${ack.error}');
-        // Drop the absorbed-seqnums entry so the map doesn't grow unbounded.
-        // The absorbed journal entries stay in `_synclib_changes` and will be
-        // picked up again on the next push attempt — same behavior as a
-        // non-coalesced failed ack.
-        _absorbedSeqnums.remove(ack.localSeqnum);
       }
     }
   }
@@ -1911,115 +1852,6 @@ class SyncClient {
     } catch (e) {
       return null;
     }
-  }
-
-  /// Coalesce journaled changes per (table, row_id) for opted-in tables.
-  ///
-  /// For each row in [coalesceTables], multiple sequential changes are merged
-  /// into one change carrying:
-  ///   - the latest seqnum (sent to server),
-  ///   - the latest operation (later supersedes — delete trumps insert/update),
-  ///   - a deep-merged data map (later keys overwrite earlier).
-  ///
-  /// Absorbed seqnums are recorded in [_absorbedSeqnums] keyed by the
-  /// surviving seqnum, so [_handleSyncChangeAcks] can delete all of them
-  /// from the journal when the server acks the surviving one.
-  ///
-  /// Changes for tables not in [coalesceTables] pass through unchanged.
-  List<Change> _coalescePendingChanges(List<Change> changes, Set<String> coalesceTables) {
-    // (table, rowId) -> index into result list for current surviving change
-    final indexByKey = <String, int>{};
-    final result = <Change>[];
-
-    for (final change in changes) {
-      if (!coalesceTables.contains(change.tableName)) {
-        result.add(change);
-        continue;
-      }
-      final key = '${change.tableName} ${change.rowId}';
-      final existingIdx = indexByKey[key];
-      if (existingIdx == null) {
-        indexByKey[key] = result.length;
-        result.add(change);
-        continue;
-      }
-      final existing = result[existingIdx];
-      // Deep-merge data: parse both, merge later-wins, re-encode.
-      final mergedDataJson = _mergeChangeData(existing.data, change.data);
-      final mergedOperation = _supersedeOperation(existing.operation, change.operation);
-      // Track absorbed: existing.seqnum becomes absorbed under change.seqnum
-      // (carry forward any prior absorptions on `existing` too).
-      final absorbedForExisting = _absorbedSeqnums.remove(existing.seqnum) ?? <int>[];
-      final newlyAbsorbed = <int>[existing.seqnum, ...absorbedForExisting];
-      _absorbedSeqnums.update(
-        change.seqnum,
-        (existing) => [...existing, ...newlyAbsorbed],
-        ifAbsent: () => newlyAbsorbed,
-      );
-      result[existingIdx] = Change(
-        seqnum: change.seqnum,
-        tableName: change.tableName,
-        rowId: change.rowId,
-        operation: mergedOperation,
-        data: mergedDataJson,
-      );
-      _logger.fine('Coalesced ${change.tableName}:${change.rowId}: '
-          'absorbed seqnum ${existing.seqnum} into ${change.seqnum}');
-    }
-
-    if (changes.length != result.length) {
-      _logger.info('Coalesced ${changes.length} pending changes into ${result.length} '
-          'for tables: ${coalesceTables.join(', ')}');
-    }
-    return result;
-  }
-
-  /// Deep-merge two JSON-encoded change `data` payloads. Later keys override
-  /// earlier; nested maps merge recursively. Returns the merged JSON string,
-  /// or whichever non-null operand if the other is null/unparseable.
-  static String? _mergeChangeData(String? earlier, String? later) {
-    if (earlier == null) return later;
-    if (later == null) return earlier;
-    final earlierMap = _parseJson(earlier);
-    final laterMap = _parseJson(later);
-    if (earlierMap == null) return later;
-    if (laterMap == null) return earlier;
-    final merged = _deepMergeMap(earlierMap, laterMap);
-    return jsonEncode(merged);
-  }
-
-  /// Deep-merge two maps. For shared keys, later wins; if both values are
-  /// maps, they merge recursively.
-  static Map<String, dynamic> _deepMergeMap(
-    Map<String, dynamic> earlier,
-    Map<String, dynamic> later,
-  ) {
-    final result = Map<String, dynamic>.from(earlier);
-    for (final entry in later.entries) {
-      final existing = result[entry.key];
-      final incoming = entry.value;
-      if (existing is Map<String, dynamic> && incoming is Map) {
-        result[entry.key] = _deepMergeMap(
-          existing,
-          Map<String, dynamic>.from(incoming),
-        );
-      } else {
-        result[entry.key] = incoming;
-      }
-    }
-    return result;
-  }
-
-  /// Determine the surviving operation when two ops are coalesced. Delete
-  /// trumps any prior op (the row is being removed regardless). Otherwise
-  /// the later op wins, except an earlier insert is preserved over a later
-  /// update (the row is still being created in this batch).
-  static SynclibOperation _supersedeOperation(SynclibOperation earlier, SynclibOperation later) {
-    if (later == SynclibOperation.delete) return SynclibOperation.delete;
-    if (earlier == SynclibOperation.insert && later == SynclibOperation.update) {
-      return SynclibOperation.insert;
-    }
-    return later;
   }
 
   /// Get current sync state
@@ -2300,21 +2132,6 @@ class SyncClient {
       // Mark as synced in local database
       await _db!.markSynced(ack.seqnum);
 
-      // If this seqnum represented a coalesced (merged) change, also mark
-      // each absorbed seqnum as synced. Use markSynced (not deleteChange) to
-      // match the single-ack handler's existing cleanup semantics; the batch
-      // handler [_handleSyncChangeAcks] performs the deleteChange path.
-      final absorbed = _absorbedSeqnums.remove(ack.seqnum);
-      if (absorbed != null) {
-        for (final absorbedSeqnum in absorbed) {
-          try {
-            await _db!.markSynced(absorbedSeqnum);
-          } catch (e) {
-            _logger.warning('Failed to mark absorbed change $absorbedSeqnum synced: $e');
-          }
-        }
-      }
-
       // Update the local row's seqnum column with the server-assigned seqnum
       if (ack.serverSeqnum != null && changeInfo != null) {
         await _updateLocalSeqnum(changeInfo.table, changeInfo.rowId, ack.serverSeqnum!);
@@ -2327,7 +2144,6 @@ class SyncClient {
     } else {
       _logger.warning('Change ${ack.seqnum} failed: ${ack.error}');
       _pendingChangeInfo.remove(ack.seqnum);
-      _absorbedSeqnums.remove(ack.seqnum);
     }
   }
 
