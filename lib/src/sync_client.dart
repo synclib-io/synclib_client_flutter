@@ -1437,6 +1437,7 @@ class SyncClient {
       // absorbed seqnums are tracked so they're deleted from the journal on
       // ack alongside the surviving seqnum.
       final coalesceTables = _coalesceTableNames;
+      _logger.info('syncUnified: coalesce-enabled tables: $coalesceTables');
       if (coalesceTables.isNotEmpty && pendingChanges.isNotEmpty) {
         pendingChanges = _coalescePendingChanges(pendingChanges, coalesceTables);
       }
