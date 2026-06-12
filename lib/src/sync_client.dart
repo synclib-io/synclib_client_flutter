@@ -1233,17 +1233,31 @@ class SyncClient {
 
   /// Wait for both socket connection and at least one channel to be joined.
   /// Triggers reconnect if needed, then waits for channels to rejoin.
-  Future<void> _waitForConnectionAndChannels({Duration timeout = const Duration(seconds: 30)}) async {
+  Future<void> _waitForConnectionAndChannels({
+    Duration timeout = const Duration(seconds: 30),
+    String? topic,
+  }) async {
     await _waitForConnection(timeout: timeout);
 
-    // After socket connects, channels may still be rejoining
-    if (_ws.hasJoinedChannel) return;
+    // After socket connects, channels may still be rejoining. If a specific
+    // topic was requested, gate on *that* channel — not just any channel.
+    // Without the topic-specific check, callers pinned to a topic (e.g.
+    // tribe) get green-lit by an unrelated channel (e.g. user) re-joining
+    // faster, and then their sendRaw immediately fails with
+    // "Channel is closed, not joined". See websocket_manager.hasJoinedChannelForTopic.
+    bool isReady() => topic == null
+        ? _ws.hasJoinedChannel
+        : _ws.hasJoinedChannelForTopic(topic);
 
-    _logger.info('Socket connected but no joined channels, waiting for channel rejoin...');
+    if (isReady()) return;
+
+    _logger.info(
+      'Socket connected but ${topic == null ? "no joined channels" : "channel \"$topic\" not joined"}, waiting for channel rejoin...',
+    );
     final completer = Completer<void>();
     // Poll briefly — _handleStateChange calls _joinChannels on reconnect
     final timer = Timer.periodic(const Duration(milliseconds: 200), (t) {
-      if (_ws.hasJoinedChannel) {
+      if (isReady()) {
         t.cancel();
         if (!completer.isCompleted) completer.complete();
       }
@@ -1251,7 +1265,12 @@ class SyncClient {
 
     try {
       await completer.future.timeout(timeout, onTimeout: () {
-        throw TimeoutException('Timed out waiting for channel rejoin', timeout);
+        throw TimeoutException(
+          topic == null
+              ? 'Timed out waiting for channel rejoin'
+              : 'Timed out waiting for channel "$topic" to rejoin',
+          timeout,
+        );
       });
     } finally {
       timer.cancel();
@@ -2933,10 +2952,18 @@ class SyncClient {
     Map<String, dynamic> payload,
     {String? channelTopic, bool waitForReconnect = true}
   ) async {
-    if (!_ws.isConnected || !_ws.hasJoinedChannel) {
+    // Gate on the requested channel specifically — see
+    // [_waitForConnectionAndChannels] for why ANY-channel-joined isn't
+    // sufficient when the caller pinned to a topic.
+    final isReady = channelTopic == null
+        ? _ws.hasJoinedChannel
+        : _ws.hasJoinedChannelForTopic(channelTopic);
+    if (!_ws.isConnected || !isReady) {
       if (waitForReconnect) {
-        _logger.info('sendMessage: Not connected or channel not joined, waiting for reconnection...');
-        await _waitForConnectionAndChannels();
+        _logger.info(
+          'sendMessage: ${channelTopic == null ? "Not connected or channel not joined" : "Channel \"$channelTopic\" not joined"}, waiting for reconnection...',
+        );
+        await _waitForConnectionAndChannels(topic: channelTopic);
       } else {
         throw Exception('Not connected to server');
       }
@@ -2951,7 +2978,7 @@ class SyncClient {
       // If channel was closed (e.g. network switch), reconnect and retry once
       if (waitForReconnect && e is StateError && e.message.contains('not joined')) {
         _logger.info('sendMessage: Channel closed, reconnecting and retrying $event...');
-        await _waitForConnectionAndChannels();
+        await _waitForConnectionAndChannels(topic: channelTopic);
         final response = await _ws.sendRaw(event, payload, channelTopic: channelTopic);
         return response;
       }

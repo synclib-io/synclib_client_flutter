@@ -321,6 +321,17 @@ class WebSocketManager {
     (ch) => ch.state == PhoenixChannelState.joined,
   );
 
+  /// Whether the channel for the given topic is in the joined state.
+  /// Use this when a caller has pinned to a specific topic — the broader
+  /// [hasJoinedChannel] can return true when the *wrong* channel is joined
+  /// (e.g. user channel re-joins faster than tribe after a reconnect), at
+  /// which point a retry against the requested topic still fails with
+  /// "Channel is closed, not joined".
+  bool hasJoinedChannelForTopic(String topic) {
+    final ch = _channels[topic];
+    return ch != null && ch.state == PhoenixChannelState.joined;
+  }
+
   /// Send a raw message with custom event and payload, returns server response
   Future<Map<String, dynamic>> sendRaw(
     String event,
