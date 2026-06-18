@@ -2902,6 +2902,36 @@ class SyncClient {
     return result;
   }
 
+  /// Null out the `seqnum` column on every row of the given tables so the
+  /// next sync treats them as needing a full pull (MAX(seqnum) → NULL → 0).
+  ///
+  /// Use this after an event that changes the user's access claims (e.g. a
+  /// subscription purchase): combined with a fresh-JWT reconnect, the
+  /// server re-runs `sanitize_row` against the new claims and the affected
+  /// tables come back unstripped on the next autosync.
+  ///
+  /// Resumability requires the server to stream rows in `seqnum ASC` order
+  /// (see `apply_seqnum_filter/2` in sync_server). Without ordered pagination,
+  /// an interrupted pull leaves permanent gaps and the override should be
+  /// modeled as a separate flag instead.
+  ///
+  /// Tables without a `seqnum` column are skipped silently — those tables
+  /// don't participate in seqnum-based sync anyway.
+  Future<void> nullOutSeqnums(List<String> tables) async {
+    if (_db == null) {
+      _logger.warning('nullOutSeqnums: database not open, skipping');
+      return;
+    }
+    for (final table in tables) {
+      try {
+        await _db!.exec('UPDATE ${_quoteId(table)} SET "seqnum" = NULL');
+        _logger.info('nullOutSeqnums: nulled seqnums on $table');
+      } catch (e) {
+        _logger.fine('nullOutSeqnums: skipped $table (no seqnum column or error): $e');
+      }
+    }
+  }
+
   /// Query the max seqnum from a local SQLite table
   Future<int> _getMaxSeqnumFromTable(String table) async {
     try {
