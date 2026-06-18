@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:logging/logging.dart';
 import 'package:synclib_flutter/synclib_flutter.dart';
 import 'package:synchronized/synchronized.dart';
@@ -543,6 +544,13 @@ class SyncClient {
   bool _isInitialized = false;
   bool _hasConnectedOnce = false;
   int _lastSyncedSeqnum = 0;
+
+  /// Per-install identifier minted on first DB open and persisted in
+  /// `_synclib_metadata`. Stable for the life of the SQLite file. Sent on
+  /// every join/push so the server can track per-device ack state and
+  /// reliably trim the local outbound queue on reconnect.
+  String? _deviceId;
+  String? get deviceId => _deviceId;
   final Set<int> _pendingAcks = {};
   final Set<String> _syncedScopes = {};
 
@@ -680,6 +688,10 @@ class SyncClient {
     // and triggers repair from server.
     await _migrateToServerAuthoritativeRowHash();
 
+    // Mint (or load) the per-install device_id. Must happen after the
+    // metadata table is ensured (done by the migration above).
+    await _ensureDeviceId();
+
     // Subscribe to WebSocket messages (serialized via message lock)
     _messageSubscription = _ws.messages.listen(_enqueueMessage);
     _stateSubscription = _ws.stateChanges.listen(_handleStateChange);
@@ -693,6 +705,74 @@ class SyncClient {
     }
 
     _isInitialized = true;
+  }
+
+  /// Load the per-install `device_id` from `_synclib_metadata`, or mint and
+  /// persist one if it doesn't exist yet. UUID v4 generated with
+  /// `Random.secure()` — 122 bits of entropy, no external dependency.
+  ///
+  /// Belt-and-suspenders: also creates `_synclib_metadata` if it doesn't
+  /// exist. The standard init path runs `_migrateToServerAuthoritativeRowHash`
+  /// first (which also creates the table), but doing it here too keeps this
+  /// method safe to call in isolation and matches the TS port's shape.
+  Future<void> _ensureDeviceId() async {
+    try {
+      await _db!.exec('''
+        CREATE TABLE IF NOT EXISTS _synclib_metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      ''');
+
+      final results = await _db!.read(
+        "SELECT value FROM _synclib_metadata WHERE key = 'device_id'"
+      );
+      if (results.isNotEmpty) {
+        _deviceId = results.first['value'] as String?;
+        _logger.info('Loaded device_id: $_deviceId');
+        return;
+      }
+
+      // Mint a new UUID v4.
+      final r = Random.secure();
+      final bytes = List<int>.generate(16, (_) => r.nextInt(256));
+      bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+      bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant RFC 4122
+      String hex(int b) => b.toRadixString(16).padLeft(2, '0');
+      final uuid =
+          '${hex(bytes[0])}${hex(bytes[1])}${hex(bytes[2])}${hex(bytes[3])}-'
+          '${hex(bytes[4])}${hex(bytes[5])}-'
+          '${hex(bytes[6])}${hex(bytes[7])}-'
+          '${hex(bytes[8])}${hex(bytes[9])}-'
+          '${hex(bytes[10])}${hex(bytes[11])}${hex(bytes[12])}${hex(bytes[13])}${hex(bytes[14])}${hex(bytes[15])}';
+
+      // Use INSERT OR IGNORE so a concurrent mint (e.g. two parallel
+      // initializations) doesn't error — first writer wins.
+      await _db!.exec(
+        "INSERT OR IGNORE INTO _synclib_metadata (key, value) VALUES ('device_id', '$uuid')"
+      );
+
+      // Tentatively adopt the just-minted UUID immediately — guards against
+      // the rare case where the INSERT succeeds but the re-read throws
+      // (e.g. transient I/O), which would otherwise leave _deviceId null.
+      // The re-read below refines it if a concurrent writer beat us to it.
+      _deviceId = uuid;
+
+      try {
+        final reread = await _db!.read(
+          "SELECT value FROM _synclib_metadata WHERE key = 'device_id'"
+        );
+        if (reread.isNotEmpty && reread.first['value'] is String) {
+          _deviceId = reread.first['value'] as String;
+        }
+      } catch (e) {
+        _logger.warning('device_id re-read failed; keeping tentative mint: $e');
+      }
+
+      _logger.info('Minted device_id: $_deviceId');
+    } catch (e) {
+      _logger.warning('Failed to ensure device_id: $e');
+    }
   }
 
   /// One-time migration: switch to server-authoritative row_hash.
@@ -823,6 +903,7 @@ class SyncClient {
 
       final joinParams = {
         'client_id': config.clientId,
+        if (_deviceId != null) 'device_id': _deviceId,
         ...?channel.params,
         if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
       };
@@ -832,6 +913,11 @@ class SyncClient {
 
       // Extract server-driven hash_columns from join response
       _extractServerHashColumns(response);
+
+      // Reconcile outbound queue with server's per-device, per-channel
+      // high-water mark. Runs on every join (not gated on autoSyncOnConnect)
+      // so lost-ack cleanup works even when autosync is disabled.
+      await _trimQueueFromJoinResponse(response, topic);
 
       // Mark channel as joined
       _channelStates[topic]!.joined = true;
@@ -865,6 +951,56 @@ class SyncClient {
 
     // Start periodic background sync if configured
     _startPeriodicSync();
+  }
+
+  /// Reconcile the local outbound queue (`_sync_changes`) with the server's
+  /// per-device high-water mark reported on the channel join response. If
+  /// the server tells us "I've already applied your local_seqnum up to N for
+  /// this device on this channel," DELETE everything at or below N from the
+  /// queue whose table belongs to this channel — those writes are
+  /// guaranteed-committed even if we never saw the ack (network drop, app
+  /// crash, server restart between apply and ack send).
+  ///
+  /// CRITICAL: scope by table_name. Local seqnums in `_sync_changes` are
+  /// AUTOINCREMENT-global across the file (one counter for ALL channels),
+  /// while the server's high-water mark is per-(device, channel). An
+  /// unscoped `markSynced(N)` would `DELETE WHERE seqnum <= N` and could
+  /// sweep up unpushed writes for OTHER channels whose seqnums happen to
+  /// fall below N. Filtering by the channel's table set keeps the delete
+  /// correct in the multi-channel case.
+  ///
+  /// Called from every join site (initial join loop, dynamic single-channel
+  /// rejoin, `joinChannelByTopic`) so reconciliation isn't gated on
+  /// `autoSyncOnConnect`.
+  Future<void> _trimQueueFromJoinResponse(
+      Map<String, dynamic> response, String channelTopic) async {
+    final lastAppliedRaw = response['last_applied_local_seqnum'];
+    if (lastAppliedRaw is! int || lastAppliedRaw <= 0) return;
+
+    final matches =
+        config.channels.where((c) => c.topic == channelTopic).toList();
+    if (matches.isEmpty) {
+      _logger.warning(
+          'No SyncChannel found for topic $channelTopic; skipping trim');
+      return;
+    }
+    final tables = matches.first.allTableNames;
+    if (tables.isEmpty) return;
+
+    try {
+      final escapedTables =
+          tables.map((t) => "'${t.replaceAll("'", "''")}'").join(',');
+      await _db!.exec(
+        'DELETE FROM _sync_changes '
+        'WHERE seqnum <= $lastAppliedRaw '
+        'AND table_name IN ($escapedTables)',
+      );
+      _logger.info(
+          'Reconciled outbound queue on $channelTopic: trimmed seqnum <= $lastAppliedRaw scoped to ${tables.length} table(s)');
+    } catch (e) {
+      _logger.warning(
+          'Failed to trim queue at seqnum $lastAppliedRaw on $channelTopic: $e');
+    }
   }
 
   /// Handle join response from server, including stale tables
@@ -1052,12 +1188,16 @@ class SyncClient {
 
     final response = await _ws.joinChannel(topic, {
       'client_id': config.clientId,
+      if (_deviceId != null) 'device_id': _deviceId,
       ...?channel.params,
       if (tableSeqnums != null) 'table_seqnums': tableSeqnums,
     });
 
     // Extract server-driven hash_columns from join response
     _extractServerHashColumns(response);
+
+    // Reconcile outbound queue with server's per-device, per-channel mark.
+    await _trimQueueFromJoinResponse(response, topic);
 
     // Configure synclibc with server-driven hash columns
     await _configureHashColumns();
@@ -1171,10 +1311,14 @@ class SyncClient {
 
     _logger.info('Joining channel by topic: $topic');
 
-    await _ws.joinChannel(topic, {
+    final response = await _ws.joinChannel(topic, {
       'client_id': config.clientId,
+      if (_deviceId != null) 'device_id': _deviceId,
       ...?params,
     });
+
+    // Reconcile outbound queue with server's per-device, per-channel mark.
+    await _trimQueueFromJoinResponse(response, topic);
 
     _logger.info('Successfully joined channel: $topic');
   }
@@ -1473,6 +1617,7 @@ class SyncClient {
           _logger.info('syncUnified: Pushing ${channelChanges.length} changes on ${channel.topic}');
           final pushRequest = SyncRequestMessage(
             clientId: config.clientId,
+            deviceId: _deviceId,
             schemaVersion: schemaVersion,
             tableSeqnums: {},
             tables: [],
@@ -1539,6 +1684,7 @@ class SyncClient {
         _logger.info('syncUnified: Pulling ${channelTableNames.join(', ')} on ${channel.topic} (schema v$schemaVersion)');
         final pullRequest = SyncRequestMessage(
           clientId: config.clientId,
+          deviceId: _deviceId,
           schemaVersion: schemaVersion,
           tableSeqnums: channelSeqnums,
           tables: channelTableNames,

@@ -882,6 +882,15 @@ class PendingChange {
 /// Handles push (pending changes), pull (table seqnums), schema, and stripped content
 class SyncRequestMessage extends SyncMessage {
   final String clientId;
+
+  /// Per-install identifier minted by the client on first DB open and
+  /// persisted in `_synclib_metadata`. Distinct from `clientId` (which is
+  /// often a build/platform tag and shared across devices). Used server-side
+  /// to track per-device `last_applied_local_seqnum` so reconnects can
+  /// reliably trim the local outbound queue of changes the server has
+  /// already committed (regardless of whether the ack made it back to this
+  /// device). Optional for backwards compatibility with older servers.
+  final String? deviceId;
   final int schemaVersion;
 
   /// Per-table seqnums for incremental pull
@@ -905,6 +914,7 @@ class SyncRequestMessage extends SyncMessage {
 
   const SyncRequestMessage({
     required this.clientId,
+    this.deviceId,
     required this.schemaVersion,
     required this.tableSeqnums,
     this.tables,
@@ -918,6 +928,7 @@ class SyncRequestMessage extends SyncMessage {
   Map<String, dynamic> toMap() => {
     'type': 'sync_request',
     'client_id': clientId,
+    if (deviceId != null) 'device_id': deviceId,
     'schema_version': schemaVersion,
     'table_seqnums': tableSeqnums,
     if (tables != null) 'tables': tables,
@@ -934,6 +945,7 @@ class SyncRequestMessage extends SyncMessage {
 
     return SyncRequestMessage(
       clientId: map['client_id'] as String,
+      deviceId: map['device_id'] as String?,
       schemaVersion: map['schema_version'] as int? ?? 0,
       tableSeqnums: tableSeqnums,
       tables: (map['tables'] as List?)?.cast<String>(),
