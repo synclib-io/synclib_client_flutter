@@ -3076,8 +3076,9 @@ class SyncClient {
     return result;
   }
 
-  /// Null out the `seqnum` column on every row of the given tables so the
-  /// next sync treats them as needing a full pull (MAX(seqnum) → NULL → 0).
+  /// Reset the `seqnum` column to 0 on every row of the given tables so the
+  /// next sync treats them as needing a full pull (`MAX(seqnum) → 0`, server
+  /// ships `WHERE seqnum > 0` → everything).
   ///
   /// Use this after an event that changes the user's access claims (e.g. a
   /// subscription purchase): combined with a fresh-JWT reconnect, the
@@ -3091,6 +3092,13 @@ class SyncClient {
   ///
   /// Tables without a `seqnum` column are skipped silently — those tables
   /// don't participate in seqnum-based sync anyway.
+  ///
+  /// Why 0 and not NULL: if the local SQLite schema declares `seqnum` as
+  /// `NOT NULL` (the server's Postgres schema does), `UPDATE … = NULL`
+  /// throws a constraint violation, the catch below logs it at `fine`
+  /// level (typically below the consumer's default log level), and the
+  /// nulling silently does nothing — leaving callers convinced they've
+  /// armed a re-pull when they haven't.
   Future<void> nullOutSeqnums(List<String> tables) async {
     if (_db == null) {
       _logger.warning('nullOutSeqnums: database not open, skipping');
@@ -3098,10 +3106,10 @@ class SyncClient {
     }
     for (final table in tables) {
       try {
-        await _db!.exec('UPDATE ${_quoteId(table)} SET "seqnum" = NULL');
-        _logger.info('nullOutSeqnums: nulled seqnums on $table');
+        await _db!.exec('UPDATE ${_quoteId(table)} SET "seqnum" = 0');
+        _logger.info('nullOutSeqnums: reset seqnums on $table');
       } catch (e) {
-        _logger.fine('nullOutSeqnums: skipped $table (no seqnum column or error): $e');
+        _logger.warning('nullOutSeqnums: failed on $table (likely no seqnum column): $e');
       }
     }
   }
