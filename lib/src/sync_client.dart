@@ -543,6 +543,23 @@ class SyncClient {
 
   bool _isInitialized = false;
   bool _hasConnectedOnce = false;
+
+  /// True while a call to [connect] is in progress. Used by
+  /// [_handleStateChange] to skip its auto-rejoin of channels when an
+  /// explicit caller is already going to call [_joinChannels] itself.
+  ///
+  /// Without this guard, every reconnect after the first one races two
+  /// `_joinChannels()` invocations against each other: one from [connect]'s
+  /// `await _joinChannels()` and one from `_handleStateChange`'s fire-and-
+  /// forget call. Both push `phx_join` for the same topic; Phoenix replies
+  /// to both, but the `phoenix_socket` client only delivers the reply to a
+  /// single push completer — the other `await` hangs until the push
+  /// timeout fires and throws `ChannelTimeoutException`. Symptom in the
+  /// server log: two `JOINED <topic> in ~50ms` events ~50ms apart on the
+  /// same device_id; on the client: 30s wait, then ChannelTimeoutException
+  /// even though the channel is functionally joined and receiving pushes.
+  bool _explicitConnectInProgress = false;
+
   int _lastSyncedSeqnum = 0;
 
   /// Per-install identifier minted on first DB open and persisted in
@@ -859,22 +876,30 @@ class SyncClient {
       throw StateError('Not initialized. Call initialize() first.');
     }
 
-    // Only disconnect if actually connected or connecting
-    // This prevents phoenix_socket's "_joinedOnce" assertion error on reconnect
-    // but avoids disrupting operations if we're already disconnected
-    if (_ws.isConnected || _ws.state == ConnectionState.connecting) {
-      _logger.info('Already connected/connecting (state: ${_ws.state}), disconnecting first...');
-      await disconnect();
+    // Tell [_handleStateChange] to skip its auto-rejoin while we're in
+    // here — we'll call [_joinChannels] explicitly below. See the field
+    // docstring for the race this prevents.
+    _explicitConnectInProgress = true;
+    try {
+      // Only disconnect if actually connected or connecting
+      // This prevents phoenix_socket's "_joinedOnce" assertion error on reconnect
+      // but avoids disrupting operations if we're already disconnected
+      if (_ws.isConnected || _ws.state == ConnectionState.connecting) {
+        _logger.info('Already connected/connecting (state: ${_ws.state}), disconnecting first...');
+        await disconnect();
+      }
+
+      final params = <String, String>{
+        'token': token,
+        'client_id': config.clientId,
+      };
+      if (extra != null) params.addAll(extra);
+
+      await _ws.connect(params: params);
+      await _joinChannels();
+    } finally {
+      _explicitConnectInProgress = false;
     }
-
-    final params = <String, String>{
-      'token': token,
-      'client_id': config.clientId,
-    };
-    if (extra != null) params.addAll(extra);
-
-    await _ws.connect(params: params);
-    await _joinChannels();
   }
 
   /// Join all configured channels
@@ -2637,8 +2662,11 @@ class SyncClient {
       case ConnectionState.connected:
         // Update sync state
         _updateSyncState(SyncState.ready);
-        // When reconnected (not initial connection), rejoin channels
-        if (_hasConnectedOnce) {
+        // When reconnected (not initial connection), rejoin channels —
+        // but ONLY when an explicit caller of [connect] isn't already
+        // about to do the rejoin itself. See [_explicitConnectInProgress]
+        // for the race this guard prevents.
+        if (_hasConnectedOnce && !_explicitConnectInProgress) {
           _logger.info('Reconnected - rejoining channels');
           _joinChannels().catchError((e) {
             _logger.severe('Failed to rejoin channels after reconnect: $e');
