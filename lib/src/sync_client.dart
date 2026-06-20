@@ -1544,11 +1544,11 @@ class SyncClient {
   /// of sendHello(), requestSnapshots(), runAutoSync(), etc.
   ///
   /// [forceRefresh] - Tables to force refresh (ignore seqnums)
-  /// [includeStripped] - Auto-detect and refresh stripped rows (default: true)
+  /// [includeStripped] - Auto-detect and refresh stripped rows, has a cost (default: false)
   /// [cleanupLegacyChanges] - Clean up old synced=1 records from legacy sync (default: true on first run)
   Future<void> syncUnified({
     List<String>? forceRefresh,
-    bool includeStripped = true,
+    bool includeStripped = false,
     bool? cleanupLegacyChanges,
     bool skipMerkle = false,
   }) async {
