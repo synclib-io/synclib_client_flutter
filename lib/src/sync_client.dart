@@ -3403,20 +3403,34 @@ class SyncClient {
       final blockSize = _serverMerkleBlockSize ?? _defaultMerkleBlockSize;
       final allRepairedTables = <String>[];
 
-      await _merkleVerifyFromChannels(config.channels, blockSize, allRepairedTables);
+      final allChannelsOk = await _merkleVerifyFromChannels(
+        config.channels, blockSize, allRepairedTables);
 
-      // Update last verified timestamp in metadata
-      await _db!.exec(
-        "INSERT OR REPLACE INTO _synclib_metadata (key, value) VALUES ('merkle_last_verified', '$now')"
-      );
+      // Only mark the verification as complete (and skip for the next
+      // interval window) when every channel ran cleanly. A timeout or
+      // thrown error on any channel previously updated the timestamp
+      // silently — flaky network on day 10 → another full interval before
+      // retry. Now: incomplete runs leave the timestamp untouched and
+      // merkle will retry on the next sync.
+      if (allChannelsOk) {
+        await _db!.exec(
+          "INSERT OR REPLACE INTO _synclib_metadata (key, value) VALUES ('merkle_last_verified', '$now')"
+        );
 
-      if (allRepairedTables.isNotEmpty) {
-        _logger.info('Merkle verification repaired tables: ${allRepairedTables.join(', ')}');
+        if (allRepairedTables.isNotEmpty) {
+          _logger.info('Merkle verification repaired tables: ${allRepairedTables.join(', ')}');
+        } else {
+          _logger.info('Merkle verification: all tables match');
+        }
       } else {
-        _logger.info('Merkle verification: all tables match');
+        _logger.warning(
+            'Merkle verification incomplete (one or more channels failed root verification or a repair); '
+            'leaving last_verified at ${DateTime.fromMillisecondsSinceEpoch(lastVerified)} so the next sync retries.');
       }
 
-      // Emit event so clients can invalidate caches if repairs occurred
+      // Emit event so clients can invalidate caches if repairs occurred.
+      // Emitted regardless of allChannelsOk because partial repairs may
+      // still have happened and consumers should refresh.
       _merkleVerificationController.add(MerkleVerificationEvent(
         repairedTables: allRepairedTables,
       ));
@@ -3433,12 +3447,18 @@ class SyncClient {
   /// channel (typically the tribe/pull channel with the widest server scope).
   /// This avoids false mismatches where the client has rows from a wider
   /// channel that don't exist in the narrower channel's server scope.
-  Future<void> _merkleVerifyFromChannels(
+  /// Returns true when every channel ran root verification AND every
+  /// reported mismatch was repaired without error. Returns false if any
+  /// channel timed out, errored on root verification, or had a repair
+  /// failure — `_checkMerkleVerification` reads this to decide whether
+  /// to advance the `merkle_last_verified` timestamp.
+  Future<bool> _merkleVerifyFromChannels(
     List<SyncChannel> channels,
     int blockSize,
     List<String> allRepairedTables,
   ) async {
     final verifiedTables = <String>{};
+    bool allOk = true;
 
     for (final channel in channels) {
       if (channel.tables.isEmpty) continue;
@@ -3453,7 +3473,9 @@ class SyncClient {
       _logger.fine('Merkle verification on ${channel.topic}: ${allTables.join(', ')}');
 
       // 1. Verify root hashes — wrap in timeout so a slow server response
-      //    doesn't block the entire sync for 10s+.
+      //    doesn't block the entire sync for 10s+. On timeout/error, mark
+      //    the run as incomplete (allOk = false) so the caller doesn't
+      //    advance the last_verified timestamp.
       List<MerkleMismatch> mismatches;
       try {
         mismatches = await _verifyRoots(
@@ -3462,11 +3484,12 @@ class SyncClient {
           channelTopic: channel.topic,
           hashColumns: _serverHashColumns,
         ).timeout(const Duration(seconds: 8), onTimeout: () {
-          _logger.warning('Merkle root verification timed out on ${channel.topic} — skipping');
-          return <MerkleMismatch>[];
+          throw TimeoutException(
+              'Merkle root verification timed out on ${channel.topic}');
         });
       } catch (e) {
         _logger.warning('Merkle root verification failed on ${channel.topic}: $e');
+        allOk = false;
         continue;
       }
 
@@ -3479,6 +3502,7 @@ class SyncClient {
         // Check connection health before attempting repair
         if (!_ws.isConnected) {
           _logger.warning('Merkle repair: connection lost, skipping remaining repairs on ${channel.topic}');
+          allOk = false;
           break;
         }
 
@@ -3495,7 +3519,7 @@ class SyncClient {
         try {
           switch (direction) {
             case RepairDirection.pull:
-              await _repairTablePull(tableName, blockSize, channelTopic: channel.topic, hashColumns: _serverHashColumns, scopedRowIds: mismatch.rowIds);
+              await _repairTablePull(tableName, blockSize, channelTopic: channel.topic, hashColumns: _serverHashColumns, scopedRowIds: mismatch.rowIds, serverRootHash: mismatch.serverRootHash);
               break;
             case RepairDirection.push:
               await _repairTablePush(tableName, blockSize, channelTopic: channel.topic, hashColumns: _serverHashColumns, scopedRowIds: mismatch.rowIds);
@@ -3509,12 +3533,15 @@ class SyncClient {
           final msg = e.toString();
           if (msg.contains('errored channel') || msg.contains('ChannelTimeout')) {
             _logger.warning('Merkle repair: channel errored on $tableName, skipping remaining repairs on ${channel.topic}');
+            allOk = false;
             break;
           }
           _logger.warning('Merkle repair failed for $tableName on ${channel.topic}: $e — skipping');
+          allOk = false;
         }
       }
     }
+    return allOk;
   }
 
   /// Verify data integrity using Merkle trees.
@@ -3705,6 +3732,8 @@ class SyncClient {
           mismatch.table,
           blockSize,
           channelTopic: channelTopic,
+          scopedRowIds: mismatch.rowIds,
+          serverRootHash: mismatch.serverRootHash,
         );
         repairedTables.add(mismatch.table);
       }
@@ -3718,26 +3747,93 @@ class SyncClient {
     }
   }
 
-  /// Repair a table by fetching differing blocks from server (pull: server → client).
+  /// Repair a table by fetching differing rows/blocks from server (pull: server → client).
+  ///
+  /// Two-tier repair strategy:
+  ///   1. **ID-set diff fast path** (when scopedRowIds is provided): compare
+  ///      the server's full id list against local. If client is missing rows
+  ///      OR has extras, fetch only the specific missing ids and delete the
+  ///      extras. Then recheck the local scoped root against the server's —
+  ///      if matched, we're done and skip block diff entirely.
+  ///
+  ///      This is the common bug shape: a previous seqnum-corruption bug
+  ///      left N specific rows missing from local. Pre-fix, block-by-block
+  ///      diff would mismatch on ~every block due to id-ordered alignment
+  ///      cascade (one missing row shifts all subsequent blocks). Fetching
+  ///      ~all blocks of a 5000-row table to recover 50 rows wastes
+  ///      enormous bandwidth. ID-set diff fetches exactly those 50 rows.
+  ///
+  ///   2. **Block diff fallback** (existing behavior): when id sets match
+  ///      but root still differs, the issue is *content drift* on existing
+  ///      rows. Block alignment is now correct (no cascade), so only the
+  ///      truly drifted blocks differ.
   Future<void> _repairTablePull(
     String table,
     int blockSize, {
     String? channelTopic,
     List<String>? hashColumns,
     List<String>? scopedRowIds,
+    String? serverRootHash,
   }) async {
-    // 1. Get block hashes
-    final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize, hashColumns: hashColumns, scopedRowIds: scopedRowIds);
-    _logger.fine('verifyIntegrity: $table has ${blockHashes.length} blocks');
-
-    // 2. Send block hashes to server to find differences
-    final payload = <String, dynamic>{
-      'table': table,
-      'block_hashes': blockHashes,
-      'block_size': blockSize,
-    };
-
     try {
+      // ----- Fast path: id-set diff -----
+      if (scopedRowIds != null) {
+        final localIds = await _merkle!.getAllRowIds(table);
+        final scopedSet = scopedRowIds.toSet();
+        final localSet = localIds.toSet();
+        final missingFromLocal = scopedSet.difference(localSet).toList();
+        final extraOnLocal = localSet.difference(scopedSet).toList();
+
+        if (missingFromLocal.isNotEmpty || extraOnLocal.isNotEmpty) {
+          _logger.info('verifyIntegrity: $table id-set diff: '
+              '${missingFromLocal.length} missing locally, '
+              '${extraOnLocal.length} extra locally');
+
+          if (missingFromLocal.isNotEmpty) {
+            await _fetchAndApplyRowsByIds(table, missingFromLocal, channelTopic: channelTopic);
+          }
+          if (extraOnLocal.isNotEmpty) {
+            await _deleteLocalRows(table, extraOnLocal);
+          }
+
+          // Recheck scoped root locally — if it now matches the server's
+          // we can skip block diff entirely (the common gap-only case).
+          if (serverRootHash != null) {
+            try {
+              final reverifiedInfo = await _merkle!.merkleRoot(
+                table,
+                blockSize: blockSize,
+                hashColumns: hashColumns,
+                scopedRowIds: scopedRowIds,
+              );
+              if (reverifiedInfo.rootHash == serverRootHash) {
+                _logger.info('verifyIntegrity: $table - id-set repair sufficient, '
+                    'skipping block diff');
+                return;
+              }
+              _logger.info('verifyIntegrity: $table - id-set repair done but root '
+                  'still differs (content drift), proceeding to block diff');
+            } catch (e) {
+              _logger.warning('verifyIntegrity: $table - root recheck failed, '
+                  'falling through to block diff: $e');
+            }
+          }
+        }
+      }
+
+      // ----- Slow path: block-by-block diff (content drift) -----
+      // Either no scopedRowIds (legacy path), or id sets match but content
+      // differs. With sets aligned, block-diff is now correctly aligned and
+      // only flags blocks with actual content differences.
+      final blockHashes = await _merkle!.merkleBlockHashes(table, blockSize: blockSize, hashColumns: hashColumns, scopedRowIds: scopedRowIds);
+      _logger.fine('verifyIntegrity: $table has ${blockHashes.length} blocks');
+
+      final payload = <String, dynamic>{
+        'table': table,
+        'block_hashes': blockHashes,
+        'block_size': blockSize,
+      };
+
       final responseMap = await _ws.sendRaw('merkle_block_hashes', payload, channelTopic: channelTopic);
       final response = MerkleBlockHashesResponse.fromMap(responseMap);
 
@@ -3750,44 +3846,101 @@ class SyncClient {
         _logger.info('verifyIntegrity: $table - ${response.differingBlocks.length} differing blocks: '
             '${response.differingBlocks}');
 
-        // 3. Fetch and apply each differing block
         for (final blockIndex in response.differingBlocks) {
           await _fetchAndApplyBlock(table, blockIndex, blockSize, channelTopic: channelTopic);
         }
       }
 
-      // 4. Delete local rows that are outside server's scope.
-      //    This handles the case where server has fewer rows than client
-      //    (e.g. rolling time window filters out old posts).
-      if (scopedRowIds != null) {
+      // Legacy delete-out-of-scope pass — kept for the no-scopedRowIds
+      // path (the new fast path above already handled extras when scoped).
+      if (scopedRowIds != null && response.differingBlocks.isNotEmpty) {
         final allLocalIds = await _merkle!.getAllRowIds(table);
         final scopedSet = scopedRowIds.toSet();
         final outOfScope = allLocalIds.where((id) => !scopedSet.contains(id)).toList();
         if (outOfScope.isNotEmpty) {
           _logger.info('verifyIntegrity: $table - deleting ${outOfScope.length} out-of-scope rows');
-          _db!.beginBulkRemote();
-          try {
-            for (final rowId in outOfScope) {
-              final change = ChangeMessage(
-                table: table,
-                operation: 'delete',
-                rowId: rowId,
-              );
-              final sql = _generateSql(change);
-              _db!.execBulkRemote(sql);
-            }
-            await _db!.endBulkRemote();
-          } catch (e) {
-            await _db!.endBulkRemote(rollback: true);
-            rethrow;
-          }
+          await _deleteLocalRows(table, outOfScope);
         }
       }
 
       _logger.info('verifyIntegrity: $table - repair complete');
-
     } catch (e) {
       _logger.severe('verifyIntegrity: Failed to repair $table: $e');
+      rethrow;
+    }
+  }
+
+  /// Fetch a specific list of rows from server by id and apply to local DB.
+  /// Used by the id-set-diff fast path in `_repairTablePull` to heal gaps
+  /// without paying the per-block alignment cascade cost.
+  Future<void> _fetchAndApplyRowsByIds(
+    String table,
+    List<String> rowIds, {
+    String? channelTopic,
+  }) async {
+    if (rowIds.isEmpty) return;
+
+    // Chunk the request to avoid pathological message sizes for huge gaps.
+    // 500 ids per request keeps payload well under the WS frame size cap.
+    const chunkSize = 500;
+    var applied = 0;
+    for (var i = 0; i < rowIds.length; i += chunkSize) {
+      final chunk = rowIds.sublist(i, i + chunkSize > rowIds.length ? rowIds.length : i + chunkSize);
+      final payload = <String, dynamic>{
+        'table': table,
+        'row_ids': chunk,
+      };
+
+      final responseMap = await _ws.sendRaw('merkle_fetch_rows_by_id', payload, channelTopic: channelTopic);
+      final rawRows = (responseMap['rows'] as List?) ?? [];
+      final rows = rawRows.map((r) => Map<String, dynamic>.from(r as Map)).toList();
+
+      _db!.beginBulkRemote();
+      try {
+        for (final row in rows) {
+          final rowId = row['id']?.toString();
+          if (rowId == null) continue;
+          final change = ChangeMessage(
+            table: table,
+            // Use 'insert' — _generateSql for inserts produces INSERT OR
+            // REPLACE on SQLite, which correctly handles either branch
+            // (id new locally → insert; id already present → replace).
+            operation: 'insert',
+            rowId: rowId,
+            data: row,
+          );
+          final sql = _generateSql(change);
+          _db!.execBulkRemote(sql);
+          applied++;
+        }
+        await _db!.endBulkRemote();
+      } catch (e) {
+        await _db!.endBulkRemote(rollback: true);
+        rethrow;
+      }
+    }
+
+    _logger.info('verifyIntegrity: $table - id-set repair applied $applied/${rowIds.length} rows');
+  }
+
+  /// Delete a specific list of local row ids. Used by repair paths that
+  /// detect extras the server's scope doesn't include.
+  Future<void> _deleteLocalRows(String table, List<String> rowIds) async {
+    if (rowIds.isEmpty) return;
+    _db!.beginBulkRemote();
+    try {
+      for (final rowId in rowIds) {
+        final change = ChangeMessage(
+          table: table,
+          operation: 'delete',
+          rowId: rowId,
+        );
+        final sql = _generateSql(change);
+        _db!.execBulkRemote(sql);
+      }
+      await _db!.endBulkRemote();
+    } catch (e) {
+      await _db!.endBulkRemote(rollback: true);
       rethrow;
     }
   }
