@@ -614,6 +614,13 @@ class ConversationMessage extends SyncMessage {
   final String? userId; // User who triggered the event
   final String? messageId; // For message_sent events (notification only, not content)
   final int? onlineCount; // Number of users currently online
+  /// Authoritative roster of user ids currently in the conversation room.
+  /// Present on user_joined and user_left events; null on older-server
+  /// payloads or events that don't carry the roster (e.g. message_sent).
+  /// When present, clients should REPLACE their local set with this value
+  /// rather than incrementally applying the delta — the server's copy is
+  /// the source of truth.
+  final List<String>? onlineUserIds;
   final Map<String, dynamic>? metadata; // For extensibility
   final int timestamp;
 
@@ -623,6 +630,7 @@ class ConversationMessage extends SyncMessage {
     this.userId,
     this.messageId,
     this.onlineCount,
+    this.onlineUserIds,
     this.metadata,
     required this.timestamp,
   });
@@ -639,6 +647,7 @@ class ConversationMessage extends SyncMessage {
     if (userId != null) 'user_id': userId,
     if (messageId != null) 'message_id': messageId,
     if (onlineCount != null) 'online_count': onlineCount,
+    if (onlineUserIds != null) 'online_user_ids': onlineUserIds,
     if (metadata != null) 'metadata': metadata,
     'timestamp': timestamp,
   };
@@ -647,12 +656,18 @@ class ConversationMessage extends SyncMessage {
     // The event type comes from the Phoenix channel event name
     final event = map['type'] as String? ?? map['event'] as String?;
 
+    final rawOnlineUserIds = map['online_user_ids'];
+    final onlineUserIds = rawOnlineUserIds is List
+        ? rawOnlineUserIds.map((e) => e.toString()).toList()
+        : null;
+
     return ConversationMessage(
       event: event ?? 'conversation:message_sent',
       conversationId: map['conversation_id'] as String?,
       userId: map['user_id'] as String?,
       messageId: map['message_id'] as String?,
       onlineCount: map['online_count'] as int?,
+      onlineUserIds: onlineUserIds,
       metadata: map['metadata'] as Map<String, dynamic>?,
       timestamp: map['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );

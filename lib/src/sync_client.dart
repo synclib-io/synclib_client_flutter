@@ -3250,6 +3250,122 @@ class SyncClient {
   /// Stream of remote changes as they are applied
   Stream<ChangeMessage> get remoteChanges => _remoteChangeController.stream;
 
+  /// Stream of local writes as they land in SQLite. Mirrors [remoteChanges]
+  /// on the local side — subscribers get one event per tracked row change
+  /// BEFORE the sync-on-write debounce fires. Silent during bulk snapshot
+  /// ingest (that path uses `beginBulkRemote`/`endBulkRemote` and never
+  /// touches the per-row change controller) — subscribe to [snapshotBatches]
+  /// for coverage of that path.
+  ///
+  /// Empty stream when the database isn't open yet.
+  Stream<Change> get localChanges =>
+      _db?.localChanges ?? const Stream<Change>.empty();
+
+  // ==========================================================================
+  // Per-table / per-row / per-parent subscription helpers.
+  //
+  // These are the primary shape for reactive UI queries. Each helper coalesces
+  // all three emission paths (local writes, real-time remote broadcasts, bulk
+  // snapshot batches) so a subscriber gets a single stream of "something in my
+  // scope changed" events.
+  //
+  // Design notes:
+  //   * SNAPSHOT batches carry table + row_count only (no per-row detail), so
+  //     they ALWAYS fire on row-scoped and parent-scoped helpers too. A stray
+  //     refresh() is cheap; missing an update is not.
+  //   * PARENT-scoped filtering parses `Change.data` (JSON string) for local
+  //     writes and reads `ChangeMessage.data` (Map) for remotes. DELETES with
+  //     null data always fire — we can't tell if the deleted row belonged to
+  //     this parent without the row data.
+  //   * Callers that need dedup/coalescing across bursts should debounce on
+  //     their end; these primitives are intentionally low-level.
+  // ==========================================================================
+
+  /// Local write events filtered to a single table.
+  Stream<Change> localChangesFor(String table) =>
+      localChanges.where((c) => c.tableName == table);
+
+  /// Real-time remote change events filtered to a single table.
+  Stream<ChangeMessage> remoteChangesFor(String table) =>
+      remoteChanges.where((c) => c.table == table);
+
+  /// Snapshot batch events filtered to a single table.
+  Stream<SnapshotBatchEvent> snapshotBatchesFor(String table) =>
+      snapshotBatches.where((e) => e.table == table);
+
+  /// Subscribe to ANY change on a table — local write, real-time broadcast,
+  /// or bulk snapshot batch. Returns a cancel function.
+  ///
+  /// Use for "collection notifier" cases where the notifier holds no scope
+  /// narrower than the whole table (e.g. "all workouts I can see").
+  void Function() onTableChange(String table, void Function() callback) {
+    final localSub = localChangesFor(table).listen((_) => callback());
+    final remoteSub = remoteChangesFor(table).listen((_) => callback());
+    final batchSub = snapshotBatchesFor(table).listen((_) => callback());
+    return () {
+      localSub.cancel();
+      remoteSub.cancel();
+      batchSub.cancel();
+    };
+  }
+
+  /// Subscribe to changes for a specific row (identified by its SQLite id).
+  /// Use for "single document notifier" cases where the id is known up front.
+  ///
+  /// Snapshot batches carry no per-row detail so they always fire.
+  void Function() onRowChange(String table, String rowId, void Function() callback) {
+    final localSub = localChangesFor(table)
+        .where((c) => c.rowId == rowId)
+        .listen((_) => callback());
+    final remoteSub = remoteChangesFor(table)
+        .where((c) => c.rowId == rowId)
+        .listen((_) => callback());
+    final batchSub = snapshotBatchesFor(table).listen((_) => callback());
+    return () {
+      localSub.cancel();
+      remoteSub.cancel();
+      batchSub.cancel();
+    };
+  }
+
+  /// Subscribe to changes scoped to a `parent_id`. Use for subcollection
+  /// notifiers watching all children under a specific parent — child ids
+  /// aren't known up front, so [onRowChange] can't be used.
+  ///
+  /// How the filter works:
+  ///   * LOCAL writes: `Change.data` is the merged document as a JSON string.
+  ///     Parsed and compared.
+  ///   * REMOTE single broadcasts: `ChangeMessage.data` is already a Map.
+  ///   * SNAPSHOT batches: no row detail, always fire.
+  ///   * DELETES with null data: always fire.
+  void Function() onParentChange(String table, String parentId, void Function() callback) {
+    bool localMatches(Change c) {
+      final d = c.data;
+      if (d == null) return true;
+      try {
+        final parsed = jsonDecode(d);
+        return parsed is Map && parsed['parent_id'] == parentId;
+      } catch (_) {
+        return true;
+      }
+    }
+
+    bool remoteMatches(ChangeMessage c) {
+      final d = c.data;
+      if (d == null) return true;
+      return d['parent_id'] == parentId;
+    }
+
+    final localSub = localChangesFor(table).where(localMatches).listen((_) => callback());
+    final remoteSub = remoteChangesFor(table).where(remoteMatches).listen((_) => callback());
+    final batchSub = snapshotBatchesFor(table).listen((_) => callback());
+    return () {
+      localSub.cancel();
+      remoteSub.cancel();
+      batchSub.cancel();
+    };
+  }
+
   /// Stream of snapshot complete events (emits streamId and channelId when snapshot finishes)
   Stream<SnapshotCompleteEvent> get snapshotComplete => _snapshotCompleteController.stream;
 
