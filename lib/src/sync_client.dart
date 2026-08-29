@@ -1917,6 +1917,158 @@ class SyncClient {
     }
   }
 
+  // ==========================================================================
+  // HTTP fallback sync (docs/http_fallback_sync_plan.md)
+  // ==========================================================================
+
+  /// HTTP counterpart of [syncUnified] — the WebSocket-fallback sync loop.
+  ///
+  /// Pushes pending changes per push channel via POST /push, then pulls each
+  /// pull channel's tables by looping [fetchPage] with a seqnum cursor until a
+  /// page stops filling. Uses the same local queue + apply path as the socket,
+  /// so after a transport flip the two are interchangeable. Realtime broadcasts
+  /// aren't available over HTTP; call this on a timer or on demand instead.
+  Future<void> syncUnifiedOverHttp({List<String>? forceRefresh}) async {
+    if (_isSyncing) {
+      _logger.info('syncUnifiedOverHttp: Already syncing, skipping');
+      return;
+    }
+    _isSyncing = true;
+    _updateSyncState(SyncState.syncing);
+
+    try {
+      // 1. Push pending changes per push channel.
+      _emitSyncProgress(const SyncProgress(phase: 'pushing'));
+      for (final channel in _pushChannels) {
+        final scope = _scopeForTopic(channel.topic);
+        if (scope == null) {
+          _logger.warning('syncUnifiedOverHttp: no HTTP scope for ${channel.topic}, skipping push');
+          continue;
+        }
+        await _httpPushChannel(channel, scope);
+      }
+
+      // 2. Pull each pull channel's tables, paging until has_more is false.
+      final force = (forceRefresh ?? const <String>[]).toSet();
+      for (final channel in _pullChannels) {
+        final scope = _scopeForTopic(channel.topic);
+        if (scope == null) {
+          _logger.warning('syncUnifiedOverHttp: no HTTP scope for ${channel.topic}, skipping pull');
+          continue;
+        }
+        for (final table in channel.allTableNames) {
+          await _httpPullTable(table, scope, forceRefresh: force.contains(table));
+        }
+      }
+
+      _updateSyncState(SyncState.ready);
+      _logger.info('syncUnifiedOverHttp: Complete');
+    } catch (e, stack) {
+      _logger.severe('syncUnifiedOverHttp: Error - $e', e, stack);
+      _updateSyncState(SyncState.error);
+      rethrow;
+    } finally {
+      _isSyncing = false;
+    }
+  }
+
+  /// Push one channel's pending changes over HTTP and apply the acks to the
+  /// local queue (delete acked changes, store the server seqnum) — the same
+  /// bookkeeping the socket's change-ack handler does. row_hash isn't in a
+  /// unified-sync ack (WS or HTTP); it reconciles on the following pull.
+  Future<void> _httpPushChannel(SyncChannel channel, String scope) async {
+    final pending = await _db!.getPendingChanges(limit: config.pushBatchSize);
+    final tableSet = channel.allTableNames.toSet();
+    final changes = pending.where((c) => tableSet.contains(c.tableName)).toList();
+    if (changes.isEmpty) return;
+
+    _logger.info('syncUnifiedOverHttp: HTTP-pushing ${changes.length} changes for scope=$scope');
+
+    final changeMaps = changes.map((c) => <String, dynamic>{
+          'local_seqnum': c.seqnum,
+          'table': c.tableName,
+          'row_id': c.rowId,
+          'operation': c.operation.name,
+          if (c.data != null) 'data': _parseJson(c.data!),
+        }).toList();
+
+    final acks = await _httpPush(scope, changeMaps);
+
+    for (final ack in acks) {
+      if (ack.success) {
+        try {
+          await _db!.deleteChange(ack.localSeqnum);
+        } catch (e) {
+          _logger.warning('Failed to delete change ${ack.localSeqnum}: $e');
+        }
+        if (ack.serverSeqnum != null) {
+          final change = changes.where((c) => c.seqnum == ack.localSeqnum).firstOrNull;
+          if (change != null) {
+            await _updateLocalSeqnum(change.tableName, change.rowId, ack.serverSeqnum!);
+          }
+        }
+      } else {
+        _logger.warning('HTTP push change ${ack.localSeqnum} failed: ${ack.error}');
+      }
+    }
+  }
+
+  /// POST a batch of changes to /api/sync/member/push, returning the acks.
+  Future<List<ChangeAck>> _httpPush(
+    String scope,
+    List<Map<String, dynamic>> pendingChanges,
+  ) async {
+    final authToken = _currentToken;
+    if (authToken == null) {
+      throw StateError('_httpPush: no auth token (call connect(), updateToken(), or pass token)');
+    }
+
+    final resp = await http.post(
+      _memberSyncUri('/push'),
+      headers: {
+        'authorization': 'Bearer $authToken',
+        'x-client-id': config.clientId,
+        'content-type': 'application/json',
+        'accept': 'application/json',
+      },
+      body: jsonEncode({'scope': scope, 'pending_changes': pendingChanges}),
+    );
+
+    if (resp.statusCode != 200) {
+      throw HttpSyncException('push failed: ${resp.statusCode} ${resp.body}', resp.statusCode);
+    }
+
+    final decoded = jsonDecode(resp.body) as Map<String, dynamic>;
+    final acksRaw = decoded['acks'] as List? ?? const [];
+    return acksRaw
+        .map((a) => ChangeAck.fromMap(Map<String, dynamic>.from(a as Map)))
+        .toList();
+  }
+
+  /// Pull one table over HTTP, paging by seqnum cursor until a page stops
+  /// filling. Starts from the local contiguous watermark (MAX(seqnum)), or 0
+  /// when [forceRefresh] is set.
+  Future<void> _httpPullTable(String table, String scope, {bool forceRefresh = false}) async {
+    int since = forceRefresh ? 0 : await _getMaxSeqnumFromTable(table);
+    while (true) {
+      final page = await fetchPage(table, scope: scope, since: since, limit: 500);
+      if (!page.hasMore) break;
+      if (page.nextSeqnum <= since) {
+        _logger.warning('_httpPullTable $table: cursor not advancing at $since, stopping');
+        break;
+      }
+      since = page.nextSeqnum;
+    }
+  }
+
+  /// Map a channel topic to an HTTP member-sync scope. Returns null for topics
+  /// the HTTP surface doesn't serve (e.g. world/zone).
+  String? _scopeForTopic(String topic) {
+    if (topic.startsWith('sync:user:')) return 'user';
+    if (topic.startsWith('sync:tribe:')) return 'tribe';
+    return null;
+  }
+
   /// Run merkle verification independently of syncUnified().
   /// Safe to call at any time — skips if sync is in progress or disconnected.
   Future<void> runMerkleVerification() async {
