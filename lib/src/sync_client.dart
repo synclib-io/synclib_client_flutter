@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:logging/logging.dart';
 import 'package:synclib_flutter/synclib_flutter.dart';
 import 'package:synchronized/synchronized.dart';
+import 'package:http/http.dart' as http;
 import 'connection/websocket_manager.dart';
 import 'protocol/message.dart';
 import 'protocol/codec.dart';
@@ -524,6 +525,42 @@ class SyncClientConfig {
 }
 
 /// Main sync client orchestrating bidirectional sync
+/// Result of one HTTP pull page ([SyncClient.fetchPage]).
+class PullPage {
+  final String table;
+
+  /// Rows applied locally (received minus per-row skips).
+  final int applied;
+
+  /// Rows returned by the server for this page.
+  final int received;
+
+  /// Cursor for the next page: the max seqnum in this page, or the request's
+  /// `since` when the page was empty.
+  final int nextSeqnum;
+
+  /// True when the page filled to `limit`, so another page may exist. The
+  /// caller loops with `since: nextSeqnum` until this is false.
+  final bool hasMore;
+
+  const PullPage({
+    required this.table,
+    required this.applied,
+    required this.received,
+    required this.nextSeqnum,
+    required this.hasMore,
+  });
+}
+
+/// Thrown when an HTTP sync request returns a non-200 status.
+class HttpSyncException implements Exception {
+  final String message;
+  final int statusCode;
+  HttpSyncException(this.message, this.statusCode);
+  @override
+  String toString() => 'HttpSyncException($statusCode): $message';
+}
+
 class SyncClient {
   final SyncClientConfig config;
   final Logger _logger = Logger('SyncClient');
@@ -568,6 +605,10 @@ class SyncClient {
   /// reliably trim the local outbound queue on reconnect.
   String? _deviceId;
   String? get deviceId => _deviceId;
+
+  /// Most recent auth token from [connect]/[updateToken]. The HTTP fallback
+  /// ([fetchPage]) authenticates with it, since it runs without the socket.
+  String? _currentToken;
   final Set<int> _pendingAcks = {};
   final Set<String> _syncedScopes = {};
 
@@ -876,6 +917,8 @@ class SyncClient {
       throw StateError('Not initialized. Call initialize() first.');
     }
 
+    _currentToken = token;
+
     // Tell [_handleStateChange] to skip its auto-rejoin while we're in
     // here — we'll call [_joinChannels] explicitly below. See the field
     // docstring for the race this prevents.
@@ -900,6 +943,91 @@ class SyncClient {
     } finally {
       _explicitConnectInProgress = false;
     }
+  }
+
+  /// Update the auth token used by the HTTP fallback ([fetchPage]) without
+  /// reconnecting the socket. Call this after a JWT refresh so degraded-mode
+  /// requests use the fresh token.
+  void updateToken(String token) {
+    _currentToken = token;
+  }
+
+  /// Fetch one seqnum-ordered page of [table] over HTTP (the WebSocket
+  /// fallback), apply it locally, and report the cursor.
+  ///
+  /// Shares the row-apply path with the socket ([applyServerRows]), so cached
+  /// rows and `deleted_at` tombstones land identically. The caller loops with
+  /// `since: page.nextSeqnum` until `page.hasMore` is false.
+  ///
+  /// [scope] is `'user'` or `'tribe'`; the server derives the scope id from the
+  /// token's claims, never from the request. [token] overrides the stored token
+  /// (from [connect]/[updateToken]).
+  ///
+  /// Throws [HttpSyncException] on a non-200 response and [StateError] when no
+  /// token is available.
+  Future<PullPage> fetchPage(
+    String table, {
+    required String scope,
+    int since = 0,
+    int limit = 500,
+    String? token,
+  }) async {
+    final authToken = token ?? _currentToken;
+    if (authToken == null) {
+      throw StateError(
+        'fetchPage: no auth token (call connect(), updateToken(), or pass token)',
+      );
+    }
+
+    final uri = _memberSyncUri('/$table', {
+      'scope': scope,
+      'since': '$since',
+      'limit': '$limit',
+    });
+
+    final resp = await http.get(uri, headers: {
+      'authorization': 'Bearer $authToken',
+      'x-client-id': config.clientId,
+      'accept': 'application/json',
+    });
+
+    if (resp.statusCode != 200) {
+      throw HttpSyncException(
+        'fetchPage $table failed: ${resp.statusCode} ${resp.body}',
+        resp.statusCode,
+      );
+    }
+
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    final rows = (body['rows'] as List? ?? const [])
+        .map((r) => Map<String, dynamic>.from(r as Map))
+        .toList();
+    final nextSeqnum = (body['next_seqnum'] as num?)?.toInt() ?? since;
+    final hasMore = body['has_more'] == true;
+
+    final applied = await applyServerRows(table, rows);
+
+    return PullPage(
+      table: table,
+      applied: applied,
+      received: rows.length,
+      nextSeqnum: nextSeqnum,
+      hasMore: hasMore,
+    );
+  }
+
+  /// Build a member-sync HTTP URI from the (WebSocket) [SyncClientConfig.serverUrl],
+  /// swapping the scheme to http(s) and rooting at `/api/sync/member`.
+  Uri _memberSyncUri(String path, [Map<String, String>? query]) {
+    final ws = Uri.parse(config.serverUrl);
+    final scheme = (ws.scheme == 'wss' || ws.scheme == 'https') ? 'https' : 'http';
+    return Uri(
+      scheme: scheme,
+      host: ws.host,
+      port: ws.hasPort ? ws.port : null,
+      path: '/api/sync/member$path',
+      queryParameters: query,
+    );
   }
 
   /// Join all configured channels
@@ -1900,21 +2028,36 @@ class SyncClient {
       rowCount: message.rows.length,
     ));
 
+    await applyServerRows(message.table, message.rows);
+  }
+
+  /// Apply a batch of server rows into the local table.
+  ///
+  /// Transport-agnostic: the WebSocket sync-batch handler and the HTTP pull
+  /// path (`fetchPage`) both call this with `(table, rows)`, where each row is a
+  /// server-shaped map that may carry a `deleted_at` tombstone (soft-deleted
+  /// rows are removed locally). Serialized through [_batchLock] so overlapping
+  /// batches can't race. Returns the number of rows applied (excludes rows
+  /// skipped due to per-row errors).
+  ///
+  /// row_hash is server-authoritative and travels in the row data, so it is
+  /// stored as-is; the client never recomputes it.
+  Future<int> applyServerRows(String table, List<Map<String, dynamic>> rows) async {
     // Use lock to ensure serial processing - prevents race conditions when
     // multiple batches arrive faster than they can be processed
-    await _batchLock.synchronized(() async {
+    return await _batchLock.synchronized(() async {
       // Check if table exists
       try {
         final tableCheck = await _db!.read(
-          "SELECT name FROM sqlite_master WHERE type='table' AND name='${message.table}'"
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='$table'"
         );
         if (tableCheck.isEmpty) {
-          _logger.warning('Table ${message.table} does not exist, skipping batch');
-          return;
+          _logger.warning('Table $table does not exist, skipping batch');
+          return 0;
         }
       } catch (e) {
-        _logger.severe('Error checking if table ${message.table} exists: $e');
-        return;
+        _logger.severe('Error checking if table $table exists: $e');
+        return 0;
       }
 
       // Apply batch
@@ -1922,43 +2065,41 @@ class SyncClient {
       int skippedCount = 0;
 
       try {
-        for (final row in message.rows) {
+        for (final row in rows) {
           try {
             final deletedAt = row['deleted_at'];
 
             if (deletedAt != null) {
               // Soft-deleted row - delete locally
               final rowId = row['id'] as String;
-              final deleteSql = "DELETE FROM ${_quoteId(message.table)} WHERE \"id\" = '${_escapeSql(rowId)}'";
+              final deleteSql = "DELETE FROM ${_quoteId(table)} WHERE \"id\" = '${_escapeSql(rowId)}'";
               await _db!.execBulkRemote(deleteSql);
             } else {
               // Normal row - insert/replace
               final change = ChangeMessage(
-                table: message.table,
+                table: table,
                 operation: 'insert',
                 rowId: row['id'] as String,
                 data: row,
               );
               final sql = _generateSql(change);
               await _db!.execBulkRemote(sql);
-
-              // If this was a stripped refresh and the row is still stripped,
             }
           } catch (rowErr) {
             skippedCount++;
-            _logger.severe('Skipping bad row in ${message.table} (id=${row['id']}): $rowErr');
+            _logger.severe('Skipping bad row in $table (id=${row['id']}): $rowErr');
           }
         }
         await _db!.endBulkRemote();
-        // row_hash is now server-authoritative — included in row data from server
         if (skippedCount > 0) {
-          _logger.warning('Skipped $skippedCount bad rows in ${message.table}');
+          _logger.warning('Skipped $skippedCount bad rows in $table');
         }
-        _logger.info('Applied sync batch for ${message.table}');
-
+        _logger.info('Applied sync batch for $table');
+        return rows.length - skippedCount;
       } catch (e) {
-        _logger.severe('Failed to apply sync batch for ${message.table}: $e');
+        _logger.severe('Failed to apply sync batch for $table: $e');
         await _db!.endBulkRemote(rollback: true);
+        return 0;
       }
     });
   }
