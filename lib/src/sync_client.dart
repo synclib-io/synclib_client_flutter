@@ -1043,6 +1043,108 @@ class SyncClient {
     return (rows: rows, nextSeqnum: nextSeqnum, hasMore: hasMore);
   }
 
+  /// Fetch specific rows by id over HTTP and apply them locally as a TARGETED
+  /// fetch (seqnum 0, so it can't advance the pull cursor). Returns the number
+  /// applied. See [applyServerRows]'s `asTargeted`.
+  Future<int> fetchByIds(
+    String table,
+    List<String> ids, {
+    required String scope,
+    String? token,
+  }) async {
+    final rows = await fetchByIdsRaw(table, ids, scope: scope, token: token);
+    return applyServerRows(table, rows, asTargeted: true);
+  }
+
+  /// Fetch one row by id over HTTP and apply it locally as a targeted fetch.
+  /// Returns the row map, or null if the server has no such row in scope.
+  Future<Map<String, dynamic>?> fetchById(
+    String table,
+    String id, {
+    required String scope,
+    String? token,
+  }) async {
+    final row = await fetchByIdRaw(table, id, scope: scope, token: token);
+    if (row != null) {
+      await applyServerRows(table, [row], asTargeted: true);
+    }
+    return row;
+  }
+
+  /// Fetch + parse rows by id WITHOUT applying (wire logic, testable).
+  @visibleForTesting
+  Future<List<Map<String, dynamic>>> fetchByIdsRaw(
+    String table,
+    List<String> ids, {
+    required String scope,
+    String? token,
+  }) async {
+    if (ids.isEmpty) return const [];
+    final authToken = token ?? _currentToken;
+    if (authToken == null) {
+      throw StateError('fetchByIds: no auth token (call connect(), updateToken(), or pass token)');
+    }
+
+    final resp = await _http.post(
+      memberSyncUri('/$table/by-ids', {'scope': scope}),
+      headers: {
+        'authorization': 'Bearer $authToken',
+        'x-client-id': config.clientId,
+        'content-type': 'application/json',
+        'accept': 'application/json',
+      },
+      body: jsonEncode({'ids': ids}),
+    );
+
+    if (resp.statusCode != 200) {
+      throw HttpSyncException(
+        'fetchByIds $table failed: ${resp.statusCode} ${resp.body}',
+        resp.statusCode,
+      );
+    }
+
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    return (body['rows'] as List? ?? const [])
+        .map((r) => Map<String, dynamic>.from(r as Map))
+        .toList();
+  }
+
+  /// Fetch + parse one row by id WITHOUT applying (wire logic, testable).
+  /// Returns null on a 404.
+  @visibleForTesting
+  Future<Map<String, dynamic>?> fetchByIdRaw(
+    String table,
+    String id, {
+    required String scope,
+    String? token,
+  }) async {
+    final authToken = token ?? _currentToken;
+    if (authToken == null) {
+      throw StateError('fetchById: no auth token (call connect(), updateToken(), or pass token)');
+    }
+
+    final resp = await _http.get(
+      memberSyncUri('/$table/$id', {'scope': scope}),
+      headers: {
+        'authorization': 'Bearer $authToken',
+        'x-client-id': config.clientId,
+        'accept': 'application/json',
+      },
+    );
+
+    if (resp.statusCode == 404) return null;
+    if (resp.statusCode != 200) {
+      throw HttpSyncException(
+        'fetchById $table/$id failed: ${resp.statusCode} ${resp.body}',
+        resp.statusCode,
+      );
+    }
+
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    final row = body['row'];
+    return row is Map ? Map<String, dynamic>.from(row) : null;
+  }
+
   /// Build a member-sync HTTP URI from the (WebSocket) [SyncClientConfig.serverUrl],
   /// swapping the scheme to http(s) and rooting at `/api/sync/member`.
   @visibleForTesting
@@ -2225,7 +2327,18 @@ class SyncClient {
   ///
   /// row_hash is server-authoritative and travels in the row data, so it is
   /// stored as-is; the client never recomputes it.
-  Future<int> applyServerRows(String table, List<Map<String, dynamic>> rows) async {
+  ///
+  /// [asTargeted] marks these as an out-of-seqnum-order fetch (by id, by parent,
+  /// a query): the rows are stored with `seqnum = 0` so they never inflate the
+  /// local `MAX(seqnum)` cursor above the contiguous watermark (which would gap
+  /// the next incremental pull). The real row_hash is kept; the next contiguous
+  /// sync re-delivers them with their true seqnum. See
+  /// docs/http_fallback_sync_plan.md.
+  Future<int> applyServerRows(
+    String table,
+    List<Map<String, dynamic>> rows, {
+    bool asTargeted = false,
+  }) async {
     // Use lock to ensure serial processing - prevents race conditions when
     // multiple batches arrive faster than they can be processed
     return await _batchLock.synchronized(() async {
@@ -2258,12 +2371,14 @@ class SyncClient {
               final deleteSql = "DELETE FROM ${_quoteId(table)} WHERE \"id\" = '${_escapeSql(rowId)}'";
               await _db!.execBulkRemote(deleteSql);
             } else {
-              // Normal row - insert/replace
+              // Normal row - insert/replace. For targeted fetches, store
+              // seqnum 0 so this out-of-order row can't advance the cursor.
+              final data = asTargeted ? {...row, 'seqnum': 0} : row;
               final change = ChangeMessage(
                 table: table,
                 operation: 'insert',
                 rowId: row['id'] as String,
-                data: row,
+                data: data,
               );
               final sql = _generateSql(change);
               await _db!.execBulkRemote(sql);

@@ -168,4 +168,66 @@ void main() {
       );
     });
   });
+
+  group('by-id / by-ids wire', () {
+    test('fetchByIdsRaw POSTs {ids} and parses rows', () async {
+      http.Request? captured;
+      final mock = MockClient((req) async {
+        captured = req;
+        return http.Response(jsonEncode({'rows': [{'id': 'a'}, {'id': 'b'}]}), 200);
+      });
+      final client = SyncClient(_config(), httpClient: mock);
+      final rows =
+          await client.fetchByIdsRaw('storage_files', ['a', 'b'], scope: 'user', token: 't');
+
+      expect(captured!.method, 'POST');
+      expect(captured!.url.path, '/api/sync/member/storage_files/by-ids');
+      expect(captured!.url.queryParameters['scope'], 'user');
+      expect((jsonDecode(captured!.body) as Map)['ids'], ['a', 'b']);
+      expect(rows.map((r) => r['id']).toList(), ['a', 'b']);
+    });
+
+    test('fetchByIdsRaw with empty ids makes no request', () async {
+      var called = false;
+      final mock = MockClient((_) async {
+        called = true;
+        return http.Response('{}', 200);
+      });
+      final client = SyncClient(_config(), httpClient: mock);
+      final rows = await client.fetchByIdsRaw('storage_files', const [], scope: 'user', token: 't');
+      expect(rows, isEmpty);
+      expect(called, isFalse);
+    });
+
+    test('fetchByIdRaw GETs /:table/:id and parses the row', () async {
+      http.Request? captured;
+      final mock = MockClient((req) async {
+        captured = req;
+        return http.Response(jsonEncode({'row': {'id': 'x', 'seqnum': 7}}), 200);
+      });
+      final client = SyncClient(_config(), httpClient: mock);
+      final row = await client.fetchByIdRaw('storage_files', 'x', scope: 'user', token: 't');
+
+      expect(captured!.method, 'GET');
+      expect(captured!.url.path, '/api/sync/member/storage_files/x');
+      expect(captured!.url.queryParameters['scope'], 'user');
+      expect(row!['id'], 'x');
+    });
+
+    test('fetchByIdRaw returns null on 404', () async {
+      final mock = MockClient((_) async => http.Response('{}', 404));
+      final client = SyncClient(_config(), httpClient: mock);
+      final row = await client.fetchByIdRaw('storage_files', 'missing', scope: 'user', token: 't');
+      expect(row, isNull);
+    });
+
+    test('fetchByIdRaw throws on a non-200 non-404', () async {
+      final mock = MockClient((_) async => http.Response('err', 500));
+      final client = SyncClient(_config(), httpClient: mock);
+      expect(
+        () => client.fetchByIdRaw('storage_files', 'x', scope: 'user', token: 't'),
+        throwsA(isA<HttpSyncException>()),
+      );
+    });
+  });
 }
