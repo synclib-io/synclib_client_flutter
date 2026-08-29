@@ -5,6 +5,7 @@ import 'package:logging/logging.dart';
 import 'package:synclib_flutter/synclib_flutter.dart';
 import 'package:synchronized/synchronized.dart';
 import 'package:http/http.dart' as http;
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'connection/websocket_manager.dart';
 import 'protocol/message.dart';
 import 'protocol/codec.dart';
@@ -609,6 +610,10 @@ class SyncClient {
   /// Most recent auth token from [connect]/[updateToken]. The HTTP fallback
   /// ([fetchPage]) authenticates with it, since it runs without the socket.
   String? _currentToken;
+
+  /// HTTP client for the fallback surface. Injectable so the wire logic can be
+  /// unit-tested with a mock, defaults to a real client.
+  final http.Client _http;
   final Set<int> _pendingAcks = {};
   final Set<String> _syncedScopes = {};
 
@@ -709,7 +714,8 @@ class SyncClient {
   // Hello handshake gate — completed when server reply to hello is fully processed
   Completer<void>? _helloHandshakeCompleter;
 
-  SyncClient(this.config) {
+  SyncClient(this.config, {http.Client? httpClient})
+      : _http = httpClient ?? http.Client() {
     _ws = WebSocketManager(
       url: config.serverUrl,
       codec: SyncCodecFactory.create(config.codec),
@@ -972,6 +978,35 @@ class SyncClient {
     int limit = 500,
     String? token,
   }) async {
+    final page = await fetchPageRaw(
+      table,
+      scope: scope,
+      since: since,
+      limit: limit,
+      token: token,
+    );
+    final applied = await applyServerRows(table, page.rows);
+    return PullPage(
+      table: table,
+      applied: applied,
+      received: page.rows.length,
+      nextSeqnum: page.nextSeqnum,
+      hasMore: page.hasMore,
+    );
+  }
+
+  /// Fetch + parse one page over HTTP, WITHOUT applying it to the local DB.
+  /// [fetchPage] wraps this with [applyServerRows]. Split out so the wire logic
+  /// (URI, headers, response parsing, cursor) is unit-testable without a
+  /// database or a live server.
+  @visibleForTesting
+  Future<({List<Map<String, dynamic>> rows, int nextSeqnum, bool hasMore})> fetchPageRaw(
+    String table, {
+    required String scope,
+    int since = 0,
+    int limit = 500,
+    String? token,
+  }) async {
     final authToken = token ?? _currentToken;
     if (authToken == null) {
       throw StateError(
@@ -979,13 +1014,13 @@ class SyncClient {
       );
     }
 
-    final uri = _memberSyncUri('/$table', {
+    final uri = memberSyncUri('/$table', {
       'scope': scope,
       'since': '$since',
       'limit': '$limit',
     });
 
-    final resp = await http.get(uri, headers: {
+    final resp = await _http.get(uri, headers: {
       'authorization': 'Bearer $authToken',
       'x-client-id': config.clientId,
       'accept': 'application/json',
@@ -1005,20 +1040,13 @@ class SyncClient {
     final nextSeqnum = (body['next_seqnum'] as num?)?.toInt() ?? since;
     final hasMore = body['has_more'] == true;
 
-    final applied = await applyServerRows(table, rows);
-
-    return PullPage(
-      table: table,
-      applied: applied,
-      received: rows.length,
-      nextSeqnum: nextSeqnum,
-      hasMore: hasMore,
-    );
+    return (rows: rows, nextSeqnum: nextSeqnum, hasMore: hasMore);
   }
 
   /// Build a member-sync HTTP URI from the (WebSocket) [SyncClientConfig.serverUrl],
   /// swapping the scheme to http(s) and rooting at `/api/sync/member`.
-  Uri _memberSyncUri(String path, [Map<String, String>? query]) {
+  @visibleForTesting
+  Uri memberSyncUri(String path, [Map<String, String>? query]) {
     final ws = Uri.parse(config.serverUrl);
     final scheme = (ws.scheme == 'wss' || ws.scheme == 'https') ? 'https' : 'http';
     return Uri(
@@ -1992,7 +2020,7 @@ class SyncClient {
           if (c.data != null) 'data': _parseJson(c.data!),
         }).toList();
 
-    final acks = await _httpPush(scope, changeMaps);
+    final acks = await httpPush(scope, changeMaps);
 
     for (final ack in acks) {
       if (ack.success) {
@@ -2014,17 +2042,20 @@ class SyncClient {
   }
 
   /// POST a batch of changes to /api/sync/member/push, returning the acks.
-  Future<List<ChangeAck>> _httpPush(
+  /// [token] overrides the stored token (used by unit tests).
+  @visibleForTesting
+  Future<List<ChangeAck>> httpPush(
     String scope,
-    List<Map<String, dynamic>> pendingChanges,
-  ) async {
-    final authToken = _currentToken;
+    List<Map<String, dynamic>> pendingChanges, {
+    String? token,
+  }) async {
+    final authToken = token ?? _currentToken;
     if (authToken == null) {
-      throw StateError('_httpPush: no auth token (call connect(), updateToken(), or pass token)');
+      throw StateError('httpPush: no auth token (call connect(), updateToken(), or pass token)');
     }
 
-    final resp = await http.post(
-      _memberSyncUri('/push'),
+    final resp = await _http.post(
+      memberSyncUri('/push'),
       headers: {
         'authorization': 'Bearer $authToken',
         'x-client-id': config.clientId,
