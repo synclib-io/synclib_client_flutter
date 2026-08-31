@@ -383,11 +383,28 @@ class SyncChannel {
   /// Optional params to send when joining this channel.
   final Map<String, String>? params;
 
+  /// The row-partition scope ids this channel wants synced right now, or null
+  /// for unscoped whole-table sync. When set, `syncUnified` fans out one pull
+  /// per active scope id (unit = scope, spanning this channel's tables), sending
+  /// `scope`/`scope_id` on the wire so the server filters. The application drives
+  /// this from its own state (a spatial app's visibility set); the library never
+  /// computes membership. An empty list means "scoped, but nothing in view" (no
+  /// pulls), distinct from null ("unscoped"). This is the live-path replacement
+  /// for the deprecated `streamSnapshot(scope:, scopeId:)` route.
+  final List<String>? activeScopes;
+
+  /// The scope KIND sent alongside each scope id (e.g. "zone_voxels"), so the
+  /// server's scope filter can dispatch. Optional: a use case whose predicate
+  /// keys on the id alone can omit it.
+  final String? scopeKind;
+
   const SyncChannel({
     required this.topic,
     required this.role,
     this.tables = const [],
     this.params,
+    this.activeScopes,
+    this.scopeKind,
   });
 
   /// Default repair direction implied by this channel's role.
@@ -562,6 +579,57 @@ class HttpSyncException implements Exception {
   String toString() => 'HttpSyncException($statusCode): $message';
 }
 
+/// Persistent, unit-keyed pull cursors for SCOPED sync (SYNCLIB-SCOPES.md, A1).
+///
+/// Unscoped whole-table sync keeps deriving its cursor from the table's local
+/// `MAX(seqnum)` (unchanged). That model cannot represent a scope, because a
+/// scope's rows are interleaved in seqnum with other scopes': pull scope A
+/// (rows at seqnum 10,11), then scope B (row at seqnum 5), and the table MAX is
+/// 11, so the next scope-B pull would ask `WHERE seqnum > 11` and silently miss
+/// its own row. So a scope needs its OWN cursor, keyed by the scope id and
+/// spanning the channel's tables, committed only when the scope's sync
+/// completes. This store holds exactly those, in a `_synclib_cursors(unit,
+/// seqnum)` table. `unit` is the scope id.
+class _ScopeCursorStore {
+  final SynclibDatabase _db;
+  bool _ensured = false;
+
+  _ScopeCursorStore(this._db);
+
+  Future<void> _ensure() async {
+    if (_ensured) return;
+    await _db.exec(
+      'CREATE TABLE IF NOT EXISTS _synclib_cursors (unit TEXT PRIMARY KEY, seqnum INTEGER)',
+    );
+    _ensured = true;
+  }
+
+  static String _esc(String s) => s.replaceAll("'", "''");
+
+  /// Current cursor for a scope unit, or 0 if it has never completed a sync.
+  Future<int> get(String unit) async {
+    await _ensure();
+    final rows =
+        await _db.read("SELECT seqnum FROM _synclib_cursors WHERE unit = '${_esc(unit)}'");
+    if (rows.isEmpty) return 0;
+    final v = rows.first['seqnum'];
+    if (v == null) return 0;
+    return v is int ? v : int.parse(v.toString());
+  }
+
+  /// Advance a scope unit's cursor. Monotonic: never moves backward, so an
+  /// out-of-order or empty completion cannot rewind a scope.
+  Future<void> commit(String unit, int seqnum) async {
+    await _ensure();
+    final current = await get(unit);
+    if (seqnum <= current) return;
+    await _db.exec(
+      "INSERT INTO _synclib_cursors (unit, seqnum) VALUES ('${_esc(unit)}', $seqnum) "
+      "ON CONFLICT(unit) DO UPDATE SET seqnum = $seqnum",
+    );
+  }
+}
+
 class SyncClient {
   final SyncClientConfig config;
   final Logger _logger = Logger('SyncClient');
@@ -691,6 +759,15 @@ class SyncClient {
   // Track per-channel sync state
   final Map<String, ChannelSyncState> _channelStates = {};
 
+  // Persistent per-scope cursors for scoped sync (A1). Lazily created once the
+  // local database is open. Null until then / for a purely unscoped client that
+  // never issues a scoped pull.
+  _ScopeCursorStore? _scopeCursors;
+
+  // Maps a scoped pull's stream_id to its scope unit, so `_handleSyncComplete`
+  // knows which scope cursor to advance (and only advances at completion).
+  final Map<String, String> _streamScopes = {};
+
   // Store join responses for deferred auto-sync
   Map<String, Map<String, dynamic>> _pendingJoinResponses = {};
 
@@ -739,6 +816,7 @@ class SyncClient {
       _db = await SynclibDatabase.open(config.dbPath);
       _logger.info('Database opened: ${config.dbPath}');
     }
+    _scopeCursors = _ScopeCursorStore(_db!);
     _merkle = MerkleComputer(
       _SynclibMerkleDb(_db!),
       skipColumns: config.merkleSkipColumns,
@@ -981,6 +1059,8 @@ class SyncClient {
     int limit = 500,
     String? token,
     String? env,
+    String? scope,
+    String? scopeId,
   }) async {
     final page = await fetchPageRaw(
       table,
@@ -989,6 +1069,8 @@ class SyncClient {
       limit: limit,
       token: token,
       env: env,
+      scope: scope,
+      scopeId: scopeId,
     );
     final applied = await applyServerRows(table, page.rows);
     return PullPage(
@@ -1005,10 +1087,19 @@ class SyncClient {
 
   /// Query params every member-sync request carries: the channel [topic] (the
   /// same one joined on the socket — the server rebuilds scope from it) and,
-  /// when known, `env` (dev|prod) so HTTP reads the same per-app schema.
-  Map<String, String> _scopeQuery(String topic, [String? env]) {
+  /// when known, `env` (dev|prod) so HTTP reads the same per-app schema. When a
+  /// row-partition [scopeId] is given, `scope_id` (and the `scope` kind) go on
+  /// the query so the HTTP member pull filters the same way the socket does;
+  /// omitted for an unscoped pull, so behaviour there is unchanged.
+  Map<String, String> _scopeQuery(String topic, [String? env, String? scope, String? scopeId]) {
     final e = env ?? _connectExtra?['env'];
-    return e != null ? {'topic': topic, 'env': e} : {'topic': topic};
+    final q = <String, String>{'topic': topic};
+    if (e != null) q['env'] = e;
+    if (scopeId != null && scopeId.isNotEmpty) {
+      q['scope'] = (scope != null && scope.isNotEmpty) ? scope : 'scope';
+      q['scope_id'] = scopeId;
+    }
+    return q;
   }
 
   /// Fetch + parse one page over HTTP, WITHOUT applying it to the local DB.
@@ -1023,6 +1114,8 @@ class SyncClient {
     int limit = 500,
     String? token,
     String? env,
+    String? scope,
+    String? scopeId,
   }) async {
     final authToken = token ?? _currentToken;
     if (authToken == null) {
@@ -1032,7 +1125,7 @@ class SyncClient {
     }
 
     final uri = memberSyncUri('/$table', {
-      ..._scopeQuery(topic, env),
+      ..._scopeQuery(topic, env, scope, scopeId),
       'since': '$since',
       'limit': '$limit',
     });
@@ -1968,16 +2061,16 @@ class SyncClient {
         }
       }
 
-      // 6. Pull data from each channel (all channels may have data to pull)
+      // 6. Pull data from each channel. A channel with `activeScopes` fans out
+      // into one scoped pull per active scope id (unit = scope, spanning its
+      // tables); an unscoped channel keeps its single per-channel pull. This is
+      // the live-path scope fan-out (SYNCLIB-SCOPES.md), the replacement for the
+      // deprecated streamSnapshot scope route.
       for (final channel in config.channels) {
         final channelTableNames = channel.allTableNames;
         if (channelTableNames.isEmpty) continue;
 
-        // Build per-channel table seqnums and force refresh
         final channelTableSet = channelTableNames.toSet();
-        final channelSeqnums = Map.fromEntries(
-          tableSeqnums.entries.where((e) => channelTableSet.contains(e.key))
-        );
         final channelForceRefresh = effectiveForceRefresh
             .where((t) => channelTableSet.contains(t))
             .toList();
@@ -1985,66 +2078,55 @@ class SyncClient {
             ?.where((r) => channelTableSet.contains(r.table))
             .toList();
 
-        _logger.info('syncUnified: Pulling ${channelTableNames.join(', ')} on ${channel.topic} (schema v$schemaVersion)');
-        final pullRequest = SyncRequestMessage(
-          clientId: config.clientId,
-          deviceId: _deviceId,
-          schemaVersion: schemaVersion,
-          tableSeqnums: channelSeqnums,
-          tables: channelTableNames,
-          forceRefreshTables: channelForceRefresh.isNotEmpty ? channelForceRefresh : null,
-          strippedRows: channelStrippedRows?.isNotEmpty == true ? channelStrippedRows : null,
-          pendingChanges: null,
-          role: channel.role.name,
-        );
-
-        final response = await _ws.sendRaw('sync', pullRequest.toMap(), channelTopic: channel.topic);
-
-        // Check if schema upgrade is required
-        if (response['status'] == 'schema_upgrade_required') {
-          final targetVersion = response['target_version'] as int;
-          _logger.info('syncUnified: Schema upgrade required to v$targetVersion');
-          _emitSyncProgress(const SyncProgress(phase: 'migrating'));
-
-          await _applyMigrations({
-            'current_version': targetVersion,
-            'migrations': response['migrations'],
-          });
-
-          _logger.info('syncUnified: Schema upgraded to v$targetVersion, restarting sync');
-
-          _isSyncing = false;
-          return syncUnified(
-            forceRefresh: forceRefresh,
-            includeStripped: includeStripped,
-            cleanupLegacyChanges: false,
+        final active = channel.activeScopes; // null = unscoped
+        if (active == null) {
+          // Unscoped: cursor from local table MAX(seqnum), as before.
+          final channelSeqnums = Map.fromEntries(
+            tableSeqnums.entries.where((e) => channelTableSet.contains(e.key)),
           );
+          final upgraded = await _pullUnit(
+            channel: channel,
+            tables: channelTableNames,
+            unitSeqnums: channelSeqnums,
+            forceRefresh: channelForceRefresh,
+            strippedRows: channelStrippedRows,
+            schemaVersion: schemaVersion,
+            scopeId: null,
+          );
+          if (upgraded) {
+            _isSyncing = false;
+            return syncUnified(
+              forceRefresh: forceRefresh,
+              includeStripped: includeStripped,
+              cleanupLegacyChanges: false,
+            );
+          }
+        } else {
+          // Scoped: one pull per active scope id. The scope's cursor is the
+          // per-scope stored cursor, shared across the scope's tables. An empty
+          // `active` list means "scoped, nothing in view" — no pulls at all.
+          for (final scopeId in active) {
+            final since = await _scopeCursors!.get(scopeId);
+            final scopedSeqnums = {for (final t in channelTableNames) t: since};
+            final upgraded = await _pullUnit(
+              channel: channel,
+              tables: channelTableNames,
+              unitSeqnums: scopedSeqnums,
+              forceRefresh: channelForceRefresh,
+              strippedRows: channelStrippedRows,
+              schemaVersion: schemaVersion,
+              scopeId: scopeId,
+            );
+            if (upgraded) {
+              _isSyncing = false;
+              return syncUnified(
+                forceRefresh: forceRefresh,
+                includeStripped: includeStripped,
+                cleanupLegacyChanges: false,
+              );
+            }
+          }
         }
-
-        if (response['status'] == 'error') {
-          throw StateError('Sync error on ${channel.topic}: ${response['error']}');
-        }
-
-        // Wait for this channel's pull stream to complete
-        final pullStreamId = response['stream_id'] as String?;
-        if (pullStreamId == null) {
-          throw StateError('Server did not return stream_id for ${channel.topic}');
-        }
-
-        _logger.info('syncUnified: Got pull stream_id $pullStreamId for ${channel.topic}, waiting for data');
-        streamId = pullStreamId;
-
-        final completer = Completer<void>();
-        _activeSyncCompleters[streamId] = completer;
-
-        await completer.future.timeout(
-          const Duration(seconds: 60),
-          onTimeout: () {
-            _activeSyncCompleters.remove(streamId);
-            _activeSyncPendingChanges.remove(streamId);
-            throw TimeoutException('Unified sync timed out on ${channel.topic}', const Duration(seconds: 60));
-          },
-        );
       }
 
       // Check if Merkle verification is needed (staleness check)
@@ -2066,6 +2148,85 @@ class SyncClient {
     } finally {
       _isSyncing = false;
     }
+  }
+
+  /// Issue one pull request (unscoped, or for a single scope id) and wait for
+  /// its stream to complete. Returns `true` if the server asked for a schema
+  /// upgrade, in which case the caller restarts [syncUnified].
+  ///
+  /// A scoped pull carries `scope`/`scope_id` on the wire and registers its
+  /// stream in [_streamScopes] so [_handleSyncComplete] advances the right
+  /// per-scope cursor — and only at completion, so an interrupted scope re-runs
+  /// whole rather than skipping the rows that never arrived.
+  Future<bool> _pullUnit({
+    required SyncChannel channel,
+    required List<String> tables,
+    required Map<String, int> unitSeqnums,
+    required List<String> forceRefresh,
+    List<RowRef>? strippedRows,
+    required int schemaVersion,
+    required String? scopeId,
+  }) async {
+    final label = scopeId != null ? '${channel.topic} scope=$scopeId' : channel.topic;
+    _logger.info('syncUnified: Pulling ${tables.join(', ')} on $label (schema v$schemaVersion)');
+
+    final pullRequest = SyncRequestMessage(
+      clientId: config.clientId,
+      deviceId: _deviceId,
+      schemaVersion: schemaVersion,
+      tableSeqnums: unitSeqnums,
+      tables: tables,
+      forceRefreshTables: forceRefresh.isNotEmpty ? forceRefresh : null,
+      strippedRows: strippedRows?.isNotEmpty == true ? strippedRows : null,
+      pendingChanges: null,
+      role: channel.role.name,
+      scope: scopeId != null ? (channel.scopeKind ?? 'scope') : null,
+      scopeId: scopeId,
+    );
+
+    final response = await _ws.sendRaw('sync', pullRequest.toMap(), channelTopic: channel.topic);
+
+    if (response['status'] == 'schema_upgrade_required') {
+      final targetVersion = response['target_version'] as int;
+      _logger.info('syncUnified: Schema upgrade required to v$targetVersion');
+      _emitSyncProgress(const SyncProgress(phase: 'migrating'));
+      await _applyMigrations({
+        'current_version': targetVersion,
+        'migrations': response['migrations'],
+      });
+      _logger.info('syncUnified: Schema upgraded to v$targetVersion, restarting sync');
+      return true;
+    }
+
+    if (response['status'] == 'error') {
+      throw StateError('Sync error on $label: ${response['error']}');
+    }
+
+    final pullStreamId = response['stream_id'] as String?;
+    if (pullStreamId == null) {
+      throw StateError('Server did not return stream_id for $label');
+    }
+
+    if (scopeId != null) {
+      _streamScopes[pullStreamId] = scopeId;
+    }
+
+    _logger.info('syncUnified: Got pull stream_id $pullStreamId for $label, waiting for data');
+
+    final completer = Completer<void>();
+    _activeSyncCompleters[pullStreamId] = completer;
+
+    await completer.future.timeout(
+      const Duration(seconds: 60),
+      onTimeout: () {
+        _activeSyncCompleters.remove(pullStreamId);
+        _activeSyncPendingChanges.remove(pullStreamId);
+        _streamScopes.remove(pullStreamId);
+        throw TimeoutException('Unified sync timed out on $label', const Duration(seconds: 60));
+      },
+    );
+
+    return false;
   }
 
   // ==========================================================================
@@ -2096,11 +2257,23 @@ class SyncClient {
         await _httpPushChannel(channel, channel.topic);
       }
 
-      // 2. Pull each pull channel's tables, paging until has_more is false.
+      // 2. Pull, fanning out by sync UNIT exactly like the WS path: an unscoped
+      //    channel pulls each table (unit = table, table-MAX cursor, unchanged);
+      //    a channel with `activeScopes` pulls once per active scope id (unit =
+      //    scope, spanning tables), sending scope_id on the HTTP query and using
+      //    the SAME durable scope cursor the socket uses. So a WS->HTTP degrade
+      //    keeps scoping and resumes from the same point.
       final force = (forceRefresh ?? const <String>[]).toSet();
       for (final channel in _pullChannels) {
-        for (final table in channel.allTableNames) {
-          await _httpPullTable(table, channel.topic, forceRefresh: force.contains(table));
+        final active = channel.activeScopes; // null = unscoped
+        if (active == null) {
+          for (final table in channel.allTableNames) {
+            await _httpPullTable(table, channel.topic, forceRefresh: force.contains(table));
+          }
+        } else {
+          for (final scopeId in active) {
+            await _httpPullScope(channel, scopeId, force);
+          }
         }
       }
 
@@ -2205,6 +2378,44 @@ class SyncClient {
         break;
       }
       since = page.nextSeqnum;
+    }
+  }
+
+  /// Pull one SCOPE over HTTP: all the channel's tables, each starting from the
+  /// scope's single durable cursor, committed once to the max seqnum seen across
+  /// them. Sends scope_id so the server filters. Mirrors the WS scope fan-out +
+  /// commit-on-completion; a scope-wide cursor is required because committing
+  /// per table would advance the scope past a lower-seqnum table's unread rows.
+  Future<void> _httpPullScope(SyncChannel channel, String scopeId, Set<String> force) async {
+    final tables = channel.allTableNames;
+    final forceRefresh = tables.any(force.contains);
+    final since0 = forceRefresh ? 0 : await _scopeCursors!.get(scopeId);
+    int maxSeen = since0;
+
+    for (final table in tables) {
+      int since = since0;
+      while (true) {
+        final page = await fetchPage(
+          table,
+          topic: channel.topic,
+          since: since,
+          limit: 500,
+          scope: channel.scopeKind,
+          scopeId: scopeId,
+        );
+        if (page.nextSeqnum > since) {
+          since = page.nextSeqnum;
+          if (since > maxSeen) maxSeen = since;
+        } else if (page.hasMore) {
+          _logger.warning('_httpPullScope $scopeId/$table: cursor not advancing at $since, stopping');
+          break;
+        }
+        if (!page.hasMore) break;
+      }
+    }
+
+    if (maxSeen > since0) {
+      await _scopeCursors!.commit(scopeId, maxSeen);
     }
   }
 
@@ -2457,6 +2668,22 @@ class SyncClient {
         'tables with pushed changes: ${event.tablesWithPushedChanges}');
 
     _syncCompleteController.add(event);
+
+    // Scope cursor commit (A1): if this stream was a scoped pull, advance the
+    // scope's cursor to the max final seqnum the server reported. Committed ONLY
+    // here (at completion), never mid-stream, so an interrupted scope re-runs
+    // whole. Unscoped streams keep deriving their cursor from table MAX(seqnum)
+    // and never touch this store.
+    final scopeUnit = message.streamId != null ? _streamScopes.remove(message.streamId) : null;
+    if (scopeUnit != null && _scopeCursors != null) {
+      final maxSeqnum = message.tableSeqnums.values.isEmpty
+          ? 0
+          : message.tableSeqnums.values.reduce((a, b) => a > b ? a : b);
+      if (maxSeqnum > 0) {
+        await _scopeCursors!.commit(scopeUnit, maxSeqnum);
+        _logger.info('syncUnified: Committed scope cursor $scopeUnit -> $maxSeqnum');
+      }
+    }
 
     // Complete the specific sync operation by streamId if provided
     if (message.streamId != null && _activeSyncCompleters.containsKey(message.streamId)) {
@@ -3419,6 +3646,12 @@ class SyncClient {
   /// // With scope filtering (demand-driven sync)
   /// await syncClient.streamSnapshot(['stages_weeks'], scope: 'program', scopeId: 'abc123');
   /// ```
+  @Deprecated(
+    'Use the routine sync path (syncUnified), which pulls via `sync` and, with '
+    'SyncChannel.activeScopes set, fans out one scoped pull per active scope. '
+    'streamSnapshot is the legacy scope route and is not maintained for scoped '
+    'sync. Will be removed in a future release.',
+  )
   Future<void> streamSnapshot(
     List<String> tables, {
     bool incremental = false,

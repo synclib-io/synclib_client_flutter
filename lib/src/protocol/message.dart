@@ -927,6 +927,13 @@ class SyncRequestMessage extends SyncMessage {
   /// Tells the server whether to send data back, accept changes, or both.
   final String? role;
 
+  /// Row-partition scope for this pull (SYNCLIB-SCOPES.md). `scope` is the scope
+  /// KIND (e.g. "zone_voxels") and `scopeId` the specific partition id; the
+  /// server filters the pull to rows in that scope. Both null for an unscoped
+  /// whole-table pull.
+  final String? scope;
+  final String? scopeId;
+
   const SyncRequestMessage({
     required this.clientId,
     this.deviceId,
@@ -937,6 +944,8 @@ class SyncRequestMessage extends SyncMessage {
     this.strippedRows,
     this.pendingChanges,
     this.role,
+    this.scope,
+    this.scopeId,
   });
 
   @override
@@ -951,6 +960,8 @@ class SyncRequestMessage extends SyncMessage {
     if (strippedRows != null) 'stripped_rows': strippedRows!.map((r) => r.toMap()).toList(),
     if (pendingChanges != null) 'pending_changes': pendingChanges!.map((c) => c.toMap()).toList(),
     if (role != null) 'role': role,
+    if (scope != null) 'scope': scope,
+    if (scopeId != null) 'scope_id': scopeId,
   };
 
   factory SyncRequestMessage.fromMap(Map<String, dynamic> map) {
@@ -968,6 +979,8 @@ class SyncRequestMessage extends SyncMessage {
       strippedRows: strippedRowsRaw?.map((r) => RowRef.fromMap(r as Map<String, dynamic>)).toList(),
       pendingChanges: pendingChangesRaw?.map((c) => PendingChange.fromMap(c as Map<String, dynamic>)).toList(),
       role: map['role'] as String?,
+      scope: map['scope'] as String?,
+      scopeId: map['scope_id'] as String?,
     );
   }
 }
