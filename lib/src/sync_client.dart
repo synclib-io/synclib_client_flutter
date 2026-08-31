@@ -924,6 +924,9 @@ class SyncClient {
     }
 
     _currentToken = token;
+    // Remember connect params for the HTTP fallback, which runs without the
+    // socket (so `env` still selects the right per-app schema).
+    _connectExtra = extra;
 
     // Tell [_handleStateChange] to skip its auto-rejoin while we're in
     // here — we'll call [_joinChannels] explicitly below. See the field
@@ -973,17 +976,19 @@ class SyncClient {
   /// token is available.
   Future<PullPage> fetchPage(
     String table, {
-    required String scope,
+    required String topic,
     int since = 0,
     int limit = 500,
     String? token,
+    String? env,
   }) async {
     final page = await fetchPageRaw(
       table,
-      scope: scope,
+      topic: topic,
       since: since,
       limit: limit,
       token: token,
+      env: env,
     );
     final applied = await applyServerRows(table, page.rows);
     return PullPage(
@@ -995,6 +1000,17 @@ class SyncClient {
     );
   }
 
+  /// Remembered connect params (`slug`, `env`) so the HTTP fallback sends `env`.
+  Map<String, String>? _connectExtra;
+
+  /// Query params every member-sync request carries: the channel [topic] (the
+  /// same one joined on the socket — the server rebuilds scope from it) and,
+  /// when known, `env` (dev|prod) so HTTP reads the same per-app schema.
+  Map<String, String> _scopeQuery(String topic, [String? env]) {
+    final e = env ?? _connectExtra?['env'];
+    return e != null ? {'topic': topic, 'env': e} : {'topic': topic};
+  }
+
   /// Fetch + parse one page over HTTP, WITHOUT applying it to the local DB.
   /// [fetchPage] wraps this with [applyServerRows]. Split out so the wire logic
   /// (URI, headers, response parsing, cursor) is unit-testable without a
@@ -1002,10 +1018,11 @@ class SyncClient {
   @visibleForTesting
   Future<({List<Map<String, dynamic>> rows, int nextSeqnum, bool hasMore})> fetchPageRaw(
     String table, {
-    required String scope,
+    required String topic,
     int since = 0,
     int limit = 500,
     String? token,
+    String? env,
   }) async {
     final authToken = token ?? _currentToken;
     if (authToken == null) {
@@ -1015,7 +1032,7 @@ class SyncClient {
     }
 
     final uri = memberSyncUri('/$table', {
-      'scope': scope,
+      ..._scopeQuery(topic, env),
       'since': '$since',
       'limit': '$limit',
     });
@@ -1049,10 +1066,11 @@ class SyncClient {
   Future<int> fetchByIds(
     String table,
     List<String> ids, {
-    required String scope,
+    required String topic,
     String? token,
+    String? env,
   }) async {
-    final rows = await fetchByIdsRaw(table, ids, scope: scope, token: token);
+    final rows = await fetchByIdsRaw(table, ids, topic: topic, token: token, env: env);
     return applyServerRows(table, rows, asTargeted: true);
   }
 
@@ -1061,10 +1079,11 @@ class SyncClient {
   Future<Map<String, dynamic>?> fetchById(
     String table,
     String id, {
-    required String scope,
+    required String topic,
     String? token,
+    String? env,
   }) async {
-    final row = await fetchByIdRaw(table, id, scope: scope, token: token);
+    final row = await fetchByIdRaw(table, id, topic: topic, token: token, env: env);
     if (row != null) {
       await applyServerRows(table, [row], asTargeted: true);
     }
@@ -1076,8 +1095,9 @@ class SyncClient {
   Future<List<Map<String, dynamic>>> fetchByIdsRaw(
     String table,
     List<String> ids, {
-    required String scope,
+    required String topic,
     String? token,
+    String? env,
   }) async {
     if (ids.isEmpty) return const [];
     final authToken = token ?? _currentToken;
@@ -1086,7 +1106,7 @@ class SyncClient {
     }
 
     final resp = await _http.post(
-      memberSyncUri('/$table/by-ids', {'scope': scope}),
+      memberSyncUri('/$table/by-ids', _scopeQuery(topic, env)),
       headers: {
         'authorization': 'Bearer $authToken',
         'x-client-id': config.clientId,
@@ -1115,8 +1135,9 @@ class SyncClient {
   Future<Map<String, dynamic>?> fetchByIdRaw(
     String table,
     String id, {
-    required String scope,
+    required String topic,
     String? token,
+    String? env,
   }) async {
     final authToken = token ?? _currentToken;
     if (authToken == null) {
@@ -1124,7 +1145,7 @@ class SyncClient {
     }
 
     final resp = await _http.get(
-      memberSyncUri('/$table/$id', {'scope': scope}),
+      memberSyncUri('/$table/$id', _scopeQuery(topic, env)),
       headers: {
         'authorization': 'Bearer $authToken',
         'x-client-id': config.clientId,
@@ -2069,25 +2090,17 @@ class SyncClient {
     try {
       // 1. Push pending changes per push channel.
       _emitSyncProgress(const SyncProgress(phase: 'pushing'));
+      // The server rebuilds the scope from each channel topic, so every channel
+      // is eligible — no filtering.
       for (final channel in _pushChannels) {
-        final scope = _scopeForTopic(channel.topic);
-        if (scope == null) {
-          _logger.warning('syncUnifiedOverHttp: no HTTP scope for ${channel.topic}, skipping push');
-          continue;
-        }
-        await _httpPushChannel(channel, scope);
+        await _httpPushChannel(channel, channel.topic);
       }
 
       // 2. Pull each pull channel's tables, paging until has_more is false.
       final force = (forceRefresh ?? const <String>[]).toSet();
       for (final channel in _pullChannels) {
-        final scope = _scopeForTopic(channel.topic);
-        if (scope == null) {
-          _logger.warning('syncUnifiedOverHttp: no HTTP scope for ${channel.topic}, skipping pull');
-          continue;
-        }
         for (final table in channel.allTableNames) {
-          await _httpPullTable(table, scope, forceRefresh: force.contains(table));
+          await _httpPullTable(table, channel.topic, forceRefresh: force.contains(table));
         }
       }
 
@@ -2106,13 +2119,13 @@ class SyncClient {
   /// local queue (delete acked changes, store the server seqnum) — the same
   /// bookkeeping the socket's change-ack handler does. row_hash isn't in a
   /// unified-sync ack (WS or HTTP); it reconciles on the following pull.
-  Future<void> _httpPushChannel(SyncChannel channel, String scope) async {
+  Future<void> _httpPushChannel(SyncChannel channel, String topic) async {
     final pending = await _db!.getPendingChanges(limit: config.pushBatchSize);
     final tableSet = channel.allTableNames.toSet();
     final changes = pending.where((c) => tableSet.contains(c.tableName)).toList();
     if (changes.isEmpty) return;
 
-    _logger.info('syncUnifiedOverHttp: HTTP-pushing ${changes.length} changes for scope=$scope');
+    _logger.info('syncUnifiedOverHttp: HTTP-pushing ${changes.length} changes for topic=$topic');
 
     final changeMaps = changes.map((c) => <String, dynamic>{
           'local_seqnum': c.seqnum,
@@ -2122,7 +2135,7 @@ class SyncClient {
           if (c.data != null) 'data': _parseJson(c.data!),
         }).toList();
 
-    final acks = await httpPush(scope, changeMaps);
+    final acks = await httpPush(topic, changeMaps);
 
     for (final ack in acks) {
       if (ack.success) {
@@ -2147,9 +2160,10 @@ class SyncClient {
   /// [token] overrides the stored token (used by unit tests).
   @visibleForTesting
   Future<List<ChangeAck>> httpPush(
-    String scope,
+    String topic,
     List<Map<String, dynamic>> pendingChanges, {
     String? token,
+    String? env,
   }) async {
     final authToken = token ?? _currentToken;
     if (authToken == null) {
@@ -2164,7 +2178,7 @@ class SyncClient {
         'content-type': 'application/json',
         'accept': 'application/json',
       },
-      body: jsonEncode({'scope': scope, 'pending_changes': pendingChanges}),
+      body: jsonEncode({..._scopeQuery(topic, env), 'pending_changes': pendingChanges}),
     );
 
     if (resp.statusCode != 200) {
@@ -2181,10 +2195,10 @@ class SyncClient {
   /// Pull one table over HTTP, paging by seqnum cursor until a page stops
   /// filling. Starts from the local contiguous watermark (MAX(seqnum)), or 0
   /// when [forceRefresh] is set.
-  Future<void> _httpPullTable(String table, String scope, {bool forceRefresh = false}) async {
+  Future<void> _httpPullTable(String table, String topic, {bool forceRefresh = false}) async {
     int since = forceRefresh ? 0 : await _getMaxSeqnumFromTable(table);
     while (true) {
-      final page = await fetchPage(table, scope: scope, since: since, limit: 500);
+      final page = await fetchPage(table, topic: topic, since: since, limit: 500);
       if (!page.hasMore) break;
       if (page.nextSeqnum <= since) {
         _logger.warning('_httpPullTable $table: cursor not advancing at $since, stopping');
@@ -2192,14 +2206,6 @@ class SyncClient {
       }
       since = page.nextSeqnum;
     }
-  }
-
-  /// Map a channel topic to an HTTP member-sync scope. Returns null for topics
-  /// the HTTP surface doesn't serve (e.g. world/zone).
-  String? _scopeForTopic(String topic) {
-    if (topic.startsWith('sync:user:')) return 'user';
-    if (topic.startsWith('sync:tribe:')) return 'tribe';
-    return null;
   }
 
   /// Run merkle verification independently of syncUnified().

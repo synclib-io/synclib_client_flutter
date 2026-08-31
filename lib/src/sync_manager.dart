@@ -164,20 +164,20 @@ class SyncManager {
   /// (seqnum 0, so it can't inflate the pull cursor). `scope` is `"user"` or
   /// `"tribe"`. Best-effort: a failed on-demand fetch never throws to the
   /// caller.
-  Future<void> ensureRow(String table, String id, String scope) async {
+  Future<void> ensureRow(String table, String id, String topic) async {
     if (_isSyncLive) return;
     try {
-      await _client.fetchById(table, id, scope: scope);
+      await _client.fetchById(table, id, topic: topic);
     } catch (_) {
       // Best-effort: a failed on-demand fetch must not crash the screen.
     }
   }
 
   /// [ensureRow] for a set of ids, fetched in one round-trip.
-  Future<void> ensureRows(String table, List<String> ids, String scope) async {
+  Future<void> ensureRows(String table, List<String> ids, String topic) async {
     if (_isSyncLive || ids.isEmpty) return;
     try {
-      await _client.fetchByIds(table, ids, scope: scope);
+      await _client.fetchByIds(table, ids, topic: topic);
     } catch (_) {
       // Best-effort.
     }
@@ -190,11 +190,11 @@ class SyncManager {
   /// caller that explicitly wants a fresh page may pull one even while live.
   Future<PullPage> fetchPage(
     String table, {
-    required String scope,
+    required String topic,
     int since = 0,
     int limit = 500,
   }) {
-    return _client.fetchPage(table, scope: scope, since: since, limit: limit);
+    return _client.fetchPage(table, topic: topic, since: since, limit: limit);
   }
 
   /// Update the auth token used by the HTTP fallback (and the next socket

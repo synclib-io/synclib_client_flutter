@@ -26,13 +26,13 @@ void main() {
   group('memberSyncUri', () {
     test('maps ws://host:port/socket to http://host:port/api/sync/member/...', () {
       final client = SyncClient(_config());
-      final uri = client.memberSyncUri('/storage_files', {'scope': 'user', 'since': '0'});
+      final uri = client.memberSyncUri('/storage_files', {'topic': 'sync:user:x', 'since': '0'});
 
       expect(uri.scheme, 'http');
       expect(uri.host, 'localhost');
       expect(uri.port, 4242);
       expect(uri.path, '/api/sync/member/storage_files');
-      expect(uri.queryParameters['scope'], 'user');
+      expect(uri.queryParameters['topic'], 'sync:user:x');
       expect(uri.queryParameters['since'], '0');
     });
 
@@ -66,12 +66,12 @@ void main() {
 
       final client = SyncClient(_config(), httpClient: mock);
       final page = await client.fetchPageRaw('storage_files',
-          scope: 'user', since: 3, limit: 50, token: 'tok-123');
+          topic: 'sync:user:x', since: 3, limit: 50, token: 'tok-123');
 
       // request shape
       expect(captured!.method, 'GET');
       expect(captured!.url.path, '/api/sync/member/storage_files');
-      expect(captured!.url.queryParameters['scope'], 'user');
+      expect(captured!.url.queryParameters['topic'], 'sync:user:x');
       expect(captured!.url.queryParameters['since'], '3');
       expect(captured!.url.queryParameters['limit'], '50');
       expect(captured!.headers['authorization'], 'Bearer tok-123');
@@ -90,7 +90,7 @@ void main() {
           ));
       final client = SyncClient(_config(), httpClient: mock);
       final page =
-          await client.fetchPageRaw('storage_files', scope: 'user', since: 7, token: 't');
+          await client.fetchPageRaw('storage_files', topic: 'sync:user:x', since: 7, token: 't');
       expect(page.rows, isEmpty);
       expect(page.hasMore, isFalse);
       // server sent 0; parser takes it as-is (server is authoritative)
@@ -101,7 +101,7 @@ void main() {
       final mock = MockClient((_) async => http.Response('nope', 403));
       final client = SyncClient(_config(), httpClient: mock);
       expect(
-        () => client.fetchPageRaw('storage_files', scope: 'user', token: 't'),
+        () => client.fetchPageRaw('storage_files', topic: 'sync:user:x', token: 't'),
         throwsA(isA<HttpSyncException>().having((e) => e.statusCode, 'statusCode', 403)),
       );
     });
@@ -109,7 +109,7 @@ void main() {
     test('missing token throws StateError', () async {
       final client = SyncClient(_config(), httpClient: MockClient((_) async => http.Response('{}', 200)));
       expect(
-        () => client.fetchPageRaw('storage_files', scope: 'user'),
+        () => client.fetchPageRaw('storage_files', topic: 'sync:user:x'),
         throwsA(isA<StateError>()),
       );
     });
@@ -133,7 +133,7 @@ void main() {
 
       final client = SyncClient(_config(), httpClient: mock);
       final acks = await client.httpPush(
-        'user',
+        'sync:user:x',
         [
           {'local_seqnum': 1, 'table': 'storage_files', 'row_id': 'a', 'operation': 'insert', 'data': {'x': 1}},
           {'local_seqnum': 2, 'table': 'storage_files', 'row_id': 'b', 'operation': 'delete'},
@@ -147,7 +147,7 @@ void main() {
       expect(captured!.headers['authorization'], 'Bearer tok-9');
       expect(captured!.headers['x-client-id'], 'app_test');
       final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-      expect(body['scope'], 'user');
+      expect(body['topic'], 'sync:user:x');
       expect((body['pending_changes'] as List).length, 2);
       expect((body['pending_changes'] as List).first['row_id'], 'a');
 
@@ -163,7 +163,7 @@ void main() {
       final mock = MockClient((_) async => http.Response('boom', 500));
       final client = SyncClient(_config(), httpClient: mock);
       expect(
-        () => client.httpPush('user', const [], token: 't'),
+        () => client.httpPush('sync:user:x', const [], token: 't'),
         throwsA(isA<HttpSyncException>().having((e) => e.statusCode, 'statusCode', 500)),
       );
     });
@@ -178,11 +178,11 @@ void main() {
       });
       final client = SyncClient(_config(), httpClient: mock);
       final rows =
-          await client.fetchByIdsRaw('storage_files', ['a', 'b'], scope: 'user', token: 't');
+          await client.fetchByIdsRaw('storage_files', ['a', 'b'], topic: 'sync:user:x', token: 't');
 
       expect(captured!.method, 'POST');
       expect(captured!.url.path, '/api/sync/member/storage_files/by-ids');
-      expect(captured!.url.queryParameters['scope'], 'user');
+      expect(captured!.url.queryParameters['topic'], 'sync:user:x');
       expect((jsonDecode(captured!.body) as Map)['ids'], ['a', 'b']);
       expect(rows.map((r) => r['id']).toList(), ['a', 'b']);
     });
@@ -194,7 +194,7 @@ void main() {
         return http.Response('{}', 200);
       });
       final client = SyncClient(_config(), httpClient: mock);
-      final rows = await client.fetchByIdsRaw('storage_files', const [], scope: 'user', token: 't');
+      final rows = await client.fetchByIdsRaw('storage_files', const [], topic: 'sync:user:x', token: 't');
       expect(rows, isEmpty);
       expect(called, isFalse);
     });
@@ -206,18 +206,18 @@ void main() {
         return http.Response(jsonEncode({'row': {'id': 'x', 'seqnum': 7}}), 200);
       });
       final client = SyncClient(_config(), httpClient: mock);
-      final row = await client.fetchByIdRaw('storage_files', 'x', scope: 'user', token: 't');
+      final row = await client.fetchByIdRaw('storage_files', 'x', topic: 'sync:user:x', token: 't');
 
       expect(captured!.method, 'GET');
       expect(captured!.url.path, '/api/sync/member/storage_files/x');
-      expect(captured!.url.queryParameters['scope'], 'user');
+      expect(captured!.url.queryParameters['topic'], 'sync:user:x');
       expect(row!['id'], 'x');
     });
 
     test('fetchByIdRaw returns null on 404', () async {
       final mock = MockClient((_) async => http.Response('{}', 404));
       final client = SyncClient(_config(), httpClient: mock);
-      final row = await client.fetchByIdRaw('storage_files', 'missing', scope: 'user', token: 't');
+      final row = await client.fetchByIdRaw('storage_files', 'missing', topic: 'sync:user:x', token: 't');
       expect(row, isNull);
     });
 
@@ -225,7 +225,7 @@ void main() {
       final mock = MockClient((_) async => http.Response('err', 500));
       final client = SyncClient(_config(), httpClient: mock);
       expect(
-        () => client.fetchByIdRaw('storage_files', 'x', scope: 'user', token: 't'),
+        () => client.fetchByIdRaw('storage_files', 'x', topic: 'sync:user:x', token: 't'),
         throwsA(isA<HttpSyncException>()),
       );
     });

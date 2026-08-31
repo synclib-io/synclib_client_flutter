@@ -164,7 +164,7 @@ void main() {
         // Wipe the local copy, then pull it back purely over HTTP.
         await h.db.exec("DELETE FROM measurements WHERE id = '$id'");
 
-        final page = await h.client.fetchPage('measurements', scope: 'user', since: 0, limit: 200);
+        final page = await h.client.fetchPage('measurements', topic: 'sync:user:$_userId', since: 0, limit: 200);
 
         expect(page.received, greaterThan(0), reason: 'server should return rows for this user');
         expect(page.applied, greaterThan(0), reason: 'fetched rows should apply into local SQLite');
