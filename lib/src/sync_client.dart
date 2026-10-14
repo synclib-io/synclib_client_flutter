@@ -290,8 +290,14 @@ class MerkleVerificationEvent {
   /// Whether any repairs were made
   bool get hadMismatches => repairedTables.isNotEmpty;
 
+  /// True when verification could not finish (a table could not be hashed,
+  /// the server request failed, or a repair failed). No result is implied
+  /// about the tables, and the next sync retries.
+  final bool incomplete;
+
   const MerkleVerificationEvent({
     required this.repairedTables,
+    this.incomplete = false,
   });
 }
 
@@ -768,6 +774,19 @@ class SyncClient {
   // knows which scope cursor to advance (and only advances at completion).
   final Map<String, String> _streamScopes = {};
 
+  /// Unscoped pull streams in flight: stream id -> channel topic. Their
+  /// per-table cursors are committed from the server's sync_complete.
+  final Map<String, String> _streamTopics = {};
+
+  /// Cursor key for one table on an unscoped channel. Unscoped channels used
+  /// the local table's MAX(seqnum), which the client's own acked writes raise
+  /// to their new server seqnum: the cursor could then jump past another
+  /// device's row that took a lower seqnum and was not pulled yet, and that
+  /// row was never pulled. (Tombstones, deleted locally, were also re-pulled
+  /// on every sync.) Now, like scopes and the JS client, the cursor is the
+  /// server's reported high-water mark, stored in _synclib_cursors.
+  static String _tableCursorUnit(String topic, String table) => 'table:$topic:$table';
+
   // Store join responses for deferred auto-sync
   Map<String, Map<String, dynamic>> _pendingJoinResponses = {};
 
@@ -782,6 +801,11 @@ class SyncClient {
   // syncOnWrite: subscription to local changes and debounce timer
   StreamSubscription? _localChangeSubscription;
   Timer? _syncOnWriteDebounceTimer;
+
+  // A sync asked for while another was running. It used to be dropped
+  // ("Already syncing"), so a write made during a sync waited for the next
+  // unrelated sync. Now the running sync starts one more when it finishes.
+  Future<void> Function()? _rerunAfterSync;
 
   // Periodic background sync timer
   Timer? _periodicSyncTimer;
@@ -1930,7 +1954,8 @@ class SyncClient {
     }
 
     if (_isSyncing) {
-      _logger.info('syncUnified: Already syncing, skipping');
+      _logger.info('syncUnified: Already syncing; will sync again when it finishes');
+      _rerunAfterSync = () => syncUnified();
       return;
     }
 
@@ -1971,9 +1996,7 @@ class SyncClient {
         data: c.data != null ? _parseJson(c.data!) : null,
       )).toList();
 
-      // 3. Get per-table seqnums for incremental pull
-      final tableSeqnums = await _getPerTableSeqnums(tablesToSync);
-      _logger.info('syncUnified: Table seqnums: $tableSeqnums');
+      // 3. Pull cursors come from _synclib_cursors per pull unit (below).
 
       // 4. Find stripped rows if needed
       List<RowRef>? strippedRows;
@@ -2080,10 +2103,11 @@ class SyncClient {
 
         final active = channel.activeScopes; // null = unscoped
         if (active == null) {
-          // Unscoped: cursor from local table MAX(seqnum), as before.
-          final channelSeqnums = Map.fromEntries(
-            tableSeqnums.entries.where((e) => channelTableSet.contains(e.key)),
-          );
+          // Unscoped: one stored cursor per table (see _tableCursorUnit).
+          final channelSeqnums = <String, int>{
+            for (final t in channelTableNames)
+              t: await _scopeCursors!.get(_tableCursorUnit(channel.topic, t)),
+          };
           final upgraded = await _pullUnit(
             channel: channel,
             tables: channelTableNames,
@@ -2129,13 +2153,12 @@ class SyncClient {
         }
       }
 
-      // Check if Merkle verification is needed (staleness check)
+      // Check if Merkle verification is needed (staleness check).
+      // (No syncOnWrite timer is cancelled after it: repair writes go
+      // through the untracked bulk path and never arm it, so the only timer
+      // a cancel could hit was a user's write made during the sync.)
       if (!skipMerkle) {
         await _checkMerkleVerification();
-
-        // Cancel any syncOnWrite debounce triggered by merkle repair writes —
-        // those are internal maintenance, not user changes needing a new sync.
-        _syncOnWriteDebounceTimer?.cancel();
       }
 
       _updateSyncState(SyncState.ready);
@@ -2147,7 +2170,20 @@ class SyncClient {
       rethrow;
     } finally {
       _isSyncing = false;
+      _runDeferredSync();
     }
+  }
+
+  /// Start the sync that was asked for while the last one was running.
+  void _runDeferredSync() {
+    final rerun = _rerunAfterSync;
+    if (rerun == null) return;
+    _rerunAfterSync = null;
+    Timer.run(() {
+      rerun().catchError((e) {
+        _logger.warning('Deferred sync failed: $e');
+      });
+    });
   }
 
   /// Issue one pull request (unscoped, or for a single scope id) and wait for
@@ -2207,6 +2243,9 @@ class SyncClient {
       throw StateError('Server did not return stream_id for $label');
     }
 
+    if (scopeId == null) {
+      _streamTopics[pullStreamId] = channel.topic;
+    }
     if (scopeId != null) {
       _streamScopes[pullStreamId] = scopeId;
     }
@@ -2242,7 +2281,8 @@ class SyncClient {
   /// aren't available over HTTP; call this on a timer or on demand instead.
   Future<void> syncUnifiedOverHttp({List<String>? forceRefresh}) async {
     if (_isSyncing) {
-      _logger.info('syncUnifiedOverHttp: Already syncing, skipping');
+      _logger.info('syncUnifiedOverHttp: Already syncing; will sync again when it finishes');
+      _rerunAfterSync = () => syncUnifiedOverHttp();
       return;
     }
     _isSyncing = true;
@@ -2285,6 +2325,7 @@ class SyncClient {
       rethrow;
     } finally {
       _isSyncing = false;
+      _runDeferredSync();
     }
   }
 
@@ -2313,7 +2354,8 @@ class SyncClient {
     for (final ack in acks) {
       if (ack.success) {
         try {
-          await _db!.deleteChange(ack.localSeqnum);
+          await _settleAckedChange(ack.localSeqnum,
+              pushed: changes.where((c) => c.seqnum == ack.localSeqnum).firstOrNull);
         } catch (e) {
           _logger.warning('Failed to delete change ${ack.localSeqnum}: $e');
         }
@@ -2366,18 +2408,27 @@ class SyncClient {
   }
 
   /// Pull one table over HTTP, paging by seqnum cursor until a page stops
-  /// filling. Starts from the local contiguous watermark (MAX(seqnum)), or 0
-  /// when [forceRefresh] is set.
+  /// filling. Starts from the table's stored cursor (see [_tableCursorUnit]),
+  /// or 0 when [forceRefresh] is set, and commits where it got to.
   Future<void> _httpPullTable(String table, String topic, {bool forceRefresh = false}) async {
-    int since = forceRefresh ? 0 : await _getMaxSeqnumFromTable(table);
-    while (true) {
-      final page = await fetchPage(table, topic: topic, since: since, limit: 500);
-      if (!page.hasMore) break;
-      if (page.nextSeqnum <= since) {
-        _logger.warning('_httpPullTable $table: cursor not advancing at $since, stopping');
-        break;
+    final unit = _tableCursorUnit(topic, table);
+    final start = forceRefresh ? 0 : await _scopeCursors!.get(unit);
+    int since = start;
+    try {
+      while (true) {
+        final page = await fetchPage(table, topic: topic, since: since, limit: 500);
+        if (page.nextSeqnum > since) {
+          since = page.nextSeqnum;
+        } else if (page.hasMore) {
+          _logger.warning('_httpPullTable $table: cursor not advancing at $since, stopping');
+          break;
+        }
+        if (!page.hasMore) break;
       }
-      since = page.nextSeqnum;
+    } finally {
+      // Commit what was applied, including the last page (the old loop only
+      // advanced on full pages and relied on MAX(seqnum) for the rest).
+      if (since > start) await _scopeCursors!.commit(unit, since);
     }
   }
 
@@ -2434,9 +2485,9 @@ class SyncClient {
     _isSyncing = true;
     try {
       await _checkMerkleVerification();
-      _syncOnWriteDebounceTimer?.cancel();
     } finally {
       _isSyncing = false;
+      _runDeferredSync();
     }
   }
 
@@ -2477,6 +2528,48 @@ class SyncClient {
   }
 
   /// Handle change acknowledgments from unified sync
+  /// Take an acknowledged change off the queue, unless the row was written
+  /// again after it was pushed.
+  ///
+  /// The native queue keeps one entry per row: a second write while the first
+  /// is in flight merges into that entry (json_patch) and keeps its seqnum.
+  /// Deleting by seqnum on the ack then dropped the newer edit unsent. Here,
+  /// in one statement batch (no await between check and write), an entry that
+  /// no longer matches what was pushed is re-queued under a fresh seqnum; that
+  /// also puts it above the server's high-water mark, so a rejoin trim can't
+  /// remove it. The web (drift) queue never merges, so it just deletes.
+  Future<void> _settleAckedChange(int seqnum, {Change? pushed}) async {
+    pushed ??= _activeSyncPendingChanges.values
+        .expand((changes) => changes)
+        .where((c) => c.seqnum == seqnum)
+        .firstOrNull;
+
+    if (pushed != null) {
+      final dataMatch = pushed.data == null ? 'data IS NULL' : "data IS '${pushed.data!.replaceAll("'", "''")}'";
+      // synclibc stores insert/update/delete as 1/2/3.
+      final op = pushed.operation.index + 1;
+      try {
+        await _db!.exec('SAVEPOINT synclib_settle; '
+            'CREATE TEMP TABLE IF NOT EXISTS _synclib_requeue (table_name TEXT, row_id TEXT, operation INTEGER, data TEXT); '
+            'DELETE FROM _synclib_requeue; '
+            'INSERT INTO _synclib_requeue SELECT table_name, row_id, operation, data FROM _sync_changes '
+            'WHERE seqnum = $seqnum AND NOT (operation = $op AND $dataMatch); '
+            'DELETE FROM _sync_changes WHERE seqnum = $seqnum; '
+            'INSERT INTO _sync_changes (table_name, row_id, operation, data) '
+            'SELECT table_name, row_id, operation, data FROM _synclib_requeue; '
+            'RELEASE synclib_settle;');
+        return;
+      } catch (_) {
+        try {
+          await _db!.exec('ROLLBACK TO synclib_settle; RELEASE synclib_settle;');
+        } catch (_) {}
+        // No _sync_changes table: the web queue. Fall through to delete.
+      }
+    }
+
+    await _db!.deleteChange(seqnum);
+  }
+
   Future<void> _handleSyncChangeAcks(ChangeAcksMessage message) async {
     _logger.info('syncUnified: Received ${message.acks.length} change acknowledgments');
 
@@ -2492,8 +2585,8 @@ class SyncClient {
         // DELETE from _sync_changes instead of just marking synced
         // This ensures the table is cleaned up and doesn't grow indefinitely
         try {
-          await _db!.deleteChange(ack.localSeqnum);
-          _logger.fine('Deleted acknowledged change: ${ack.localSeqnum}');
+          await _settleAckedChange(ack.localSeqnum);
+          _logger.fine('Settled acknowledged change: ${ack.localSeqnum}');
         } catch (e) {
           _logger.warning('Failed to delete change ${ack.localSeqnum}: $e');
         }
@@ -2672,8 +2765,14 @@ class SyncClient {
     // Scope cursor commit (A1): if this stream was a scoped pull, advance the
     // scope's cursor to the max final seqnum the server reported. Committed ONLY
     // here (at completion), never mid-stream, so an interrupted scope re-runs
-    // whole. Unscoped streams keep deriving their cursor from table MAX(seqnum)
-    // and never touch this store.
+    // whole. Unscoped streams commit one cursor per table, below.
+    final unscopedTopic = message.streamId != null ? _streamTopics.remove(message.streamId) : null;
+    if (unscopedTopic != null && _scopeCursors != null) {
+      for (final entry in message.tableSeqnums.entries) {
+        await _scopeCursors!.commit(_tableCursorUnit(unscopedTopic, entry.key), entry.value);
+      }
+    }
+
     final scopeUnit = message.streamId != null ? _streamScopes.remove(message.streamId) : null;
     if (scopeUnit != null && _scopeCursors != null) {
       final maxSeqnum = message.tableSeqnums.values.isEmpty
@@ -2844,6 +2943,13 @@ class SyncClient {
         await _handleSyncDataBatch(message);
       } else if (message is SyncCompleteMessage) {
         await _handleSyncComplete(message);
+      } else if (message is SyncErrorMessage) {
+        // Fail the waiting sync now; ignoring this left it hung until the
+        // timeout, and every sync in between was skipped.
+        final completer = message.streamId == null ? null : _activeSyncCompleters.remove(message.streamId);
+        if (completer != null && !completer.isCompleted) {
+          completer.completeError(StateError('Server sync failed: ${message.error ?? 'unknown error'}'));
+        }
       } else {
         _logger.warning('Unhandled message type: ${message.runtimeType}');
       }
@@ -4227,6 +4333,7 @@ class SyncClient {
       // still have happened and consumers should refresh.
       _merkleVerificationController.add(MerkleVerificationEvent(
         repairedTables: allRepairedTables,
+        incomplete: !allChannelsOk,
       ));
     } catch (e) {
       _logger.warning('Merkle verification failed: $e');
@@ -4293,6 +4400,12 @@ class SyncClient {
       //    state (e.g. from a timeout), bail out — all subsequent pushes
       //    will fail immediately.
       for (final mismatch in mismatches) {
+        // Fixed during verification (ghost rows dropped); nothing to repair.
+        if (mismatch.resolved) {
+          allRepairedTables.add(mismatch.table);
+          continue;
+        }
+
         // Check connection health before attempting repair
         if (!_ws.isConnected) {
           _logger.warning('Merkle repair: connection lost, skipping remaining repairs on ${channel.topic}');
@@ -4374,6 +4487,7 @@ class SyncClient {
 
     // Compute local Merkle roots
     final tableHashes = <String, MerkleTableInfo>{};
+    final failed = <String>[];
     for (final table in tables) {
       try {
         final merkleInfo = await _merkle!.merkleRoot(table, blockSize: blockSize, hashColumns: hashColumns);
@@ -4389,7 +4503,14 @@ class SyncClient {
             'blocks=${merkleInfo.blockCount}, rows=${merkleInfo.rowCount}');
       } catch (e) {
         _logger.warning('verifyRoots: Failed to compute Merkle root for $table: $e');
+        failed.add(table);
       }
+    }
+
+    // A table left out is a table not verified; reporting nothing about it
+    // read as "all tables match" and advanced the verification timestamp.
+    if (failed.isNotEmpty) {
+      throw StateError('Could not compute merkle roots for: ${failed.join(', ')}');
     }
 
     if (tableHashes.isEmpty) return [];
@@ -4416,15 +4537,23 @@ class SyncClient {
     // channels (e.g. users from both user + tribe channels). Re-compute using
     // only the server's scoped row_ids — if they now match, it's a false alarm.
     final realMismatches = <MerkleMismatch>[];
-    for (final mismatch in response.mismatches ?? []) {
-      if (mismatch.rowIds != null && mismatch.rowIds!.isEmpty) {
+    for (final MerkleMismatch mismatch in response.mismatches ?? []) {
+      // Rows the server deleted that this client still holds (it missed the
+      // tombstone): the tombstone wins, so drop them before rechecking.
+      final ghosts = await _localLiveIds(mismatch.table, mismatch.deletedRowIds);
+      if (ghosts.isNotEmpty) {
+        _logger.info('verifyRoots: ${mismatch.table} dropping ${ghosts.length} rows deleted on the server');
+        await _deleteLocalRows(mismatch.table, ghosts);
+      }
+
+      if (mismatch.rowIds != null && mismatch.rowIds!.isEmpty && ghosts.isEmpty) {
         // Server has 0 rows in scope for this table on this channel.
         // Client data is from another channel — not a real mismatch.
         _logger.info('verifyRoots: ${mismatch.table} - server has 0 scoped rows, '
             'client data is from another channel (false alarm)');
         continue;
       }
-      if (mismatch.rowIds != null && mismatch.rowIds!.isNotEmpty) {
+      if (mismatch.rowIds != null) {
         try {
           final scopedInfo = await _merkle!.merkleRoot(
             mismatch.table,
@@ -4435,7 +4564,10 @@ class SyncClient {
           if (scopedInfo.rootHash == mismatch.serverRootHash) {
             _logger.info('verifyRoots: ${mismatch.table} matches after scoping '
                 '(${scopedInfo.rowCount} scoped rows vs ${tableHashes[mismatch.table]?.rowCount} total)');
-            continue; // Not a real mismatch — just extra rows from other channels
+            // Matches now. If ghosts were dropped that was the repair;
+            // otherwise the extra rows belong to another channel.
+            if (ghosts.isNotEmpty) realMismatches.add(mismatch.asResolved());
+            continue;
           }
         } catch (e) {
           _logger.warning('verifyRoots: scoped recheck failed for ${mismatch.table}: $e');
@@ -4719,6 +4851,22 @@ class SyncClient {
 
   /// Delete a specific list of local row ids. Used by repair paths that
   /// detect extras the server's scope doesn't include.
+  /// Which of [ids] exist locally as live rows.
+  Future<List<String>> _localLiveIds(String table, List<String> ids) async {
+    final found = <String>[];
+    for (var i = 0; i < ids.length; i += 500) {
+      final chunk = ids
+          .sublist(i, i + 500 > ids.length ? ids.length : i + 500)
+          .map((id) => "'${id.replaceAll("'", "''")}'")
+          .join(',');
+      final rows = await _db!.read('SELECT id FROM "$table" WHERE deleted_at IS NULL AND id IN ($chunk)');
+      for (final r in rows) {
+        found.add(r['id'].toString());
+      }
+    }
+    return found;
+  }
+
   Future<void> _deleteLocalRows(String table, List<String> rowIds) async {
     if (rowIds.isEmpty) return;
     _db!.beginBulkRemote();
@@ -4999,7 +5147,10 @@ class SyncClient {
           _logger.fine('repairLww: skipping stripped row $table:$rowId');
           continue;
         }
-        localRows.add(row);
+        // base_row_hash: the server version this copy came from. The server
+        // lets it win only if that is still the current version.
+        final base = await _db!.read("SELECT row_hash FROM ${_quoteId(table)} WHERE id = '${_escapeSql(rowId)}'");
+        localRows.add({...row, 'base_row_hash': base.isEmpty ? null : base.first['row_hash']});
       }
     }
 
@@ -5024,10 +5175,13 @@ class SyncClient {
             final rowId = row['id']?.toString();
             if (rowId == null) continue;
 
+            // A tombstone (deleted on the server) removes the local copy, as
+            // a pull does. Writing it back left the ghost in place.
+            final isDelete = row['deleted_at'] != null;
             final existsLocally = rowIds.contains(rowId);
             final change = ChangeMessage(
               table: table,
-              operation: existsLocally ? 'update' : 'insert',
+              operation: isDelete ? 'delete' : existsLocally ? 'update' : 'insert',
               rowId: rowId,
               data: row,
             );

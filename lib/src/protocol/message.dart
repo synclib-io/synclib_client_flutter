@@ -81,6 +81,8 @@ abstract class SyncMessage {
         return SyncDataBatchMessage.fromMap(map);
       case 'sync_complete':
         return SyncCompleteMessage.fromMap(map);
+      case 'sync_error':
+        return SyncErrorMessage.fromMap(map);
       // Merkle tree integrity verification messages
       case 'merkle_verify':
         return MerkleVerifyMessage.fromMap(map);
@@ -111,6 +113,23 @@ class IgnoredMessage extends SyncMessage {
 
   @override
   Map<String, dynamic> toMap() => {'type': type};
+}
+
+/// The server could not finish a sync stream (its task crashed). Carries the
+/// stream id so the waiting sync fails at once instead of timing out.
+class SyncErrorMessage extends SyncMessage {
+  final String? streamId;
+  final String? error;
+
+  const SyncErrorMessage({this.streamId, this.error});
+
+  factory SyncErrorMessage.fromMap(Map<String, dynamic> map) => SyncErrorMessage(
+        streamId: map['stream_id'] as String?,
+        error: map['error']?.toString(),
+      );
+
+  @override
+  Map<String, dynamic> toMap() => {'type': 'sync_error', 'stream_id': streamId, 'error': error};
 }
 
 /// Initial handshake message from client to server
@@ -1226,12 +1245,22 @@ class MerkleMismatch {
   /// to the same set of rows the server sees.
   final List<String>? rowIds;
 
+  /// Ids the server deleted in this scope. A client still holding one missed
+  /// the tombstone and should drop it.
+  final List<String> deletedRowIds;
+
+  /// Set by the client when verification itself fixed the table (ghost rows
+  /// dropped) so no repair pass is needed.
+  final bool resolved;
+
   const MerkleMismatch({
     required this.table,
     required this.serverRootHash,
     required this.serverBlockCount,
     required this.serverRowCount,
     this.rowIds,
+    this.deletedRowIds = const [],
+    this.resolved = false,
   });
 
   factory MerkleMismatch.fromMap(Map<String, dynamic> map) => MerkleMismatch(
@@ -1240,6 +1269,17 @@ class MerkleMismatch {
     serverBlockCount: map['server_block_count'] as int,
     serverRowCount: map['server_row_count'] as int,
     rowIds: (map['row_ids'] as List?)?.cast<String>(),
+    deletedRowIds: (map['deleted_row_ids'] as List?)?.cast<String>() ?? const [],
+  );
+
+  MerkleMismatch asResolved() => MerkleMismatch(
+    table: table,
+    serverRootHash: serverRootHash,
+    serverBlockCount: serverBlockCount,
+    serverRowCount: serverRowCount,
+    rowIds: rowIds,
+    deletedRowIds: deletedRowIds,
+    resolved: true,
   );
 }
 
